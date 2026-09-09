@@ -4,6 +4,7 @@
 use qwc_core::arch::*;
 use qwc_core::dtype::Dtype;
 use qwc_core::memory::*;
+use qwc_core::roofline::*;
 
 fn gb(b: u64) -> f64 {
     b as f64 / 1e9
@@ -75,4 +76,26 @@ fn main() {
             if b.fits(&cfg, conc, total) { "ok" } else { "OOM" }
         );
     }
+    println!("\nПотолок decode (memory-bound: за шаг читаются все веса)");
+    println!("  {:>6} | {:>7} | {:>12} | {:>12} | {:>12}", "batch", "ctx", "ITL идеал", "ITL @47%", "tok/s идеал");
+    println!("  {:->6}-+-{:->7}-+-{:->12}-+-{:->12}-+-{:->12}", "", "", "", "", "");
+    for (batch, ctx) in [(1usize, 2048usize), (1, 32768), (8, 2048), (16, 2048), (32, 2048), (32, 8192)] {
+        let ideal = DecodeStep { batch, context_len: ctx, bandwidth_efficiency: 1.0 };
+        let real = DecodeStep { bandwidth_efficiency: 0.47, ..ideal };
+        println!(
+            "  {:>6} | {:>7} | {:>9.2} ms | {:>9.2} ms | {:>9.0} t/s",
+            batch, ctx,
+            ideal.itl_ms(ours.bytes(), &cfg),
+            real.itl_ms(ours.bytes(), &cfg),
+            ideal.tokens_per_sec(ours.bytes(), &cfg),
+        );
+    }
+
+    println!("\nИз чего состоит шаг decode (batch=32, ctx=2048)");
+    let step = DecodeStep { batch: 32, context_len: 2048, bandwidth_efficiency: 1.0 };
+    let c = step.cost(ours.bytes(), &cfg);
+    for (name, bytes) in [("веса", c.weight_bytes), ("состояние DeltaNet", c.state_bytes), ("KV-кэш", c.kv_bytes)] {
+        println!("  {:<20} {:>7.2} GB  {:>4.0}%", name, gb(bytes), 100.0 * bytes as f64 / c.total() as f64);
+    }
+    println!("  переход в compute-bound при batch ~{:.0}", compute_bound_batch(Dtype::Nvfp4));
 }

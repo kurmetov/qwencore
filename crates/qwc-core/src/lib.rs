@@ -9,3 +9,4 @@
 pub mod arch;
 pub mod dtype;
 pub mod memory;
+pub mod roofline;
