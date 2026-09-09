@@ -77,11 +77,11 @@ fn main() {
         );
     }
     println!("\nПотолок decode (memory-bound: за шаг читаются все веса)");
-    println!("  {:>6} | {:>7} | {:>12} | {:>12} | {:>12}", "batch", "ctx", "ITL идеал", "ITL @47%", "tok/s идеал");
+    println!("  {:>6} | {:>7} | {:>12} | {:>12} | {:>12}", "batch", "ctx", "ITL идеал", "ITL @53%", "tok/s идеал");
     println!("  {:->6}-+-{:->7}-+-{:->12}-+-{:->12}-+-{:->12}", "", "", "", "", "");
     for (batch, ctx) in [(1usize, 2048usize), (1, 32768), (8, 2048), (16, 2048), (32, 2048), (32, 8192)] {
         let ideal = DecodeStep { batch, context_len: ctx, bandwidth_efficiency: 1.0 };
-        let real = DecodeStep { bandwidth_efficiency: 0.47, ..ideal };
+        let real = DecodeStep { bandwidth_efficiency: 0.53, ..ideal };
         println!(
             "  {:>6} | {:>7} | {:>9.2} ms | {:>9.2} ms | {:>9.0} t/s",
             batch, ctx,

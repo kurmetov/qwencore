@@ -12,8 +12,17 @@
 use crate::dtype::Dtype;
 use crate::memory::CacheConfig;
 
-/// Пиковая пропускная способность RTX 5090: 512 бит @ 28 Gbps.
+/// Паспортный пик RTX 5090: 512 бит @ 28 Gbps.
 pub const PEAK_BANDWIDTH: f64 = 1792e9;
+
+/// Реально достижимое чтение из DRAM, измерено на этой карте
+/// (`cargo run -p qwc-cuda --bin gpuinfo`): 90% паспортного пика.
+/// Все оценки строятся по нему — паспортное число недостижимо в принципе.
+pub const ACHIEVABLE_BANDWIDTH: f64 = 1605e9;
+
+/// Чтение из L2 (96 MiB): в 2.4 раза быстрее DRAM. Рабочие множества движка
+/// на порядки больше, поэтому применимо только внутри одного слоя.
+pub const L2_BANDWIDTH: f64 = 3886e9;
 /// Пик плотного FP4 на RTX 5090, FLOP/s.
 pub const PEAK_FP4_FLOPS: f64 = 1.676e15;
 
@@ -40,8 +49,9 @@ impl StepCost {
         self.weight_bytes + self.state_bytes + self.kv_bytes
     }
 
+    /// `efficiency` — доля достижимой пропускной способности, а не паспортной.
     pub fn seconds(&self, efficiency: f64) -> f64 {
-        self.total() as f64 / (PEAK_BANDWIDTH * efficiency)
+        self.total() as f64 / (ACHIEVABLE_BANDWIDTH * efficiency)
     }
 }
 
@@ -81,7 +91,7 @@ pub fn gemm_intensity(m: usize, weight_dtype: Dtype, n: usize, k: usize) -> f64 
 pub fn compute_bound_batch(weight_dtype: Dtype) -> f64 {
     // intensity(M) = 2*M / bytes_per_elem; порог = PEAK_FLOPS / PEAK_BW
     let bytes_per_elem = weight_dtype.effective_bits() as f64 / 8.0;
-    (PEAK_FP4_FLOPS / PEAK_BANDWIDTH) * bytes_per_elem / 2.0
+    (PEAK_FP4_FLOPS / ACHIEVABLE_BANDWIDTH) * bytes_per_elem / 2.0
 }
 
 #[cfg(test)]
@@ -98,7 +108,7 @@ mod tests {
         // Идеальный кернел: вся полоса памяти.
         let ideal = DecodeStep { batch: 1, context_len: 2048, bandwidth_efficiency: 1.0 };
         let tps = ideal.tokens_per_sec(w, &cache);
-        assert!((95.0..115.0).contains(&tps), "потолок batch=1: {tps:.0} tok/s");
+        assert!((85.0..100.0).contains(&tps), "потолок batch=1: {tps:.0} tok/s");
 
         // То, что даёт CUTLASS GEMM на M=1 (замерено: 47%).
         let real = DecodeStep { bandwidth_efficiency: 0.47, ..ideal };
@@ -141,7 +151,7 @@ mod tests {
         assert!((200.0..350.0).contains(&b), "переход при batch {b:.0}");
 
         let i32 = gemm_intensity(32, Dtype::Nvfp4, INTERMEDIATE_SIZE, HIDDEN_SIZE);
-        let threshold = PEAK_FP4_FLOPS / PEAK_BANDWIDTH;
+        let threshold = PEAK_FP4_FLOPS / ACHIEVABLE_BANDWIDTH;
         assert!(i32 < threshold);
     }
 }
