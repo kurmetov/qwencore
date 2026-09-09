@@ -1,0 +1,13 @@
+[package]
+name = "qwc-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qwc-core = { path = "../qwc-core" }
+memmap2 = "0.9"
+serde_json = "1"
+
+[lints]
+workspace = true
