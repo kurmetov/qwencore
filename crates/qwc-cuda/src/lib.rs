@@ -5,6 +5,8 @@
 //! 170 SM и block-scaled MMA для NVFP4, и на другом железе смысла не имеют.
 
 pub mod bandwidth;
+pub mod bf16;
+pub mod delta_net;
 pub mod device;
 pub mod error;
 pub(crate) mod ffi;

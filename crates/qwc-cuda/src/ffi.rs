@@ -33,4 +33,18 @@ unsafe extern "C" {
     // Кернелы из cuda/bandwidth.cu
     pub fn qwc_bw_read(src: *const c_void, bytes: usize, out: *mut f32, stream: Stream) -> c_int;
     pub fn qwc_bw_copy(src: *const c_void, dst: *mut c_void, bytes: usize, stream: Stream) -> c_int;
+
+    // Кернел из cuda/delta_net.cu
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwc_delta_decode(
+        state: *mut c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        alpha: *const c_void,
+        beta: *const c_void,
+        out: *mut c_void,
+        batch: c_int,
+        stream: Stream,
+    ) -> c_int;
 }
