@@ -282,6 +282,64 @@ fn decode_impl(
     })
 }
 
+/// Causal attention over a contiguous chunk of prefill rows of one sequence.
+///
+/// Decode-ядро обслуживает одну строку запроса за проход и потому перечитывает
+/// страницы KV столько раз, сколько в чанке токенов. Здесь один проход по KV
+/// обслуживает тайл строк, так что трафик падает кратно размеру тайла.
+/// Строки должны идти подряд и принадлежать одной последовательности: тайл
+/// делит между собой таблицу блоков, а маска остаётся причинной за счёт того,
+/// что у каждой строки свой `context_lengths`.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_gated(
+    query: &DeviceBuffer<u16>,
+    query_gate_projection: &DeviceBuffer<u16>,
+    key_cache: &DeviceBuffer<u8>,
+    value_cache: &DeviceBuffer<u8>,
+    num_blocks: usize,
+    block_tables: &DeviceBuffer<u32>,
+    context_lengths: &DeviceBuffer<u32>,
+    max_blocks_per_sequence: usize,
+    output: &mut DeviceBuffer<u16>,
+    rows: usize,
+    row_base: usize,
+    cache_dtype: KvCacheDtype,
+    stream: &Stream,
+) -> Result<()> {
+    assert!(rows > 0);
+    let end = row_base + rows;
+    assert!(query.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM);
+    assert!(query_gate_projection.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM * 2);
+    assert!(output.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM);
+    assert!(context_lengths.len() >= end);
+    assert!(block_tables.len() >= end * max_blocks_per_sequence);
+    let cache_elements = num_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
+    let cache_bytes = cache_elements * cache_dtype.bytes_per_element();
+    assert_eq!(key_cache.len(), cache_bytes);
+    assert_eq!(value_cache.len(), cache_bytes);
+
+    let launch = match cache_dtype {
+        KvCacheDtype::Fp8 => ffi::qwc_paged_attention_prefill_fp8,
+        KvCacheDtype::Bf16 => ffi::qwc_paged_attention_prefill_bf16,
+    };
+    check(unsafe {
+        launch(
+            query.as_ptr(),
+            query_gate_projection.as_ptr(),
+            key_cache.as_ptr(),
+            value_cache.as_ptr(),
+            block_tables.as_ptr(),
+            context_lengths.as_ptr(),
+            output.as_mut_ptr(),
+            rows as i32,
+            row_base as i32,
+            max_blocks_per_sequence as i32,
+            1.0 / (ATTN_HEAD_DIM as f32).sqrt(),
+            stream.raw(),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

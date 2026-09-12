@@ -253,6 +253,142 @@ __global__ __launch_bounds__(kThreads, 1) void paged_attention_parts_kernel(
   }
 }
 
+// Causal prefill: одно CTA владеет тайлом строк запроса одной последовательности,
+// варп на строку. Decode-ядро делит токены между варпами, поэтому обслуживает
+// одну строку за проход и на чанке префилла перечитывает те же страницы KV
+// столько раз, сколько в чанке токенов. Здесь проход по KV один на тайл, а
+// строки тайла переиспользуют уже прочитанные K и V: трафик падает в kWarps раз
+// при том же регистровом бюджете, потому что варпу по-прежнему принадлежит
+// ровно один онлайн-softmax.
+//
+// Межварповое слияние не нужно: аккумулятор варпа полон для своей строки, и
+// shared_output прежнего ядра (48 KiB) здесь не существует.
+template <bool Bf16Cache>
+__global__ __launch_bounds__(kThreads) void paged_attention_prefill_kernel(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ query_gate_projection,
+    const void* __restrict__ key_cache,
+    const void* __restrict__ value_cache,
+    const uint32_t* __restrict__ block_tables,
+    const uint32_t* __restrict__ context_lengths,
+    __nv_bfloat16* __restrict__ output,
+    int max_blocks,
+    int rows,
+    int row_base,
+    float softmax_scale) {
+  const int kv_head = blockIdx.x;
+  const int tile = blockIdx.y;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+
+  // Запросы тайла держим в bf16: во float это 48 KiB на блок, а конвертация
+  // при чтении стоит одну инструкцию.
+  __shared__ __nv_bfloat16 shared_query[kWarps][kGroup][kHeadDim];
+
+  const int tile_first = tile * kWarps;
+  const int tile_rows = min(kWarps, rows - tile_first);
+  for (int slot = 0; slot < tile_rows; ++slot) {
+    const int batch_row = row_base + tile_first + slot;
+    for (int i = threadIdx.x; i < kGroup * kHeadDim; i += kThreads) {
+      const int q = i / kHeadDim;
+      const int dimension = i - q * kHeadDim;
+      const int query_head = kv_head * kGroup + q;
+      const size_t offset =
+          (static_cast<size_t>(batch_row) * kQueryHeads + query_head) * kHeadDim;
+      shared_query[slot][q][dimension] = query[offset + dimension];
+    }
+  }
+  __syncthreads();
+
+  // Дальше барьеров нет, поэтому лишние варпы просто уходят.
+  if (warp >= tile_rows) {
+    return;
+  }
+  const int batch = row_base + tile_first + warp;
+  const int context = static_cast<int>(context_lengths[batch]);
+
+  float local_max[kGroup];
+  float local_sum[kGroup];
+  float accumulator[kGroup][kValuesPerLane];
+#pragma unroll
+  for (int q = 0; q < kGroup; ++q) {
+    local_max[q] = -CUDART_INF_F;
+    local_sum[q] = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kValuesPerLane; ++i) {
+      accumulator[q][i] = 0.0f;
+    }
+  }
+
+  const int dimension_base = lane * kValuesPerLane;
+  for (int token = 0; token < context; ++token) {
+    const int logical_block = token / kPageSize;
+    const uint32_t physical_block =
+        block_tables[static_cast<size_t>(batch) * max_blocks + logical_block];
+    const size_t base = cache_offset(
+        physical_block, kv_head, token % kPageSize, dimension_base);
+
+    float key[kValuesPerLane];
+#pragma unroll
+    for (int i = 0; i < kValuesPerLane; ++i) {
+      key[i] = cache_to_float<Bf16Cache>(key_cache, base + i);
+    }
+
+    float scores[kGroup];
+#pragma unroll
+    for (int q = 0; q < kGroup; ++q) {
+      float score = 0.0f;
+#pragma unroll
+      for (int i = 0; i < kValuesPerLane; ++i) {
+        score = fmaf(
+            key[i],
+            __bfloat162float(shared_query[warp][q][dimension_base + i]),
+            score);
+      }
+      score = warp_sum(score);
+      scores[q] = __shfl_sync(0xffffffffu, score, 0) * softmax_scale;
+    }
+
+    float value[kValuesPerLane];
+#pragma unroll
+    for (int i = 0; i < kValuesPerLane; ++i) {
+      value[i] = cache_to_float<Bf16Cache>(value_cache, base + i);
+    }
+
+#pragma unroll
+    for (int q = 0; q < kGroup; ++q) {
+      const float next_max = fmaxf(local_max[q], scores[q]);
+      const float previous_weight = __expf(local_max[q] - next_max);
+      const float token_weight = __expf(scores[q] - next_max);
+      local_sum[q] = local_sum[q] * previous_weight + token_weight;
+#pragma unroll
+      for (int i = 0; i < kValuesPerLane; ++i) {
+        accumulator[q][i] =
+            accumulator[q][i] * previous_weight + token_weight * value[i];
+      }
+      local_max[q] = next_max;
+    }
+  }
+
+#pragma unroll
+  for (int q = 0; q < kGroup; ++q) {
+    const int query_head = kv_head * kGroup + q;
+    const size_t output_base =
+        (static_cast<size_t>(batch) * kQueryHeads + query_head) * kHeadDim;
+#pragma unroll
+    for (int i = 0; i < kValuesPerLane; ++i) {
+      const float value =
+          local_sum[q] > 0.0f ? accumulator[q][i] / local_sum[q] : 0.0f;
+      output[output_base + dimension_base + i] = __float2bfloat16(
+          value * output_gate(
+                      query_gate_projection,
+                      batch,
+                      query_head,
+                      dimension_base + i));
+    }
+  }
+}
+
 // Higher-occupancy alternative: one CTA per query head. It rereads the KV
 // head for every member of a GQA group, but uses far fewer registers and only
 // ~9 KiB shared memory. This wins for shapes where parallelism is scarcer than
@@ -573,6 +709,83 @@ cudaError_t launch_paged_attention(
 }
 
 }  // namespace
+
+namespace {
+
+template <bool Bf16Cache>
+cudaError_t launch_prefill_attention(
+    const void* query,
+    const void* query_gate_projection,
+    const void* key_cache,
+    const void* value_cache,
+    const void* block_tables,
+    const void* context_lengths,
+    void* output,
+    int rows,
+    int row_base,
+    int max_blocks,
+    float softmax_scale,
+    cudaStream_t stream) {
+  if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
+      block_tables == nullptr || context_lengths == nullptr ||
+      output == nullptr || rows <= 0 || row_base < 0 || max_blocks <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const dim3 grid(kKvHeads, (rows + kWarps - 1) / kWarps, 1);
+  paged_attention_prefill_kernel<Bf16Cache><<<grid, kThreads, 0, stream>>>(
+      static_cast<const __nv_bfloat16*>(query),
+      static_cast<const __nv_bfloat16*>(query_gate_projection),
+      key_cache,
+      value_cache,
+      static_cast<const uint32_t*>(block_tables),
+      static_cast<const uint32_t*>(context_lengths),
+      static_cast<__nv_bfloat16*>(output),
+      max_blocks,
+      rows,
+      row_base,
+      softmax_scale);
+  return cudaGetLastError();
+}
+
+}  // namespace
+
+extern "C" cudaError_t qwc_paged_attention_prefill_bf16(
+    const void* query,
+    const void* query_gate_projection,
+    const void* key_cache,
+    const void* value_cache,
+    const void* block_tables,
+    const void* context_lengths,
+    void* output,
+    int rows,
+    int row_base,
+    int max_blocks,
+    float softmax_scale,
+    cudaStream_t stream) {
+  return launch_prefill_attention<true>(
+      query, query_gate_projection, key_cache, value_cache, block_tables,
+      context_lengths, output, rows, row_base, max_blocks, softmax_scale,
+      stream);
+}
+
+extern "C" cudaError_t qwc_paged_attention_prefill_fp8(
+    const void* query,
+    const void* query_gate_projection,
+    const void* key_cache,
+    const void* value_cache,
+    const void* block_tables,
+    const void* context_lengths,
+    void* output,
+    int rows,
+    int row_base,
+    int max_blocks,
+    float softmax_scale,
+    cudaStream_t stream) {
+  return launch_prefill_attention<false>(
+      query, query_gate_projection, key_cache, value_cache, block_tables,
+      context_lengths, output, rows, row_base, max_blocks, softmax_scale,
+      stream);
+}
 
 extern "C" cudaError_t qwc_paged_attention_fp8(
     const void* query,
