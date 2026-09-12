@@ -22,8 +22,10 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = Path.home() / "models/Qwen3.8-27B-QUASAR-NVFP4"
 
 
-def prompt_ids(count: int) -> list[int]:
-    return [1000 + (index % 20000) for index in range(count)]
+def prompt_ids(count: int, seed: int) -> list[int]:
+    """Distinct prompt per request: identical ones let prefix caching skip
+    prefill, which reports a prefill rate the hardware cannot reach."""
+    return [1000 + ((seed * 7919 + index) % 20000) for index in range(count)]
 
 
 def run_qwc(args) -> dict:
@@ -36,6 +38,9 @@ def run_qwc(args) -> dict:
         "--prompt-tokens", str(args.prompt_tokens),
         "--max-new", str(args.max_new),
         "--context", str(args.context),
+        "--kv-cache-gb", str(args.kv_cache_gb),
+        "--memory-limit-gb", str(args.memory_limit_gb),
+        "--kv-cache", args.kv_cache_dtype,
     ]
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
     if result.returncode:
@@ -54,11 +59,15 @@ def run_vllm(args) -> dict:
         max_model_len=args.context,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=False,
-        disable_log_stats=True,
+        # v1 only fills RequestStateStats when stats are enabled, and without
+        # them the record has no TTFT/ITL to compare against qwc's.
+        disable_log_stats=False,
         # Matched to qwc: the same number of concurrent sequences, and a token
         # budget per step that admits the same prefill chunking.
         max_num_seqs=args.concurrency,
-        max_num_batched_tokens=max(args.context, args.concurrency),
+        max_num_batched_tokens=args.max_batched_tokens or max(args.context, args.concurrency),
+        # "bf16" is vLLM's unquantized KV, which it spells "auto".
+        kv_cache_dtype="fp8" if args.kv_cache_dtype == "fp8" else "auto",
     )
     load_seconds = time.perf_counter() - started
 
@@ -72,12 +81,16 @@ def run_vllm(args) -> dict:
         ignore_eos=True,
         detokenize=False,
     )
-    requests = [{"prompt_token_ids": prompt_ids(args.prompt_tokens)} for _ in range(args.requests)]
+    requests = [
+        {"prompt_token_ids": prompt_ids(args.prompt_tokens, seed)}
+        for seed in range(1, args.requests + 1)
+    ]
 
-    # Warm up CUDA graphs and the caches on a smaller saturated run.
+    # Warm up CUDA graphs and the caches on a smaller saturated run. Its seeds
+    # are disjoint from the measured ones so it cannot prime the prefix cache.
     warmup = [
-        {"prompt_token_ids": prompt_ids(args.prompt_tokens)}
-        for _ in range(min(args.concurrency, args.requests))
+        {"prompt_token_ids": prompt_ids(args.prompt_tokens, 10**6 + seed)}
+        for seed in range(min(args.concurrency, args.requests))
     ]
     llm.generate(warmup, params, use_tqdm=False)
 
@@ -90,16 +103,21 @@ def run_vllm(args) -> dict:
     if output_tokens != expected:
         raise SystemExit(f"vLLM produced {output_tokens} tokens, expected {expected}")
 
+    # vLLM 0.28 reports RequestStateStats: `first_token_latency` is already
+    # wall-clock since arrival, so it includes queueing exactly like qwc's TTFT.
+    # The token timestamps are engine-core monotonic and only valid as a span.
     ttft = []
     itl = []
     for output in outputs:
         metrics = getattr(output, "metrics", None)
-        if metrics and getattr(metrics, "first_token_time", None):
-            ttft.append((metrics.first_token_time - metrics.arrival_time) * 1e3)
-            span = metrics.finished_time - metrics.first_token_time
-            produced = len(output.outputs[0].token_ids)
-            if produced > 1:
-                itl.append(span * 1e3 / (produced - 1))
+        if metrics is None:
+            continue
+        if getattr(metrics, "first_token_latency", 0.0):
+            ttft.append(metrics.first_token_latency * 1e3)
+        produced = len(output.outputs[0].token_ids)
+        span = getattr(metrics, "last_token_ts", 0.0) - getattr(metrics, "first_token_ts", 0.0)
+        if produced > 1 and span > 0:
+            itl.append(span * 1e3 / (produced - 1))
     import vllm
 
     record = {
@@ -110,6 +128,8 @@ def run_vllm(args) -> dict:
         "prompt_tokens": args.prompt_tokens,
         "max_new_tokens": args.max_new,
         "context": args.context,
+        "kv_cache": args.kv_cache_dtype,
+        "max_batched_tokens": args.max_batched_tokens or max(args.context, args.concurrency),
         "load_seconds": round(load_seconds, 3),
         "wall_seconds": round(elapsed, 4),
         "output_tokens": output_tokens,
@@ -137,6 +157,11 @@ def main() -> int:
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--context", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--kv-cache-dtype", choices=("fp8", "bf16"), default="fp8")
+    # vLLM only: match qwc's 512-token prefill arena to isolate chunk width.
+    parser.add_argument("--max-batched-tokens", type=int, default=0)
+    parser.add_argument("--kv-cache-gb", type=float, default=5.0)
+    parser.add_argument("--memory-limit-gb", type=float, default=28.0)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 

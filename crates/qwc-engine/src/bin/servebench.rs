@@ -68,19 +68,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache,
     );
 
-    // One deterministic prompt for every request: this measures the engine, and
-    // differing prompt lengths would only add scheduling noise on top.
-    let prompt: Vec<u32> = (0..args.prompt_tokens)
-        .map(|index| 1000 + (index as u32 % 20000))
-        .collect();
+    // Same length for every request, but distinct content: identical prompts
+    // would let a prefix-caching engine skip prefill entirely and report a
+    // throughput no engine can actually sustain.
     let prompts: HashMap<SeqId, Vec<u32>> = (1..=args.requests as u32)
-        .map(|id| (id, prompt.clone()))
+        .map(|id| (id, prompt_for(id, args.prompt_tokens)))
         .collect();
 
     for id in 1..=args.requests as u32 {
         scheduler.submit(Request {
             id,
-            prompt_tokens: prompt.len(),
+            prompt_tokens: args.prompt_tokens,
             max_new_tokens: args.max_new,
         })?;
     }
@@ -163,6 +161,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         percentile(&mut inter_token_ms, 0.95),
     );
     Ok(())
+}
+
+/// Distinct token ids per request; mirrors `prompt_ids` in bench/servebench.py
+/// so every engine sees byte-identical prompts.
+fn prompt_for(id: u32, length: usize) -> Vec<u32> {
+    (0..length)
+        .map(|index| 1000 + ((id.wrapping_mul(7919) + index as u32) % 20000))
+        .collect()
 }
 
 fn percentile(values: &mut [f64], fraction: f64) -> f64 {
