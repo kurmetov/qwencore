@@ -21,6 +21,18 @@ impl Rng {
     }
 }
 
+/// k.q на каждую строку и k-голову — ровно то, что считает prepare на GPU.
+/// Скан читает этот скаляр вместо того, чтобы пересчитывать его в каждом варпе.
+fn kq_rows(q: &[f32], k: &[f32]) -> Vec<f32> {
+    assert_eq!(q.len(), k.len());
+    (0..q.len() / LA_K_HEAD_DIM)
+        .map(|head| {
+            let base = head * LA_K_HEAD_DIM;
+            (0..LA_K_HEAD_DIM).map(|i| q[base + i] * k[base + i]).sum()
+        })
+        .collect()
+}
+
 fn l2_normalize_heads(v: &mut [f32], heads: usize, dim: usize) {
     for h in 0..v.len() / dim {
         let _ = heads;
@@ -72,6 +84,7 @@ fn matches_cpu_reference() {
     let mut d_state = DeviceBuffer::from_slice(&state).unwrap();
     let d_q = DeviceBuffer::from_slice(&q).unwrap();
     let d_k = DeviceBuffer::from_slice(&k).unwrap();
+    let d_kq = DeviceBuffer::from_slice(&kq_rows(&q, &k)).unwrap();
     let d_v = DeviceBuffer::from_slice(&v).unwrap();
     let d_alpha = DeviceBuffer::from_slice(&alpha).unwrap();
     let d_beta = DeviceBuffer::from_slice(&beta).unwrap();
@@ -83,6 +96,7 @@ fn matches_cpu_reference() {
         v: &d_v,
         alpha: &d_alpha,
         beta: &d_beta,
+        kq: &d_kq,
     };
     delta_net::decode(&mut d_state, &inputs, &mut d_out, batch, &stream).unwrap();
     stream.synchronize().unwrap();
@@ -143,6 +157,7 @@ fn decay_shrinks_state_when_write_disabled() {
     let mut d_state = DeviceBuffer::from_slice(&state).unwrap();
     let d_q = DeviceBuffer::from_slice(&q).unwrap();
     let d_k = DeviceBuffer::from_slice(&k).unwrap();
+    let d_kq = DeviceBuffer::from_slice(&kq_rows(&q, &k)).unwrap();
     let d_v = DeviceBuffer::from_slice(&v).unwrap();
     let d_alpha = DeviceBuffer::from_slice(&alpha).unwrap();
     let d_beta = DeviceBuffer::from_slice(&beta).unwrap();
@@ -154,6 +169,7 @@ fn decay_shrinks_state_when_write_disabled() {
         v: &d_v,
         alpha: &d_alpha,
         beta: &d_beta,
+        kq: &d_kq,
     };
     delta_net::decode(&mut d_state, &inputs, &mut d_out, batch, &stream).unwrap();
     stream.synchronize().unwrap();
@@ -189,6 +205,7 @@ fn scheduler_slots_address_persistent_state_without_gather() {
     let device_slots = DeviceBuffer::from_slice(&slots).unwrap();
     let device_q = DeviceBuffer::from_slice(inputs_host.0).unwrap();
     let device_k = DeviceBuffer::from_slice(inputs_host.1).unwrap();
+    let device_kq = DeviceBuffer::from_slice(&kq_rows(inputs_host.0, inputs_host.1)).unwrap();
     let device_v = DeviceBuffer::from_slice(inputs_host.2).unwrap();
     let device_alpha = DeviceBuffer::from_slice(inputs_host.3).unwrap();
     let device_beta = DeviceBuffer::from_slice(inputs_host.4).unwrap();
@@ -198,6 +215,7 @@ fn scheduler_slots_address_persistent_state_without_gather() {
         v: &device_v,
         alpha: &device_alpha,
         beta: &device_beta,
+        kq: &device_kq,
     };
     let mut output = DeviceBuffer::<f32>::zeroed(batch * V_ELEMS).unwrap();
     delta_net::decode_slots(
@@ -268,6 +286,7 @@ fn chunk_prefill_matches_repeated_recurrent_decode() {
     let mut device_state = DeviceBuffer::from_slice(&initial).unwrap();
     let device_q = DeviceBuffer::from_slice(&q).unwrap();
     let device_k = DeviceBuffer::from_slice(&k).unwrap();
+    let device_kq = DeviceBuffer::from_slice(&kq_rows(&q, &k)).unwrap();
     let device_v = DeviceBuffer::from_slice(&v).unwrap();
     let device_alpha = DeviceBuffer::from_slice(&alpha).unwrap();
     let device_beta = DeviceBuffer::from_slice(&beta).unwrap();
@@ -277,6 +296,7 @@ fn chunk_prefill_matches_repeated_recurrent_decode() {
         v: &device_v,
         alpha: &device_alpha,
         beta: &device_beta,
+        kq: &device_kq,
     };
     let mut output = DeviceBuffer::<f32>::zeroed(tokens * V_ELEMS).unwrap();
     delta_net::prefill_slot(
@@ -358,6 +378,7 @@ fn chunk_prefill_fp32_state_matches_fp32_reference_and_differs_from_bf16() {
     let stream = Stream::new().unwrap();
     let device_q = DeviceBuffer::from_slice(&q).unwrap();
     let device_k = DeviceBuffer::from_slice(&k).unwrap();
+    let device_kq = DeviceBuffer::from_slice(&kq_rows(&q, &k)).unwrap();
     let device_v = DeviceBuffer::from_slice(&v).unwrap();
     let device_alpha = DeviceBuffer::from_slice(&alpha).unwrap();
     let device_beta = DeviceBuffer::from_slice(&beta).unwrap();
@@ -367,6 +388,7 @@ fn chunk_prefill_fp32_state_matches_fp32_reference_and_differs_from_bf16() {
         v: &device_v,
         alpha: &device_alpha,
         beta: &device_beta,
+        kq: &device_kq,
     };
 
     let run = |mode| {
@@ -466,6 +488,7 @@ fn chunk_prefill_row_offset_reads_and_writes_only_its_slice() {
         let mut device_state = DeviceBuffer::from_slice(&initial).unwrap();
         let device_q = DeviceBuffer::from_slice(&wide_q).unwrap();
         let device_k = DeviceBuffer::from_slice(&wide_k).unwrap();
+        let device_kq = DeviceBuffer::from_slice(&kq_rows(&wide_q, &wide_k)).unwrap();
         let device_v = DeviceBuffer::from_slice(&wide_v).unwrap();
         let device_alpha = DeviceBuffer::from_slice(&wide_alpha).unwrap();
         let device_beta = DeviceBuffer::from_slice(&wide_beta).unwrap();
@@ -475,6 +498,7 @@ fn chunk_prefill_row_offset_reads_and_writes_only_its_slice() {
             v: &device_v,
             alpha: &device_alpha,
             beta: &device_beta,
+            kq: &device_kq,
         };
         let sentinel = -3.5f32;
         let mut output = DeviceBuffer::from_slice(&vec![sentinel; arena * V_ELEMS]).unwrap();
@@ -633,12 +657,16 @@ fn delta_preprocessor_matches_cpu_and_updates_only_selected_conv_slots() {
         .unwrap();
     stream.synchronize().unwrap();
 
+    let expected_kq = kq_rows(&q, &k);
     for (name, actual, expected, tolerance) in [
         ("q", prepared.q.to_vec().unwrap(), q, 2e-5f32),
         ("k", prepared.k.to_vec().unwrap(), k, 2e-4),
         ("v", prepared.v.to_vec().unwrap(), v, 2e-5),
         ("alpha", prepared.alpha.to_vec().unwrap(), alpha, 2e-4),
         ("beta", prepared.beta.to_vec().unwrap(), beta, 2e-4),
+        // Скан больше не считает k.q сам, а читает его отсюда: если prepare
+        // посчитает не то, разойдётся весь линейный слой, а не одна фаза.
+        ("kq", prepared.kq.to_vec().unwrap(), expected_kq, 2e-5),
     ] {
         for (index, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
             assert!(

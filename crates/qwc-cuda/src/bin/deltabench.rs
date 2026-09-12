@@ -7,7 +7,7 @@
 
 use qwc_core::arch::NUM_LINEAR_LAYERS;
 use qwc_core::roofline::ACHIEVABLE_BANDWIDTH;
-use qwc_cuda::delta_net::{self, DeltaInputs, GATE_ELEMS, QK_ELEMS, STATE_ELEMS, V_ELEMS};
+use qwc_cuda::delta_net::{self, DeltaInputs, GATE_ELEMS, KQ_ELEMS, QK_ELEMS, STATE_ELEMS, V_ELEMS};
 use qwc_cuda::{Device, DeviceBuffer, Event, Stream, bf16};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -54,12 +54,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let alpha = DeviceBuffer::from_slice(&vec![0.95f32; batch * GATE_ELEMS])?;
         let beta = DeviceBuffer::from_slice(&vec![0.7f32; batch * GATE_ELEMS])?;
         let mut out = DeviceBuffer::<f32>::zeroed(batch * V_ELEMS)?;
+        // k.q для постоянных q = k = 0.088 на 128 измерениях.
+        let kq = DeviceBuffer::from_slice(&vec![128.0f32 * 0.088 * 0.088; batch * KQ_ELEMS])?;
         let inputs = DeltaInputs {
             q: &q,
             k: &k,
             v: &v,
             alpha: &alpha,
             beta: &beta,
+            kq: &kq,
         };
 
         // Прогрев.

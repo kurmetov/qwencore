@@ -15,6 +15,8 @@ pub const QK_ELEMS: usize = LA_NUM_K_HEADS * LA_K_HEAD_DIM;
 pub const V_ELEMS: usize = LA_NUM_V_HEADS * LA_V_HEAD_DIM;
 /// Гейтов (alpha, beta) на последовательность.
 pub const GATE_ELEMS: usize = LA_NUM_V_HEADS;
+/// Скаляров k.q на последовательность: по одному на k-голову.
+pub const KQ_ELEMS: usize = LA_NUM_K_HEADS;
 /// FP32 causal-convolution history per persistent sequence slot and layer.
 pub const CONV_STATE_ELEMS: usize = qwc_core::arch::LA_CONV_CHANNELS * 3;
 
@@ -54,6 +56,9 @@ pub struct PreparedDelta {
     pub v: DeviceBuffer<f32>,
     pub alpha: DeviceBuffer<f32>,
     pub beta: DeviceBuffer<f32>,
+    /// k.q на токен и k-голову: общий для всех строк состояния, поэтому
+    /// считается один раз в prepare, а не в каждом варпе скана.
+    pub kq: DeviceBuffer<f32>,
     batch: usize,
 }
 
@@ -66,6 +71,7 @@ impl PreparedDelta {
             v: DeviceBuffer::zeroed(batch * V_ELEMS)?,
             alpha: DeviceBuffer::zeroed(batch * GATE_ELEMS)?,
             beta: DeviceBuffer::zeroed(batch * GATE_ELEMS)?,
+            kq: DeviceBuffer::zeroed(batch * KQ_ELEMS)?,
             batch,
         })
     }
@@ -77,6 +83,7 @@ impl PreparedDelta {
             v: &self.v,
             alpha: &self.alpha,
             beta: &self.beta,
+            kq: &self.kq,
         }
     }
 }
@@ -134,6 +141,7 @@ impl DeltaPreprocessor {
                 output.v.as_mut_ptr(),
                 output.alpha.as_mut_ptr(),
                 output.beta.as_mut_ptr(),
+                output.kq.as_mut_ptr(),
                 state_capacity as i32,
                 batch as i32,
                 mixed_qkv.stride() as i32,
@@ -179,6 +187,7 @@ impl DeltaPreprocessor {
                 output.v.as_mut_ptr(),
                 output.alpha.as_mut_ptr(),
                 output.beta.as_mut_ptr(),
+                output.kq.as_mut_ptr(),
                 state_capacity as i32,
                 state_slot as i32,
                 tokens as i32,
@@ -290,6 +299,8 @@ pub struct DeltaInputs<'a> {
     pub alpha: &'a DeviceBuffer<f32>,
     /// Сила записи sigmoid(b), [batch, 48].
     pub beta: &'a DeviceBuffer<f32>,
+    /// Скаляр k.q, [batch, 16].
+    pub kq: &'a DeviceBuffer<f32>,
 }
 
 /// Один шаг decode. Состояние обновляется на месте.
@@ -312,6 +323,7 @@ pub fn decode(
             inputs.v.as_ptr().cast(),
             inputs.alpha.as_ptr().cast(),
             inputs.beta.as_ptr().cast(),
+            inputs.kq.as_ptr().cast(),
             out.as_mut_ptr().cast(),
             batch as i32,
             batch as i32,
@@ -349,6 +361,7 @@ pub fn decode_slots(
             inputs.v.as_ptr().cast(),
             inputs.alpha.as_ptr().cast(),
             inputs.beta.as_ptr().cast(),
+            inputs.kq.as_ptr().cast(),
             out.as_mut_ptr().cast(),
             state_capacity as i32,
             batch as i32,
@@ -379,6 +392,7 @@ pub fn prefill_slot(
     assert!(inputs.v.len() >= end * V_ELEMS);
     assert!(inputs.alpha.len() >= end * GATE_ELEMS);
     assert!(inputs.beta.len() >= end * GATE_ELEMS);
+    assert!(inputs.kq.len() >= end * KQ_ELEMS);
     assert!(out.len() >= end * V_ELEMS);
     check(unsafe {
         ffi::qwc_delta_prefill(
@@ -388,6 +402,7 @@ pub fn prefill_slot(
             inputs.v.as_ptr().cast(),
             inputs.alpha.as_ptr().cast(),
             inputs.beta.as_ptr().cast(),
+            inputs.kq.as_ptr().cast(),
             out.as_mut_ptr().cast(),
             state_capacity as i32,
             state_slot as i32,

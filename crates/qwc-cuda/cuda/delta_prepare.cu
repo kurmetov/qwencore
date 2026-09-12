@@ -173,6 +173,7 @@ __global__ __launch_bounds__(kHeadDim) void normalize_and_gate_kernel(
     const __nv_bfloat16* __restrict__ dt_bias,
     float* __restrict__ alpha,
     float* __restrict__ beta,
+    float* __restrict__ kq,
     int gate_stride) {
   const int head = blockIdx.x;
   const int batch = blockIdx.y;
@@ -206,8 +207,26 @@ __global__ __launch_bounds__(kHeadDim) void normalize_and_gate_kernel(
     }
   }
   __syncthreads();
-  query[base + dimension] = q * q_inverse;
-  key[base + dimension] = k * k_inverse;
+  const float normalized_q = q * q_inverse;
+  const float normalized_k = k * k_inverse;
+  query[base + dimension] = normalized_q;
+  key[base + dimension] = normalized_k;
+
+  // k . q не зависит от строки состояния: в скане его пересчитывали все 128
+  // строк каждой из трёх v-голов, то есть 384 раза одно число, и бабочка на
+  // него стоила трети shuffle-инструкций горячего цикла. Здесь оба вектора
+  // уже в регистрах, и редукция переиспользует ту же shared-память.
+  float kq_sum = warp_sum(normalized_q * normalized_k);
+  if (lane == 0) {
+    warp_q[warp] = kq_sum;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    kq_sum = warp_sum(lane < 4 ? warp_q[lane] : 0.0f);
+    if (lane == 0) {
+      kq[static_cast<size_t>(batch) * kKHeads + head] = kq_sum;
+    }
+  }
 
   if (dimension < 3) {
     const int value_head = head * 3 + dimension;
@@ -240,6 +259,7 @@ extern "C" cudaError_t qwc_delta_prepare_decode(
     void* value,
     void* alpha,
     void* beta,
+    void* kq,
     int state_capacity,
     int batch,
     int mixed_stride,
@@ -249,6 +269,7 @@ extern "C" cudaError_t qwc_delta_prepare_decode(
       conv_weight == nullptr || a_log == nullptr || dt_bias == nullptr ||
       conv_state == nullptr || state_slots == nullptr || query == nullptr ||
       key == nullptr || value == nullptr || alpha == nullptr || beta == nullptr ||
+      kq == nullptr ||
       state_capacity < batch || batch <= 0 || batch > 128 ||
       mixed_stride < kChannels || gate_stride < kVHeads) {
     return cudaErrorInvalidValue;
@@ -279,6 +300,7 @@ extern "C" cudaError_t qwc_delta_prepare_decode(
       static_cast<const __nv_bfloat16*>(dt_bias),
       static_cast<float*>(alpha),
       static_cast<float*>(beta),
+      static_cast<float*>(kq),
       gate_stride);
   return cudaGetLastError();
 }
@@ -296,6 +318,7 @@ extern "C" cudaError_t qwc_delta_prepare_prefill(
     void* value,
     void* alpha,
     void* beta,
+    void* kq,
     int state_capacity,
     int state_slot,
     int tokens,
@@ -306,7 +329,8 @@ extern "C" cudaError_t qwc_delta_prepare_prefill(
   if (mixed_qkv == nullptr || a_projection == nullptr || b_projection == nullptr ||
       conv_weight == nullptr || a_log == nullptr || dt_bias == nullptr ||
       conv_state == nullptr || query == nullptr || key == nullptr || value == nullptr ||
-      alpha == nullptr || beta == nullptr || state_capacity <= 0 || state_slot < 0 ||
+      alpha == nullptr || beta == nullptr || kq == nullptr ||
+      state_capacity <= 0 || state_slot < 0 ||
       state_slot >= state_capacity || tokens <= 0 || tokens > 1024 ||
       row_offset < 0 || mixed_stride < kChannels || gate_stride < kVHeads) {
     return cudaErrorInvalidValue;
@@ -324,6 +348,7 @@ extern "C" cudaError_t qwc_delta_prepare_prefill(
   float* value_rows = static_cast<float*>(value) + (size_t)row_offset * kVElements;
   float* alpha_rows = static_cast<float*>(alpha) + (size_t)row_offset * kVHeads;
   float* beta_rows = static_cast<float*>(beta) + (size_t)row_offset * kVHeads;
+  float* kq_rows = static_cast<float*>(kq) + (size_t)row_offset * kKHeads;
   constexpr int threads = 256;
   const int blocks = (kChannels + threads - 1) / threads;
   dim3 conv_grid(blocks, tokens);
@@ -358,6 +383,7 @@ extern "C" cudaError_t qwc_delta_prepare_prefill(
       static_cast<const __nv_bfloat16*>(dt_bias),
       alpha_rows,
       beta_rows,
+      kq_rows,
       gate_stride);
   return cudaGetLastError();
 }
