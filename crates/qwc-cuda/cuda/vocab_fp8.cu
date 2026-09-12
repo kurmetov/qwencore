@@ -34,6 +34,30 @@ __device__ __forceinline__ uint8_t to_fp8(float value) {
   return converted.__x;
 }
 
+// Одна колонка hidden против ROWS весов: разворачивается целиком, поэтому
+// сдвиг по байту внутри упакованного слова остаётся константой.
+template <int ROWS, int COLUMNS>
+__device__ __forceinline__ void accumulate(
+    const uint32_t (&packed)[ROWS],
+    int shift,
+    const float* __restrict__ hidden_column,
+    int stride,
+    float (&accumulator)[ROWS][COLUMNS]) {
+  float x[COLUMNS];
+#pragma unroll
+  for (int i = 0; i < COLUMNS; ++i) {
+    x[i] = hidden_column[i * stride];
+  }
+#pragma unroll
+  for (int j = 0; j < ROWS; ++j) {
+    const float weight = fp8_to_float(static_cast<uint8_t>(packed[j] >> (8 * shift)));
+#pragma unroll
+    for (int i = 0; i < COLUMNS; ++i) {
+      accumulator[j][i] += weight * x[i];
+    }
+  }
+}
+
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
   for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
@@ -204,6 +228,128 @@ __global__ void lm_head_kernel(
     const float total = warp_sum(accumulator[b]);
     if (lane == 0) {
       logits[static_cast<size_t>(b) * vocab + row] = total * scale;
+    }
+  }
+}
+
+// Батчевый проход по словарю: тайл [kRowTile строк × BATCH_TILE столбцов].
+//
+// Прежний кернел держит hidden-тайл в статической shared и упирается в batch 8,
+// а батчи больше перечитывают все 1.27 ГБ таблицы на каждую группу: на
+// concurrency 64 это восемь проходов и треть шага. Здесь таблица читается один
+// раз. Цена постановки hidden в shared амортизируется числом строк на блок:
+// при 128 строках она вдвое меньше самих весов, тогда как при восьми была бы
+// больше их на порядок.
+constexpr int kRowTile = 128;
+constexpr int kBatchThreads = 16;
+constexpr int kRowThreads = kThreads / kBatchThreads;
+constexpr int kRowsPerThread = kRowTile / kRowThreads;
+constexpr int kLogitsChunk = 64;
+// Шаг тайла по batch: аккумуляторы живут в регистрах, поэтому берётся
+// наименьший подходящий тайл, а не максимальный.
+constexpr int kBatchTileStep = kBatchThreads;
+constexpr int kMaxBatchedLogits = 96;
+
+template <int BATCH_TILE>
+__global__ __launch_bounds__(kThreads) void lm_head_batched_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ row_scales,
+    const __nv_bfloat16* __restrict__ hidden,
+    float* __restrict__ logits,
+    int hidden_size,
+    int vocab,
+    int batch) {
+  constexpr int kBatchPerThread = BATCH_TILE / kBatchThreads;
+  __shared__ uint8_t weight_tile[kRowTile][kLogitsChunk];
+  // Лишний столбец разводит по банкам чтение тайла во внутреннем цикле.
+  __shared__ float hidden_tile[BATCH_TILE][kLogitsChunk + 1];
+
+  const int row_base = blockIdx.x * kRowTile;
+  const int row_group = threadIdx.x / kBatchThreads;
+  const int batch_group = threadIdx.x % kBatchThreads;
+
+  float accumulator[kRowsPerThread][kBatchPerThread];
+#pragma unroll
+  for (int j = 0; j < kRowsPerThread; ++j) {
+#pragma unroll
+    for (int i = 0; i < kBatchPerThread; ++i) {
+      accumulator[j][i] = 0.0f;
+    }
+  }
+
+  for (int base = 0; base < hidden_size; base += kLogitsChunk) {
+    const int width = min(kLogitsChunk, hidden_size - base);
+    __syncthreads();
+    // Веса: по четыре байта на поток, шестнадцать потоков на строку.
+    for (int index = threadIdx.x; index < kRowTile * (kLogitsChunk / 4);
+         index += kThreads) {
+      const int row = index / (kLogitsChunk / 4);
+      const int column = (index % (kLogitsChunk / 4)) * 4;
+      uint32_t packed = 0;
+      if (row_base + row < vocab && column < width) {
+        const size_t offset =
+            static_cast<size_t>(row_base + row) * hidden_size + base + column;
+        if (column + 4 <= width) {
+          packed = *reinterpret_cast<const uint32_t*>(weights + offset);
+        } else {
+          for (int i = 0; i < width - column; ++i) {
+            packed |= static_cast<uint32_t>(weights[offset + i]) << (8 * i);
+          }
+        }
+      }
+      *reinterpret_cast<uint32_t*>(&weight_tile[row][column]) = packed;
+    }
+    // hidden: строка на последовательность, столбцы идут подряд.
+    for (int index = threadIdx.x; index < BATCH_TILE * kLogitsChunk;
+         index += kThreads) {
+      const int b = index / kLogitsChunk;
+      const int column = index - b * kLogitsChunk;
+      float value = 0.0f;
+      if (b < batch && column < width) {
+        value = __bfloat162float(
+            hidden[static_cast<size_t>(b) * hidden_size + base + column]);
+      }
+      hidden_tile[b][column] = value;
+    }
+    __syncthreads();
+
+    for (int k = 0; k < width; k += 4) {
+      uint32_t packed[kRowsPerThread];
+#pragma unroll
+      for (int j = 0; j < kRowsPerThread; ++j) {
+        packed[j] = *reinterpret_cast<const uint32_t*>(
+            &weight_tile[row_group * kRowsPerThread + j][k]);
+      }
+      if (k + 4 <= width) {
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          accumulate<kRowsPerThread, kBatchPerThread>(
+              packed, s, &hidden_tile[batch_group * kBatchPerThread][k + s],
+              kLogitsChunk + 1, accumulator);
+        }
+      } else {
+        for (int s = 0; s < width - k; ++s) {
+          accumulate<kRowsPerThread, kBatchPerThread>(
+              packed, s, &hidden_tile[batch_group * kBatchPerThread][k + s],
+              kLogitsChunk + 1, accumulator);
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int j = 0; j < kRowsPerThread; ++j) {
+    const int row = row_base + row_group * kRowsPerThread + j;
+    if (row >= vocab) {
+      continue;
+    }
+    const float scale = row_scales[row];
+#pragma unroll
+    for (int i = 0; i < kBatchPerThread; ++i) {
+      const int b = batch_group * kBatchPerThread + i;
+      if (b < batch) {
+        logits[static_cast<size_t>(b) * vocab + row] = accumulator[j][i] * scale;
+      }
     }
   }
 }
@@ -409,5 +555,45 @@ extern "C" cudaError_t qwc_bf16_lm_head(
   }
   return cudaGetLastError();
 }
+
+extern "C" cudaError_t qwc_fp8_lm_head_batched(
+    const void* weights,
+    const void* row_scales,
+    const void* hidden,
+    void* logits,
+    int batch,
+    int hidden_size,
+    int vocab,
+    cudaStream_t stream) {
+  if (weights == nullptr || row_scales == nullptr || hidden == nullptr ||
+      logits == nullptr || batch <= 0 || batch > kMaxBatchedLogits ||
+      hidden_size <= 0 || hidden_size % 4 != 0 || vocab <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int blocks = (vocab + kRowTile - 1) / kRowTile;
+  const uint8_t* w = static_cast<const uint8_t*>(weights);
+  const float* s = static_cast<const float*>(row_scales);
+  const __nv_bfloat16* h = static_cast<const __nv_bfloat16*>(hidden);
+  float* out = static_cast<float*>(logits);
+  switch ((batch + kBatchTileStep - 1) / kBatchTileStep) {
+#define QWC_LM_HEAD_TILE(n)                                                  \
+  case (n) / kBatchTileStep:                                                 \
+    lm_head_batched_kernel<n><<<blocks, kThreads, 0, stream>>>(              \
+        w, s, h, out, hidden_size, vocab, batch);                            \
+    break;
+    QWC_LM_HEAD_TILE(16)
+    QWC_LM_HEAD_TILE(32)
+    QWC_LM_HEAD_TILE(48)
+    QWC_LM_HEAD_TILE(64)
+    QWC_LM_HEAD_TILE(80)
+    QWC_LM_HEAD_TILE(96)
+#undef QWC_LM_HEAD_TILE
+    default:
+      return cudaErrorInvalidValue;
+  }
+  return cudaGetLastError();
+}
+
+extern "C" int qwc_fp8_max_batched_logits() { return kMaxBatchedLogits; }
 
 extern "C" int qwc_fp8_max_logits_batch() { return kMaxLogitsBatch; }

@@ -18,12 +18,14 @@ pub mod paged_attention;
 pub mod rmsnorm;
 pub mod sampling;
 pub mod stream;
+pub mod timeline;
 pub mod vocab;
 
 pub use device::Device;
 pub use error::{CudaError, Result};
 pub use memory::{DeviceBuffer, MemoryUsage, memory_usage, set_memory_limit};
 pub use stream::{Event, Stream};
+pub use timeline::Timeline;
 
 /// Compacts selected rows of a BF16 `[rows, cols]` arena into a dense buffer.
 ///

@@ -10,14 +10,22 @@ use crate::error::{Result, check};
 use crate::{DeviceBuffer, Stream, ffi};
 use std::ffi::c_void;
 
-/// Потолок batch одного запуска logits: hidden-тайл лежит в статической
-/// shared-памяти. Батчи больше режутся на группы, ценой повторного чтения
-/// весов — 1.27 GB на группу.
+/// Потолок batch узкого кернела logits: hidden-тайл лежит в статической
+/// shared-памяти. На batch 1 он идёт на потолке полосы, поэтому остаётся
+/// быстрым путём для одиночной последовательности.
 pub const MAX_LOGITS_BATCH: usize = 8;
 
-/// Тот же потолок, но прочитанный из кернела: константы не должны разъезжаться.
+/// Потолок batch батчевого кернела: таблица читается один раз на любой batch
+/// вплоть до этого значения. Выше — группы, как и раньше.
+pub const MAX_BATCHED_LOGITS: usize = 96;
+
+/// Те же потолки, но прочитанные из кернела: константы не должны разъезжаться.
 pub fn kernel_max_logits_batch() -> usize {
     unsafe { ffi::qwc_fp8_max_logits_batch() as usize }
+}
+
+pub fn kernel_max_batched_logits() -> usize {
+    unsafe { ffi::qwc_fp8_max_batched_logits() as usize }
 }
 
 pub struct Fp8Vocab {
@@ -251,8 +259,11 @@ impl Fp8Vocab {
         })
     }
 
-    /// Логиты `[batch, vocab]` в FP32. Батчи больше `MAX_LOGITS_BATCH`
-    /// разбиваются на группы: каждая группа перечитывает веса целиком.
+    /// Логиты `[batch, vocab]` в FP32.
+    ///
+    /// До `MAX_LOGITS_BATCH` работает узкий кернел — на batch 1 он уже на
+    /// потолке полосы. Дальше идёт батчевый: он читает таблицу один раз, тогда
+    /// как группы по восемь перечитывали её по 1.27 GB на группу.
     pub fn logits(
         &self,
         hidden: &DeviceBuffer<u16>,
@@ -263,6 +274,9 @@ impl Fp8Vocab {
         assert!(batch > 0);
         assert!(hidden.len() >= batch * self.cols);
         assert!(logits.len() >= batch * self.rows);
+        if batch > MAX_LOGITS_BATCH && self.cols.is_multiple_of(4) {
+            return self.logits_batched(hidden, logits, batch, stream);
+        }
         let mut done = 0;
         while done < batch {
             let group = (batch - done).min(MAX_LOGITS_BATCH);
@@ -273,6 +287,41 @@ impl Fp8Vocab {
                 unsafe { (logits.as_mut_ptr() as *mut f32).add(done * self.rows) as *mut c_void };
             check(unsafe {
                 ffi::qwc_fp8_lm_head(
+                    self.data.as_ptr(),
+                    self.row_scales.as_ptr(),
+                    hidden_ptr,
+                    logits_ptr,
+                    group as i32,
+                    self.cols as i32,
+                    self.rows as i32,
+                    stream.raw(),
+                )
+            })?;
+            done += group;
+        }
+        Ok(())
+    }
+
+    /// Один проход по таблице на весь batch. Батчи больше
+    /// `MAX_BATCHED_LOGITS` всё ещё режутся, но это далеко за пределами
+    /// `MAX_BATCH` исполнителя.
+    fn logits_batched(
+        &self,
+        hidden: &DeviceBuffer<u16>,
+        logits: &mut DeviceBuffer<f32>,
+        batch: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let mut done = 0;
+        while done < batch {
+            let group = (batch - done).min(MAX_BATCHED_LOGITS);
+            // SAFETY: смещения внутри уже проверенных по длине буферов.
+            let hidden_ptr =
+                unsafe { (hidden.as_ptr() as *const u16).add(done * self.cols) as *const c_void };
+            let logits_ptr =
+                unsafe { (logits.as_mut_ptr() as *mut f32).add(done * self.rows) as *mut c_void };
+            check(unsafe {
+                ffi::qwc_fp8_lm_head_batched(
                     self.data.as_ptr(),
                     self.row_scales.as_ptr(),
                     hidden_ptr,
@@ -400,5 +449,6 @@ mod tests {
     #[test]
     fn max_logits_batch_matches_kernel() {
         assert_eq!(super::MAX_LOGITS_BATCH, super::kernel_max_logits_batch());
+        assert_eq!(super::MAX_BATCHED_LOGITS, super::kernel_max_batched_logits());
     }
 }

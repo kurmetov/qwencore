@@ -17,7 +17,7 @@ use qwc_cuda::graph::CudaGraph;
 use qwc_cuda::nvfp4::{self, QuantizedActivation, W4A4Workspace};
 use qwc_cuda::paged_attention::{self, KvCacheDtype, PAGE_SIZE, PagedAttentionWorkspace};
 use qwc_cuda::sampling::Argmax;
-use qwc_cuda::{DeviceBuffer, Result, Stream, bf16};
+use qwc_cuda::{DeviceBuffer, Result, Stream, Timeline, bf16};
 use qwc_runtime::BatchLayout;
 
 /// Persistent sequence slots supported by the decode kernels.
@@ -118,6 +118,11 @@ pub struct Executor {
     sampler: Argmax,
     decode_graphs: Vec<Option<CudaGraph>>,
     captured_weights: Option<usize>,
+
+    // Пофазный таймлайн. Пока он включён, шаг decode идёт мимо CUDA graph:
+    // внутри захвата события не измеряют время. Разница между шагом с
+    // таймлайном и шагом с графом — это и есть цена запусков.
+    profile: Option<Timeline>,
 
     // Хостовые заготовки, чтобы не аллоцировать на каждом шаге.
     host_cosine: Vec<u16>,
@@ -383,6 +388,7 @@ impl Executor {
             sampler: Argmax::new(batch, VOCAB_SIZE)?,
             decode_graphs: (0..batch).map(|_| None).collect(),
             captured_weights: None,
+            profile: None,
             host_cosine: vec![0; batch * ROPE_DIM],
             host_sine: vec![0; batch * ROPE_DIM],
             host_physical: vec![0; batch],
@@ -396,6 +402,47 @@ impl Executor {
 
     pub fn stream(&self) -> &Stream {
         &self.stream
+    }
+
+    /// Включает пофазный замер. Шаг чистого decode перестаёт идти через CUDA
+    /// graph — события внутри захвата времени не дают.
+    pub fn profile_enable(&mut self) {
+        self.profile = Some(Timeline::new());
+    }
+
+    pub fn profile_disable(&mut self) {
+        self.profile = None;
+    }
+
+    /// Сбрасывает метки перед шагом. Итоги читаются после него.
+    pub fn profile_reset(&mut self) {
+        if let Some(timeline) = self.profile.as_mut() {
+            timeline.reset();
+        }
+    }
+
+    /// Суммы по фазам последнего шага в порядке первого появления.
+    pub fn profile_totals(&self) -> Result<Vec<(&'static str, f32)>> {
+        match self.profile.as_ref() {
+            Some(timeline) => timeline.totals(),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Время от первой метки шага до последней и число меток.
+    pub fn profile_span(&self) -> Result<(f32, usize)> {
+        match self.profile.as_ref() {
+            Some(timeline) => Ok((timeline.total_ms()?, timeline.marks())),
+            None => Ok((0.0, 0)),
+        }
+    }
+
+    /// Открывает фазу: интервал до следующей метки уйдёт в `label`.
+    fn mark(&mut self, label: &'static str) -> Result<()> {
+        if let Some(timeline) = self.profile.as_mut() {
+            timeline.mark(label, &self.stream)?;
+        }
+        Ok(())
     }
 
     pub fn logits(&self) -> &DeviceBuffer<f32> {
@@ -429,8 +476,11 @@ impl Executor {
             self.max_context
         );
 
+        self.profile_reset();
+        self.mark("upload")?;
         self.upload_step(tokens, positions)?;
-        self.launch_decode(weights, batch, max_position)
+        self.launch_decode(weights, batch, max_position)?;
+        self.mark("end")
     }
 
     /// Executes scheduler-produced metadata against the persistent state/KV
@@ -449,6 +499,8 @@ impl Executor {
         assert_eq!(layout.token_offsets.len(), sequences + 1);
         assert_eq!(layout.block_table_offsets.len(), sequences + 1);
 
+        self.profile_reset();
+        self.mark("upload")?;
         if sequences == decode {
             // Pure decode: this shape is captured in a CUDA graph, which is
             // where the single-sequence latency comes from. Keep it.
@@ -474,7 +526,9 @@ impl Executor {
                 let position_start = layout.position_starts[row] as usize;
                 let state_slot = layout.state_slots[row] as usize;
                 if position_start == 0 {
+                    self.mark("reset")?;
                     self.reset_slot(state_slot)?;
+                    self.mark("upload")?;
                 }
                 segments.push(Segment {
                     state_slot,
@@ -501,7 +555,9 @@ impl Executor {
             self.stream.synchronize()?;
         }
 
+        self.mark("sample")?;
         let sampled = self.argmax_to_host(sequences)?;
+        self.mark("end")?;
         Ok(layout.seq_ids.iter().copied().zip(sampled).collect())
     }
 
@@ -516,6 +572,12 @@ impl Executor {
             self.decode_linear_mode,
             "weights and executor use different decode linear modes"
         );
+        if self.profile.is_some() {
+            // Захват графа не измеряется событиями: под таймлайном шаг идёт
+            // обычными запусками, и цена этих запусков видна в сумме фаз.
+            self.decode_forward(weights, batch, max_position)?;
+            return self.stream.synchronize();
+        }
         let weights_key = weights as *const ModelWeights as usize;
         if let Some(captured) = self.captured_weights {
             assert_eq!(
@@ -548,6 +610,7 @@ impl Executor {
         batch: usize,
         max_position: usize,
     ) -> Result<()> {
+        self.mark("embed")?;
         weights
             .embed
             .gather_rows(&self.tokens, &mut self.residual, batch, &self.stream)?;
@@ -555,6 +618,7 @@ impl Executor {
         // Схема слоя: residual несёт магистраль, а норма следующего блока
         // сама добавляет в неё выход предыдущего. Отдельного сложения нет —
         // это и есть fused residual-add в RmsNorm.
+        self.mark("norm")?;
         weights.layers[0].input_norm.forward_bf16(
             &self.residual,
             None,
@@ -577,6 +641,7 @@ impl Executor {
                 }
             }
 
+            self.mark("norm")?;
             layer.post_attention_norm.forward_bf16(
                 &self.mixer_out,
                 Some(&mut self.residual),
@@ -585,6 +650,7 @@ impl Executor {
                 &self.stream,
             )?;
 
+            self.mark("gemm.mlp_gate_up")?;
             if self.decode_linear_mode == DecodeLinearMode::Auto && batch <= nvfp4::MAX_W4A16_BATCH
             {
                 nvfp4::swiglu_w4a16(
@@ -614,6 +680,7 @@ impl Executor {
                     batch,
                     &self.stream,
                 )?;
+                self.mark("swiglu")?;
                 nvfp4::swiglu_bf16(
                     &self.mlp_gate,
                     &self.mlp_up,
@@ -623,6 +690,7 @@ impl Executor {
                     &self.stream,
                 )?;
             }
+            self.mark("gemm.mlp_down")?;
             project_decode(
                 &layer.mlp.down,
                 &self.mlp_hidden,
@@ -637,6 +705,7 @@ impl Executor {
                 Some(next) => &next.input_norm,
                 None => &weights.final_norm,
             };
+            self.mark("norm")?;
             next_norm.forward_bf16(
                 &self.mlp_out,
                 Some(&mut self.residual),
@@ -646,6 +715,7 @@ impl Executor {
             )?;
         }
 
+        self.mark("lm_head")?;
         weights
             .lm_head
             .logits(&self.normed, &mut self.logits, batch, &self.stream)
@@ -751,6 +821,40 @@ impl Executor {
         block_ids: &[u32],
         block_bounds: &[usize],
     ) -> Result<()> {
+        // Таймлайн вынимается из `self`: внутри прохода арена шага занята
+        // изменяемым заимствованием, и метод `mark` туда уже не пройдёт.
+        let mut timeline = self.profile.take();
+        let result = self.forward_segments_inner(
+            weights,
+            segments,
+            decode_rows,
+            input_tokens,
+            block_ids,
+            block_bounds,
+            timeline.as_mut(),
+        );
+        self.profile = timeline;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_segments_inner(
+        &mut self,
+        weights: &ModelWeights,
+        segments: &[Segment],
+        decode_rows: usize,
+        input_tokens: &[u32],
+        block_ids: &[u32],
+        block_bounds: &[usize],
+        mut timeline: Option<&mut Timeline>,
+    ) -> Result<()> {
+        macro_rules! mark {
+            ($label:expr) => {
+                if let Some(tl) = timeline.as_deref_mut() {
+                    tl.mark($label, &self.stream)?;
+                }
+            };
+        }
         debug_assert!(!segments.is_empty());
         // Leading one-token rows share one recurrent-step launch; only the
         // remaining sequences need a scan of their own. Without this a step at
@@ -772,12 +876,15 @@ impl Executor {
             .expect("a step has at least one segment");
         debug_assert!(live > 0 && live <= PREFILL_CHUNK_SIZE);
         debug_assert_eq!(block_bounds.len(), segments.len() + 1);
+        mark!("upload");
         self.upload_segments(segments, input_tokens, block_ids, block_bounds)?;
 
         let prefill = &mut self.prefill;
+        mark!("embed");
         weights
             .embed
             .gather(&prefill.tokens, &mut prefill.residual, &self.stream)?;
+        mark!("norm");
         weights.layers[0].input_norm.forward_bf16(
             &prefill.residual,
             None,
@@ -791,6 +898,7 @@ impl Executor {
         for (index, layer) in weights.layers.iter().enumerate() {
             match &layer.mixer {
                 Mixer::Linear(mixer) => {
+                    mark!("gemm.la_qkvab");
                     project_w4a4(
                         &mixer.qkv,
                         &prefill.normed,
@@ -830,6 +938,7 @@ impl Executor {
                     // The recurrence is per sequence, but the one-token rows
                     // are contiguous from row zero and share a single launch.
                     if decode_rows > 0 {
+                        mark!("delta.prepare");
                         mixer.prepare.prepare_decode(
                             &prefill.mixed_qkv,
                             &prefill.a_projection,
@@ -841,6 +950,7 @@ impl Executor {
                             decode_rows,
                             &self.stream,
                         )?;
+                        mark!("delta.scan");
                         delta_net::decode_slots(
                             &mut self.state_pools[linear_layer],
                             &prefill.decode_slots,
@@ -852,6 +962,7 @@ impl Executor {
                         )?;
                     }
                     for segment in &segments[decode_rows..] {
+                        mark!("delta.prepare_prefill");
                         mixer.prepare.prepare_prefill(
                             &prefill.mixed_qkv,
                             &prefill.a_projection,
@@ -864,6 +975,7 @@ impl Executor {
                             segment.row_begin,
                             &self.stream,
                         )?;
+                        mark!("delta.scan_prefill");
                         delta_net::prefill_slot(
                             &mut self.state_pools[linear_layer],
                             &prefill.prepared.inputs(),
@@ -876,6 +988,7 @@ impl Executor {
                             &self.stream,
                         )?;
                     }
+                    mark!("delta.norm");
                     mixer.output_norm.forward(
                         &prefill.delta_out,
                         &prefill.z_gate,
@@ -883,6 +996,7 @@ impl Executor {
                         live,
                         &self.stream,
                     )?;
+                    mark!("gemm.la_out");
                     project_w4a4(
                         &mixer.out,
                         &prefill.delta_normed,
@@ -895,6 +1009,7 @@ impl Executor {
                     linear_layer += 1;
                 }
                 Mixer::Full(mixer) => {
+                    mark!("gemm.attn_qkv");
                     project_w4a4(
                         &mixer.q,
                         &prefill.normed,
@@ -923,6 +1038,7 @@ impl Executor {
                         &self.stream,
                     )?;
                     let blocks = self.max_batch * self.max_blocks;
+                    mark!("attn.prepare");
                     mixer.prepare.prepare_decode(
                         &prefill.query_gate,
                         &prefill.key_projection,
@@ -939,6 +1055,7 @@ impl Executor {
                         self.kv_cache_dtype,
                         &self.stream,
                     )?;
+                    mark!("attn.decode");
                     paged_attention::decode_gated(
                         &prefill.query,
                         &prefill.query_gate,
@@ -955,6 +1072,7 @@ impl Executor {
                         self.kv_cache_dtype,
                         &self.stream,
                     )?;
+                    mark!("gemm.attn_out");
                     project_w4a4(
                         &mixer.o,
                         &prefill.attention_out,
@@ -968,6 +1086,7 @@ impl Executor {
                 }
             }
 
+            mark!("norm");
             layer.post_attention_norm.forward_bf16(
                 &prefill.mixer_out,
                 Some(&mut prefill.residual),
@@ -975,6 +1094,7 @@ impl Executor {
                 live,
                 &self.stream,
             )?;
+            mark!("gemm.mlp_gate_up");
             project_w4a4(
                 &layer.mlp.gate,
                 &prefill.normed,
@@ -993,6 +1113,7 @@ impl Executor {
                 live,
                 &self.stream,
             )?;
+            mark!("swiglu");
             nvfp4::swiglu_bf16(
                 &prefill.mlp_gate,
                 &prefill.mlp_up,
@@ -1001,6 +1122,7 @@ impl Executor {
                 INTERMEDIATE_SIZE,
                 &self.stream,
             )?;
+            mark!("gemm.mlp_down");
             project_w4a4(
                 &layer.mlp.down,
                 &prefill.mlp_hidden,
@@ -1015,6 +1137,7 @@ impl Executor {
                 Some(next) => &next.input_norm,
                 None => &weights.final_norm,
             };
+            mark!("norm");
             next_norm.forward_bf16(
                 &prefill.mlp_out,
                 Some(&mut prefill.residual),
@@ -1028,6 +1151,7 @@ impl Executor {
         // sequence would re-read the whole 1.27 GB lm_head each time, so the
         // last row of every segment is gathered into a dense buffer first.
         if let [only] = segments {
+            mark!("lm_head");
             return weights.lm_head.logits_row_to(
                 &prefill.normed,
                 only.row_begin + only.tokens - 1,
@@ -1046,6 +1170,7 @@ impl Executor {
         prefill
             .last_rows
             .copy_from_slice_at(0, &prefill.host_last_rows[..segments.len()])?;
+        mark!("gather_rows");
         qwc_cuda::gather_rows_bf16(
             &prefill.normed,
             &prefill.last_rows,
@@ -1054,6 +1179,7 @@ impl Executor {
             HIDDEN_SIZE,
             &self.stream,
         )?;
+        mark!("lm_head");
         weights.lm_head.logits(
             &prefill.last_hidden,
             &mut self.logits,
@@ -1068,6 +1194,7 @@ impl Executor {
         layer: usize,
         batch: usize,
     ) -> Result<()> {
+        self.mark("gemm.la_qkvab")?;
         project_decode(
             &mixer.qkv,
             &self.normed,
@@ -1105,6 +1232,7 @@ impl Executor {
             &self.stream,
         )?;
 
+        self.mark("delta.prepare")?;
         mixer.prepare.prepare_decode(
             &self.mixed_qkv,
             &self.a_projection,
@@ -1116,6 +1244,7 @@ impl Executor {
             batch,
             &self.stream,
         )?;
+        self.mark("delta.scan")?;
         delta_net::decode_slots(
             &mut self.state_pools[layer],
             &self.state_slots,
@@ -1125,6 +1254,7 @@ impl Executor {
             batch,
             &self.stream,
         )?;
+        self.mark("delta.norm")?;
         mixer.output_norm.forward(
             &self.delta_out,
             &self.z_gate,
@@ -1132,6 +1262,7 @@ impl Executor {
             batch,
             &self.stream,
         )?;
+        self.mark("gemm.la_out")?;
         project_decode(
             &mixer.out,
             &self.delta_normed,
@@ -1150,6 +1281,7 @@ impl Executor {
         batch: usize,
         max_position: usize,
     ) -> Result<()> {
+        self.mark("gemm.attn_qkv")?;
         project_decode(
             &mixer.q,
             &self.normed,
@@ -1179,6 +1311,7 @@ impl Executor {
         )?;
 
         let blocks = self.max_batch * self.max_blocks;
+        self.mark("attn.prepare")?;
         mixer.prepare.prepare_decode(
             &self.query_gate,
             &self.key_projection,
@@ -1195,6 +1328,7 @@ impl Executor {
             self.kv_cache_dtype,
             &self.stream,
         )?;
+        self.mark("attn.decode")?;
         paged_attention::decode_gated(
             &self.query,
             &self.query_gate,
@@ -1211,6 +1345,7 @@ impl Executor {
             self.kv_cache_dtype,
             &self.stream,
         )?;
+        self.mark("gemm.attn_out")?;
         project_decode(
             &mixer.o,
             &self.attention_out,

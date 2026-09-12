@@ -1,7 +1,7 @@
 //! FP8-словарь: квантизация строк, выборка эмбеддингов и логиты.
 
 use qwc_cuda::nvfp4::reference::e4m3;
-use qwc_cuda::vocab::{Bf16Vocab, Fp8Vocab, MAX_LOGITS_BATCH, reference};
+use qwc_cuda::vocab::{Bf16Vocab, Fp8Vocab, MAX_BATCHED_LOGITS, MAX_LOGITS_BATCH, reference};
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
 
 struct Rng(u64);
@@ -119,8 +119,9 @@ fn logits_match_dequantized_oracle_including_batch_split() {
     let (vocab, stream) = upload(ROWS, COLS, &host, 64);
     let (data, scales) = vocab.to_host().expect("копия на хост");
 
-    // batch 12 обязательно режется: потолок одного запуска — 8.
-    for batch in [1usize, MAX_LOGITS_BATCH, 12] {
+    // 1 и 8 идут узким кернелом, дальше батчевым: 12 и 33 попадают на
+    // неполный тайл, 96 — на максимальный, 100 снова режется на группы.
+    for batch in [1usize, MAX_LOGITS_BATCH, 12, 16, 33, 64, MAX_BATCHED_LOGITS, 100] {
         let mut rng = Rng(0x4242 + batch as u64);
         let hidden: Vec<u16> = (0..batch * COLS)
             .map(|_| bf16::from_f32(rng.next_f32()))

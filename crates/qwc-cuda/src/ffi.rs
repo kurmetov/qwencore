@@ -105,7 +105,21 @@ unsafe extern "C" {
         stream: Stream,
     ) -> c_int;
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwc_fp8_lm_head_batched(
+        weights: *const c_void,
+        row_scales: *const c_void,
+        hidden: *const c_void,
+        logits: *mut c_void,
+        batch: c_int,
+        hidden_size: c_int,
+        vocab: c_int,
+        stream: Stream,
+    ) -> c_int;
+
     pub fn qwc_fp8_max_logits_batch() -> c_int;
+
+    pub fn qwc_fp8_max_batched_logits() -> c_int;
 
     // Кернел из cuda/delta_net.cu
     #[allow(clippy::too_many_arguments)]
