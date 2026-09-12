@@ -29,5 +29,9 @@ impl fmt::Display for CudaError {
 impl std::error::Error for CudaError {}
 
 pub(crate) fn check(code: i32) -> Result<()> {
-    if code == 0 { Ok(()) } else { Err(CudaError(code)) }
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(CudaError(code))
+    }
 }

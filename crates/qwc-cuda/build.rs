@@ -28,6 +28,18 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let mut includes: Vec<PathBuf> = Vec::new();
 
+    // CUTLASS используется только как header-only генератор SM120 MMA.
+    // В runtime он не добавляет ни зависимостей, ни скрытых аллокаций.
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let cutlass = manifest.join("../../third_party/cutlass");
+    assert!(
+        cutlass.join("include/cutlass/cutlass.h").exists(),
+        "не найден vendored CUTLASS в {}",
+        cutlass.display()
+    );
+    includes.push(cutlass.join("include"));
+    includes.push(cutlass.join("tools/util/include"));
+
     // Баг CUDA 13.1 + glibc >= 2.41: конфликт объявлений rsqrt.
     // Проверяем компиляцией, а не версией, чтобы обход сам отключился
     // на CUDA >= 13.3, где NVIDIA это исправила.
@@ -35,7 +47,7 @@ fn main() {
         let shim = out.join("cuda-shim");
         generate_shim(&cuda, &shim);
         assert!(
-            probe_compiles(&nvcc, &out, &[shim.clone()]),
+            probe_compiles(&nvcc, &out, std::slice::from_ref(&shim)),
             "не удалось обойти конфликт заголовков CUDA/glibc даже с шимом"
         );
         println!("cargo:warning=применён обход бага CUDA/glibc (см. docs/02-toolchain.md)");
@@ -72,7 +84,10 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=qwc_kernels");
-    println!("cargo:rustc-link-search=native={}", cuda.join("lib64").display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        cuda.join("lib64").display()
+    );
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
 }
@@ -132,8 +147,14 @@ fn generate_shim(cuda: &Path, shim: &Path) {
 
     let orig = fs::read_to_string(inc.join("crt/math_functions.h")).unwrap();
     let patched = orig
-        .replace("double                 rsqrt(double x);", "double                 rsqrt(double x) noexcept;")
-        .replace("float                  rsqrtf(float x);", "float                  rsqrtf(float x) noexcept;");
+        .replace(
+            "double                 rsqrt(double x);",
+            "double                 rsqrt(double x) noexcept;",
+        )
+        .replace(
+            "float                  rsqrtf(float x);",
+            "float                  rsqrtf(float x) noexcept;",
+        );
     assert!(
         patched.contains("rsqrt(double x) noexcept;"),
         "патч не применился: заголовок CUDA изменился"

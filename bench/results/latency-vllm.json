@@ -1,0 +1,1 @@
+{"engine": "vllm", "version": "0.28.0", "batch": 1, "prompt_tokens": 9, "short_tokens": 8, "long_tokens": 72, "repeats": 5, "load_seconds": 89.489, "short_ms": 165.3167, "long_ms": 1385.0966, "decode_ms_per_token": 19.0591, "tokens_per_second": 52.47}

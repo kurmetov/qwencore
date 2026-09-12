@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/qwc-core", "crates/qwc-cuda", "crates/qwc-model"]
+members = [
+    "crates/qwc-core",
+    "crates/qwc-cuda",
+    "crates/qwc-engine",
+    "crates/qwc-model",
+    "crates/qwc-runtime",
+]
 
 [workspace.package]
 version = "0.1.0"

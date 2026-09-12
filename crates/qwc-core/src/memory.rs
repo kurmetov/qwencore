@@ -262,7 +262,10 @@ mod tests {
             ..CacheConfig::default()
         };
         let n_fp4 = b.max_concurrency(&fp4, 32 * 1024);
-        assert!(n_fp4 as f64 / n_fp8 as f64 > 1.5, "fp4 {n_fp4} vs fp8 {n_fp8}");
+        assert!(
+            n_fp4 as f64 / n_fp8 as f64 > 1.5,
+            "fp4 {n_fp4} vs fp8 {n_fp8}"
+        );
     }
 
     #[test]

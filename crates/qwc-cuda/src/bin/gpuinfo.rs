@@ -10,22 +10,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Устройство");
     println!("  SM                       {}", d.sm_count);
     println!("  частота SM               {:.2} GHz", d.sm_clock_hz / 1e9);
-    println!("  шина памяти              {} bit @ {:.1} Gbps", d.memory_bus_bits, d.memory_clock_hz * 2.0 / 1e9);
-    println!("  паспортный пик           {:.0} GB/s", d.peak_bandwidth() / 1e9);
-    println!("  L2                       {:.1} MiB", d.l2_bytes as f64 / (1024.0 * 1024.0));
-    println!("  shared mem / блок optin  {:.1} KB", d.max_shared_mem_optin as f64 / 1024.0);
+    println!(
+        "  шина памяти              {} bit @ {:.1} Gbps",
+        d.memory_bus_bits,
+        d.memory_clock_hz * 2.0 / 1e9
+    );
+    println!(
+        "  паспортный пик           {:.0} GB/s",
+        d.peak_bandwidth() / 1e9
+    );
+    println!(
+        "  L2                       {:.1} MiB",
+        d.l2_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  shared mem / блок optin  {:.1} KB",
+        d.max_shared_mem_optin as f64 / 1024.0
+    );
     println!("  регистров / SM           {}", d.max_registers_per_sm);
-    println!("  VRAM свободно            {:.2} / {:.2} GB", free as f64 / 1e9, total as f64 / 1e9);
+    println!(
+        "  VRAM свободно            {:.2} / {:.2} GB",
+        free as f64 / 1e9,
+        total as f64 / 1e9
+    );
 
     let l2 = d.l2_bytes as f64;
     println!("\nДостижимая пропускная способность (чтение)");
-    println!("  {:>9} | {:>10} | {:>7} | {}", "буфер", "GB/s", "% пика", "");
+    println!("  {:>9} | {:>10} | {:>7} | ", "буфер", "GB/s", "% пика");
     println!("  {:->9}-+-{:->10}-+-{:->7}-+-", "", "", "");
     for mb in [8usize, 32, 64, 96, 128, 256, 1024, 4096] {
         let bytes = mb * 1024 * 1024;
         let iters = if mb <= 128 { 200 } else { 30 };
         let m = bandwidth::read(bytes, iters)?;
-        let marker = if (bytes as f64) < l2 { "помещается в L2" } else { "" };
+        let marker = if (bytes as f64) < l2 {
+            "помещается в L2"
+        } else {
+            ""
+        };
         println!(
             "  {:>6} MiB | {:>10.0} | {:>6.0}% | {}",
             mb,

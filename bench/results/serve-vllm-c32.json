@@ -1,0 +1,1 @@
+{"engine": "vllm", "version": "0.28.0", "requests": 200, "concurrency": 32, "prompt_tokens": 256, "max_new_tokens": 128, "context": 2048, "load_seconds": 89.708, "wall_seconds": 26.0523, "output_tokens": 25600, "output_tokens_per_second": 982.64, "requests_per_second": 7.677}

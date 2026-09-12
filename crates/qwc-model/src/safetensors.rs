@@ -3,7 +3,7 @@
 //! Формат: [8 байт длины заголовка LE][JSON-заголовок][данные].
 //! Смещения в заголовке отсчитываются от начала блока данных.
 
-use memmap2::Mmap;
+use memmap2::{Advice, Mmap, UncheckedAdvice};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -75,6 +75,7 @@ impl Shard {
         let file = File::open(path)?;
         // SAFETY: файл чекпоинта не изменяется во время работы движка.
         let mmap = unsafe { Mmap::map(&file)? };
+        mmap.advise(Advice::Sequential)?;
 
         if mmap.len() < 8 {
             return Err(bad("шард короче заголовка"));
@@ -89,7 +90,8 @@ impl Shard {
             .map_err(|e| bad(&format!("заголовок не разбирается: {e}")))?;
 
         let mut tensors = HashMap::new();
-        for (name, v) in json.as_object().ok_or_else(|| bad("заголовок не объект"))? {
+        for (name, v) in json.as_object().ok_or_else(|| bad("заголовок не объект"))?
+        {
             if name == "__metadata__" {
                 continue;
             }
@@ -103,13 +105,27 @@ impl Shard {
                 .iter()
                 .map(|x| x.as_u64().unwrap_or(0) as usize)
                 .collect();
-            let off = v["data_offsets"].as_array().ok_or_else(|| bad("нет data_offsets"))?;
+            let off = v["data_offsets"]
+                .as_array()
+                .ok_or_else(|| bad("нет data_offsets"))?;
             let start = off[0].as_u64().unwrap_or(0) as usize;
             let end = off[1].as_u64().unwrap_or(0) as usize;
-            tensors.insert(name.clone(), TensorInfo { dtype, shape, start, end });
+            tensors.insert(
+                name.clone(),
+                TensorInfo {
+                    dtype,
+                    shape,
+                    start,
+                    end,
+                },
+            );
         }
 
-        Ok(Self { mmap, data_offset, tensors })
+        Ok(Self {
+            mmap,
+            data_offset,
+            tensors,
+        })
     }
 
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
@@ -124,6 +140,15 @@ impl Shard {
 
     pub fn names(&self) -> impl Iterator<Item = &String> {
         self.tensors.keys()
+    }
+
+    /// Drops clean file-backed pages after their tensors have been uploaded.
+    /// The virtual mapping stays valid and pages can be faulted in again.
+    pub fn evict_pages(&self) -> std::io::Result<()> {
+        // SAFETY: отображение read-only и file-backed, грязных страниц нет —
+        // MADV_DONTNEED здесь только сбрасывает чистые страницы, данные
+        // подгрузятся из файла заново при следующем обращении.
+        unsafe { self.mmap.unchecked_advise(UncheckedAdvice::DontNeed) }
     }
 }
 

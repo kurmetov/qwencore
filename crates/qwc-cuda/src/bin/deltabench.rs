@@ -18,14 +18,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     const COPY_CEILING: f64 = 1408e9;
 
     println!("Gated DeltaNet, рекуррентный шаг decode");
-    println!("состояние на слой на последовательность: {:.2} MB",
-             (STATE_ELEMS * 2) as f64 / 1e6);
-    println!("паспортный пик {:.0} GB/s, достижимое чтение {:.0} GB/s, чтение+запись {:.0} GB/s\n",
-             dev.peak_bandwidth() / 1e9, ACHIEVABLE_BANDWIDTH / 1e9, COPY_CEILING / 1e9);
+    println!(
+        "состояние на слой на последовательность: {:.2} MB",
+        (STATE_ELEMS * 2) as f64 / 1e6
+    );
+    println!(
+        "паспортный пик {:.0} GB/s, достижимое чтение {:.0} GB/s, чтение+запись {:.0} GB/s\n",
+        dev.peak_bandwidth() / 1e9,
+        ACHIEVABLE_BANDWIDTH / 1e9,
+        COPY_CEILING / 1e9
+    );
 
-    println!("  {:>5} | {:>10} | {:>9} | {:>9} | {:>8} | {:>7}",
-             "batch", "раб. мн-во", "на слой", "48 слоёв", "GB/s", "% пика");
-    println!("  {:->5}-+-{:->10}-+-{:->9}-+-{:->9}-+-{:->8}-+-{:->7}", "", "", "", "", "", "");
+    println!(
+        "  {:>5} | {:>10} | {:>9} | {:>9} | {:>8} | {:>7}",
+        "batch", "раб. мн-во", "на слой", "48 слоёв", "GB/s", "% пика"
+    );
+    println!(
+        "  {:->5}-+-{:->10}-+-{:->9}-+-{:->9}-+-{:->8}-+-{:->7}",
+        "", "", "", "", "", ""
+    );
 
     for batch in [1usize, 4, 8, 16, 32] {
         let mut states: Vec<DeviceBuffer<u16>> = (0..NUM_LINEAR_LAYERS)
@@ -43,7 +54,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let alpha = DeviceBuffer::from_slice(&vec![0.95f32; batch * GATE_ELEMS])?;
         let beta = DeviceBuffer::from_slice(&vec![0.7f32; batch * GATE_ELEMS])?;
         let mut out = DeviceBuffer::<f32>::zeroed(batch * V_ELEMS)?;
-        let inputs = DeltaInputs { q: &q, k: &k, v: &v, alpha: &alpha, beta: &beta };
+        let inputs = DeltaInputs {
+            q: &q,
+            k: &k,
+            v: &v,
+            alpha: &alpha,
+            beta: &beta,
+        };
 
         // Прогрев.
         for s in states.iter_mut() {
@@ -72,7 +89,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!(
             "  {:>5} | {:>7.0} MB | {:>6.1} us | {:>6.2} ms | {:>8.0} | {:>6.0}%",
-            batch, working_set, per_layer_us, per_step_ms, gbps,
+            batch,
+            working_set,
+            per_layer_us,
+            per_step_ms,
+            gbps,
             100.0 * gbps * 1e9 / COPY_CEILING
         );
     }

@@ -25,6 +25,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <stdint.h>
 
 namespace {
 
@@ -46,6 +47,7 @@ __device__ __forceinline__ float warp_sum(float v) {
 
 __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
     __nv_bfloat16* __restrict__ state,   // [B, kHv, kDv, kDk]
+    const uint32_t* __restrict__ state_slots,
     const float* __restrict__ q,         // [B, kHk, kDk], L2-нормирован
     const float* __restrict__ k,         // [B, kHk, kDk], L2-нормирован
     const float* __restrict__ v,         // [B, kHv, kDv]
@@ -55,6 +57,7 @@ __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
 {
     const int h = blockIdx.x;
     const int b = blockIdx.y;
+    const int state_slot = state_slots == nullptr ? b : state_slots[b];
     const int hk = h / kRatio;
 
     // Диапазон строк, за который отвечает этот блок.
@@ -95,7 +98,7 @@ __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
     const int lane = threadIdx.x & 31;
     constexpr int kWarps = kBlock / 32;
 
-    __nv_bfloat16* S = state + (size_t)(b * kHv + h) * kDv * kDk;
+    __nv_bfloat16* S = state + (size_t)(state_slot * kHv + h) * kDv * kDk;
     const float* vp = v + (size_t)(b * kHv + h) * kDv;
     float* op = out + (size_t)(b * kHv + h) * kDv;
 
@@ -146,6 +149,110 @@ __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
     }
 }
 
+// Chunk scan for one persistent sequence. Every warp keeps one state row in
+// registers across all time steps.
+//
+// kRoundPerToken selects the rounding policy of the recurrent state inside a
+// chunk. With rounding on, every step goes through BF16 and the chunk result
+// matches repeated decode exactly. With it off, the row stays in FP32 registers
+// for the whole chunk and only the write-back at the chunk boundary rounds —
+// this is what the reference implementation does during prefill, so the switch
+// isolates per-token rounding as a source of divergence.
+template <bool kRoundPerToken>
+__global__ __launch_bounds__(kBlock) void delta_prefill_kernel(
+    __nv_bfloat16* __restrict__ state,
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ alpha,
+    const float* __restrict__ beta,
+    float* __restrict__ out,
+    int state_slot,
+    int tokens) {
+    const int h = blockIdx.x;
+    const int hk = h / kRatio;
+    const int rows_per_block = kDv / gridDim.z;
+    const int row_begin = blockIdx.z * rows_per_block;
+    const int row_end = row_begin + rows_per_block;
+
+    __shared__ float sk[kDk];
+    __shared__ float sq[kDk];
+    __shared__ float s_kq;
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    constexpr int kWarps = kBlock / 32;
+    __nv_bfloat16* S = state +
+        (size_t)(state_slot * kHv + h) * kDv * kDk;
+
+    for (int row = row_begin + warp; row < row_end; row += kWarps) {
+        float2* srow = reinterpret_cast<float2*>(S + (size_t)row * kDk);
+        float2 packed = srow[lane];
+        __nv_bfloat162 p0 = *reinterpret_cast<__nv_bfloat162*>(&packed.x);
+        __nv_bfloat162 p1 = *reinterpret_cast<__nv_bfloat162*>(&packed.y);
+        float s[kPerThread];
+        s[0] = __bfloat162float(p0.x);
+        s[1] = __bfloat162float(p0.y);
+        s[2] = __bfloat162float(p1.x);
+        s[3] = __bfloat162float(p1.y);
+        const int base = lane * kPerThread;
+
+        for (int token = 0; token < tokens; ++token) {
+            const float* kp = k + (size_t)(token * kHk + hk) * kDk;
+            const float* qp = q + (size_t)(token * kHk + hk) * kDk;
+            for (int i = threadIdx.x; i < kDk; i += kBlock) {
+                sk[i] = kp[i];
+                sq[i] = qp[i];
+            }
+            __syncthreads();
+
+            if (threadIdx.x < 32) {
+                float acc = 0.0f;
+                for (int i = threadIdx.x; i < kDk; i += 32) {
+                    acc += sk[i] * sq[i];
+                }
+                acc = warp_sum(acc);
+                if (threadIdx.x == 0) {
+                    s_kq = acc;
+                }
+            }
+            __syncthreads();
+
+            float u = 0.0f;
+            float w = 0.0f;
+            #pragma unroll
+            for (int element = 0; element < kPerThread; ++element) {
+                u += s[element] * sk[base + element];
+                w += s[element] * sq[base + element];
+            }
+            u = __shfl_sync(0xffffffff, warp_sum(u), 0);
+            w = __shfl_sync(0xffffffff, warp_sum(w), 0);
+            const float a = alpha[token * kHv + h];
+            const float bt = beta[token * kHv + h];
+            const float value = v[(size_t)(token * kHv + h) * kDv + row];
+            const float c = bt * (value - a * u);
+            if (lane == 0) {
+                out[(size_t)(token * kHv + h) * kDv + row] =
+                    a * w + c * s_kq;
+            }
+            #pragma unroll
+            for (int element = 0; element < kPerThread; ++element) {
+                const float updated = a * s[element] + c * sk[base + element];
+                s[element] = kRoundPerToken
+                    ? __bfloat162float(__float2bfloat16(updated))
+                    : updated;
+            }
+            __syncthreads();
+        }
+
+        p0 = __nv_bfloat162(__float2bfloat16(s[0]), __float2bfloat16(s[1]));
+        p1 = __nv_bfloat162(__float2bfloat16(s[2]), __float2bfloat16(s[3]));
+        packed.x = *reinterpret_cast<float*>(&p0);
+        packed.y = *reinterpret_cast<float*>(&p1);
+        srow[lane] = packed;
+    }
+}
+
 } // namespace
 
 // Число блоков на голову подбирается так, чтобы занять все SM.
@@ -170,12 +277,61 @@ static int splits_for(int batch) {
 }
 
 extern "C" cudaError_t qwc_delta_decode(
-    void* state, const float* q, const float* k, const float* v,
+    void* state, const uint32_t* state_slots,
+    const float* q, const float* k, const float* v,
     const float* alpha, const float* beta, float* out,
-    int batch, cudaStream_t stream)
+    int state_capacity, int batch, cudaStream_t stream)
 {
+    if (state == nullptr || q == nullptr || k == nullptr || v == nullptr ||
+        alpha == nullptr || beta == nullptr || out == nullptr ||
+        state_capacity < batch || batch <= 0 || batch > 128) {
+        return cudaErrorInvalidValue;
+    }
     dim3 grid(kHv, batch, splits_for(batch));
     delta_decode_kernel<<<grid, kBlock, 0, stream>>>(
-        static_cast<__nv_bfloat16*>(state), q, k, v, alpha, beta, out);
+        static_cast<__nv_bfloat16*>(state), state_slots,
+        q, k, v, alpha, beta, out);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t qwc_delta_prefill(
+    void* state,
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* alpha,
+    const float* beta,
+    float* out,
+    int state_capacity,
+    int state_slot,
+    int tokens,
+    int round_state_per_token,
+    int row_offset,
+    cudaStream_t stream) {
+    if (state == nullptr || q == nullptr || k == nullptr || v == nullptr ||
+        alpha == nullptr || beta == nullptr || out == nullptr ||
+        state_capacity <= 0 || state_slot < 0 || state_slot >= state_capacity ||
+        tokens <= 0 || tokens > 1024 || round_state_per_token < 0 ||
+        round_state_per_token > 1 || row_offset < 0) {
+        return cudaErrorInvalidValue;
+    }
+    // The caller may hand in one slice of a fused multi-sequence token arena.
+    // Advancing the bases here keeps the kernel indexing from row zero.
+    q += (size_t)row_offset * kHk * kDk;
+    k += (size_t)row_offset * kHk * kDk;
+    v += (size_t)row_offset * kHv * kDv;
+    alpha += (size_t)row_offset * kHv;
+    beta += (size_t)row_offset * kHv;
+    out += (size_t)row_offset * kHv * kDv;
+    dim3 grid(kHv, 1, splits_for(1));
+    if (round_state_per_token) {
+        delta_prefill_kernel<true><<<grid, kBlock, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(state), q, k, v, alpha, beta, out,
+            state_slot, tokens);
+    } else {
+        delta_prefill_kernel<false><<<grid, kBlock, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(state), q, k, v, alpha, beta, out,
+            state_slot, tokens);
+    }
     return cudaGetLastError();
 }

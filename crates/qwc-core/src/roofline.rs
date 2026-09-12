@@ -106,12 +106,22 @@ mod tests {
         let cache = CacheConfig::default();
 
         // Идеальный кернел: вся полоса памяти.
-        let ideal = DecodeStep { batch: 1, context_len: 2048, bandwidth_efficiency: 1.0 };
+        let ideal = DecodeStep {
+            batch: 1,
+            context_len: 2048,
+            bandwidth_efficiency: 1.0,
+        };
         let tps = ideal.tokens_per_sec(w, &cache);
-        assert!((85.0..100.0).contains(&tps), "потолок batch=1: {tps:.0} tok/s");
+        assert!(
+            (85.0..100.0).contains(&tps),
+            "потолок batch=1: {tps:.0} tok/s"
+        );
 
         // То, что даёт CUTLASS GEMM на M=1 (замерено: 47%).
-        let real = DecodeStep { bandwidth_efficiency: 0.47, ..ideal };
+        let real = DecodeStep {
+            bandwidth_efficiency: 0.47,
+            ..ideal
+        };
         let tps_real = real.tokens_per_sec(w, &cache);
         assert!(tps_real < tps * 0.5);
     }
@@ -120,12 +130,21 @@ mod tests {
     fn state_traffic_dominates_at_high_batch() {
         let w = WeightPlan::default().bytes();
         let cache = CacheConfig::default();
-        let step = DecodeStep { batch: 32, context_len: 2048, bandwidth_efficiency: 0.8 };
+        let step = DecodeStep {
+            batch: 32,
+            context_len: 2048,
+            bandwidth_efficiency: 0.8,
+        };
         let c = step.cost(w, &cache);
 
         // При batch=32 состояние DeltaNet читается и пишется 32 раза:
         // это сопоставимо с чтением KV-кэша и заметная доля всего шага.
-        assert!(c.state_bytes > c.kv_bytes, "состояние {} vs KV {}", c.state_bytes, c.kv_bytes);
+        assert!(
+            c.state_bytes > c.kv_bytes,
+            "состояние {} vs KV {}",
+            c.state_bytes,
+            c.kv_bytes
+        );
         let share = c.state_bytes as f64 / c.total() as f64;
         assert!((0.15..0.35).contains(&share), "доля состояния {share:.2}");
     }
@@ -133,10 +152,17 @@ mod tests {
     #[test]
     fn bf16_state_saves_real_time() {
         let w = WeightPlan::default().bytes();
-        let step = DecodeStep { batch: 32, context_len: 2048, bandwidth_efficiency: 0.8 };
+        let step = DecodeStep {
+            batch: 32,
+            context_len: 2048,
+            bandwidth_efficiency: 0.8,
+        };
 
         let bf16 = CacheConfig::default();
-        let fp32 = CacheConfig { state_dtype: Dtype::Fp32, ..bf16 };
+        let fp32 = CacheConfig {
+            state_dtype: Dtype::Fp32,
+            ..bf16
+        };
 
         let saved = step.itl_ms(w, &fp32) - step.itl_ms(w, &bf16);
         // Перевод состояния в bf16 экономит миллисекунды на каждом шаге.

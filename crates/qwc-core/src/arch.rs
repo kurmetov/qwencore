@@ -36,7 +36,7 @@ pub enum LayerKind {
 /// Тип слоя по индексу. Full-attention — каждый 4-й: 3, 7, 11, ..., 63.
 pub const fn layer_kind(idx: usize) -> LayerKind {
     debug_assert!(idx < NUM_LAYERS);
-    if (idx + 1) % FULL_ATTENTION_INTERVAL == 0 {
+    if (idx + 1).is_multiple_of(FULL_ATTENTION_INTERVAL) {
         LayerKind::FullAttention
     } else {
         LayerKind::LinearAttention
@@ -151,7 +151,6 @@ pub const QUANTIZED_PARAMS: usize = NUM_LAYERS * MLP_PARAMS_PER_LAYER
 /// Полное число параметров текстовой модели (без vision tower и MTP-головы).
 pub const TEXT_PARAMS: usize = QUANTIZED_PARAMS + EMBED_PARAMS + LM_HEAD_PARAMS;
 
-
 /// Оценка размера MTP draft-головы: один блок (attention + MLP) плюс
 /// проекция конкатенации [hidden_state; embedding] -> hidden.
 /// `mtp_use_dedicated_embeddings: false`, поэтому своих эмбеддингов нет.
@@ -165,7 +164,7 @@ pub const MTP_PARAMS_EST: usize =
 pub const VISION_PARAMS_EST: usize = 27 * (4 * 1152 * 1152 + 2 * 1152 * 4304)  // блоки
     + 3 * 16 * 16 * 2 * 1152                                                   // patch embed
     + 2304 * 1152                                                              // pos embed
-    + 1152 * 4 * HIDDEN_SIZE;                                                  // merger
+    + 1152 * 4 * HIDDEN_SIZE; // merger
 
 // ---------------------------------------------------------------------------
 // Проверки на этапе компиляции

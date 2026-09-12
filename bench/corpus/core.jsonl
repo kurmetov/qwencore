@@ -1,0 +1,14 @@
+{"id":"en-fact","prompt":"The capital of France is","prompt_token_ids":[760,6511,314,9338,369],"max_new_tokens":16,"tags":["semantic","english","short"]}
+{"id":"code","prompt":"def fibonacci(n):","prompt_token_ids":[727,73111,1393,1590],"max_new_tokens":16,"tags":["semantic","code","short"]}
+{"id":"ru","prompt":"Привет! Объясни, почему небо голубое.","prompt_token_ids":[51844,26125,7921,0,208764,151665,21918,11,173961,218834,153040,61324,42317,13],"max_new_tokens":12,"tags":["semantic","unicode","russian"]}
+{"id":"zh","prompt":"这段文本是经典的英语全字母句：","prompt_token_ids":[104980,109120,95761,113244,98012,95901,110039,96804,4960],"max_new_tokens":12,"tags":["semantic","unicode","chinese"]}
+{"id":"ar","prompt":"اشرح باختصار ما هي الشبكات العصبية.","prompt_token_ids":[5525,223433,239007,175024,155025,159138,148441,20704,178830,148339,156913,70943,13],"max_new_tokens":12,"tags":["semantic","unicode","arabic"]}
+{"id":"math","prompt":"Let a_n = a_{n-1} + a_{n-2}. Given a_0 = 0 and a_1 = 1, then","prompt_token_ids":[9764,264,1054,283,264,14717,77,12,16,92,478,264,14717,77,12,17,7563,15767,264,62,15,283,220,15,321,264,62,16,283,220,16,11,1179],"max_new_tokens":12,"tags":["semantic","math"]}
+{"id":"whitespace","prompt":"line one\n\n    indented\tvalue: ","prompt_token_ids":[1021,799,271,262,1214,15397,15830,25,220],"max_new_tokens":8,"tags":["tokenizer","whitespace"]}
+{"id":"page-63","repeat":{"token_ids":[760,3841,13477,37550,33075,888,279,15217,5388,13,220],"length":63},"max_new_tokens":4,"tags":["kv-page","boundary-minus-one"]}
+{"id":"page-64","repeat":{"token_ids":[760,3841,13477,37550,33075,888,279,15217,5388,13,220],"length":64},"max_new_tokens":4,"tags":["kv-page","boundary"]}
+{"id":"page-65","repeat":{"token_ids":[760,3841,13477,37550,33075,888,279,15217,5388,13,220],"length":65},"max_new_tokens":4,"tags":["kv-page","boundary-plus-one"]}
+{"id":"chunk-127","repeat":{"token_ids":[760,3841,13477,37550,33075,888,279,15217,5388,13,220],"length":127},"max_new_tokens":4,"tags":["prefill-chunk","boundary-minus-one"]}
+{"id":"chunk-128","repeat":{"token_ids":[760,3841,13477,37550,33075,888,279,15217,5388,13,220],"length":128},"max_new_tokens":4,"tags":["prefill-chunk","boundary"]}
+{"id":"chunk-129","repeat":{"token_ids":[760,3841,13477,37550,33075,888,279,15217,5388,13,220],"length":129},"max_new_tokens":4,"tags":["prefill-chunk","boundary-plus-one"]}
+{"id":"long-601","repeat":{"token_ids":[760,3841,13477,37550,33075,888,279,15217,5388,13,220],"length":601},"max_new_tokens":8,"tags":["long-context","kv-multipage","prefill-multichunk"]}

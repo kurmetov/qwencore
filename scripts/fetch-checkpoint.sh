@@ -15,6 +15,8 @@ FILES=(
     vocab.json
     merges.txt
     chat_template.jinja
+    preprocessor_config.json
+    video_preprocessor_config.json
     model-00001-of-00005.safetensors
     model-00002-of-00005.safetensors
     model-00003-of-00005.safetensors

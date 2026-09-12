@@ -8,5 +8,8 @@ build = "build.rs"
 [dependencies]
 qwc-core = { path = "../qwc-core" }
 
+[dev-dependencies]
+qwc-model = { path = "../qwc-model" }
+
 [lints]
 workspace = true

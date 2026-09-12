@@ -1,3 +1,5 @@
 /target
 /third_party/cutlass
 /third_party/cuda-shim
+__pycache__/
+*.py[cod]

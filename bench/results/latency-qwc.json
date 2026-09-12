@@ -1,0 +1,1 @@
+{"engine": "qwc", "version": "0.1.0", "batch": 1, "prompt_tokens": 9, "short_tokens": 8, "long_tokens": 72, "repeats": 5, "load_seconds": 2.478, "short_ms": 133.512, "long_ms": 1017.1898, "decode_ms_per_token": 13.8075, "tokens_per_second": 72.42, "in_process_step_ms": 13.8021}
