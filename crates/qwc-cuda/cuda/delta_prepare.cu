@@ -82,13 +82,27 @@ __global__ void causal_conv_split_kernel(
   }
 }
 
-// A prefill row is a time step of one sequence, not an independent batch
-// member. One thread therefore owns a channel for the whole chunk and advances
-// its three-value history in program order.
+// Свёртка на четыре отвода по токенам параллельна: последовательна только
+// переноска истории между чанками. Прежняя раскладка отдавала потоку канал
+// целиком и шла по токенам в программном порядке — это 40 блоков на 170 SM,
+// то есть меньше четверти чипа. Здесь поток считает один выход (канал, токен),
+// а хвост истории дописывает отдельный запуск: писать её здесь значило бы
+// гонку с блоками, которые ту же историю читают на первых трёх токенах.
+__device__ __forceinline__ float conv_input(
+    const __nv_bfloat16* __restrict__ mixed_qkv,
+    const float* __restrict__ history,
+    int token,
+    int channel) {
+  if (token >= 0) {
+    return __bfloat162float(mixed_qkv[static_cast<size_t>(token) * kChannels + channel]);
+  }
+  return history[kConvHistory + token];
+}
+
 __global__ void causal_conv_prefill_kernel(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     const __nv_bfloat16* __restrict__ conv_weight,
-    float* __restrict__ conv_state,
+    const float* __restrict__ conv_state,
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
@@ -98,36 +112,50 @@ __global__ void causal_conv_prefill_kernel(
   if (channel >= kChannels) {
     return;
   }
-  float* history =
+  const int token = blockIdx.y;
+  const float* history =
       conv_state + (static_cast<size_t>(state_slot) * kChannels + channel) * kConvHistory;
   const __nv_bfloat16* weight = conv_weight + channel * 4;
-  float h0 = history[0];
-  float h1 = history[1];
-  float h2 = history[2];
-  for (int token = 0; token < tokens; ++token) {
-    const float current =
-        __bfloat162float(mixed_qkv[static_cast<size_t>(token) * kChannels + channel]);
-    float convolved = __bfloat162float(weight[0]) * h0;
-    convolved = fmaf(__bfloat162float(weight[1]), h1, convolved);
-    convolved = fmaf(__bfloat162float(weight[2]), h2, convolved);
-    convolved = fmaf(__bfloat162float(weight[3]), current, convolved);
-    h0 = h1;
-    h1 = h2;
-    h2 = current;
 
-    const float activated = __bfloat162float(
-        __float2bfloat16(convolved * sigmoid(convolved)));
-    if (channel < kQkElements) {
-      query[static_cast<size_t>(token) * kQkElements + channel] = activated;
-    } else if (channel < 2 * kQkElements) {
-      key[static_cast<size_t>(token) * kQkElements + channel - kQkElements] = activated;
-    } else {
-      value[static_cast<size_t>(token) * kVElements + channel - 2 * kQkElements] = activated;
-    }
+  float convolved =
+      __bfloat162float(weight[0]) * conv_input(mixed_qkv, history, token - 3, channel);
+  convolved = fmaf(__bfloat162float(weight[1]),
+                   conv_input(mixed_qkv, history, token - 2, channel), convolved);
+  convolved = fmaf(__bfloat162float(weight[2]),
+                   conv_input(mixed_qkv, history, token - 1, channel), convolved);
+  convolved = fmaf(__bfloat162float(weight[3]),
+                   conv_input(mixed_qkv, history, token, channel), convolved);
+
+  const float activated =
+      __bfloat162float(__float2bfloat16(convolved * sigmoid(convolved)));
+  if (channel < kQkElements) {
+    query[static_cast<size_t>(token) * kQkElements + channel] = activated;
+  } else if (channel < 2 * kQkElements) {
+    key[static_cast<size_t>(token) * kQkElements + channel - kQkElements] = activated;
+  } else {
+    value[static_cast<size_t>(token) * kVElements + channel - 2 * kQkElements] = activated;
   }
-  history[0] = h0;
-  history[1] = h1;
-  history[2] = h2;
+}
+
+// Хвост чанка становится историей следующего. Поток владеет тремя значениями
+// своего канала и читает их до записи, поэтому чанк короче трёх токенов
+// доносит остаток прежней истории без гонки.
+__global__ void conv_state_prefill_kernel(
+    const __nv_bfloat16* __restrict__ mixed_qkv,
+    float* __restrict__ conv_state,
+    int state_slot,
+    int tokens) {
+  const int channel = blockIdx.x * blockDim.x + threadIdx.x;
+  if (channel >= kChannels) {
+    return;
+  }
+  float* history =
+      conv_state + (static_cast<size_t>(state_slot) * kChannels + channel) * kConvHistory;
+  const float previous[kConvHistory] = {history[0], history[1], history[2]};
+  #pragma unroll
+  for (int i = 0; i < kConvHistory; ++i) {
+    history[i] = conv_input(mixed_qkv, previous, tokens - kConvHistory + i, channel);
+  }
 }
 
 __global__ __launch_bounds__(kHeadDim) void normalize_and_gate_kernel(
@@ -282,16 +310,23 @@ extern "C" cudaError_t qwc_delta_prepare_prefill(
   float* beta_rows = static_cast<float*>(beta) + (size_t)row_offset * kVHeads;
   constexpr int threads = 256;
   const int blocks = (kChannels + threads - 1) / threads;
-  causal_conv_prefill_kernel<<<blocks, threads, 0, stream>>>(
+  dim3 conv_grid(blocks, tokens);
+  causal_conv_prefill_kernel<<<conv_grid, threads, 0, stream>>>(
       mixed_qkv_rows,
       static_cast<const __nv_bfloat16*>(conv_weight),
-      static_cast<float*>(conv_state),
+      static_cast<const float*>(conv_state),
       query_rows,
       key_rows,
       value_rows,
       state_slot,
       tokens);
   cudaError_t launched = cudaGetLastError();
+  if (launched != cudaSuccess) {
+    return launched;
+  }
+  conv_state_prefill_kernel<<<blocks, threads, 0, stream>>>(
+      mixed_qkv_rows, static_cast<float*>(conv_state), state_slot, tokens);
+  launched = cudaGetLastError();
   if (launched != cudaSuccess) {
     return launched;
   }

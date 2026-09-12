@@ -45,6 +45,17 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
+// Три редукции за один проход по бабочке: шагов столько же, сколько у одной,
+// а результат остаётся во всех дорожках — броадкаст с нулевой дорожки не нужен.
+__device__ __forceinline__ void warp_sum3(float& a, float& b, float& c) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a += __shfl_xor_sync(0xffffffff, a, off);
+        b += __shfl_xor_sync(0xffffffff, b, off);
+        c += __shfl_xor_sync(0xffffffff, c, off);
+    }
+}
+
 __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
     __nv_bfloat16* __restrict__ state,   // [B, kHv, kDv, kDk]
     const uint32_t* __restrict__ state_slots,
@@ -169,88 +180,71 @@ __global__ __launch_bounds__(kBlock) void delta_prefill_kernel(
     float* __restrict__ out,
     int state_slot,
     int tokens) {
+    // Варп владеет строкой состояния и идёт по токенам сам. Прежняя раскладка
+    // ставила на токен три __syncthreads() и считала k.q одним варпом из
+    // восьми, пока остальные стояли на барьере: рекуррентность и так
+    // последовательна, а барьеры добавляли к ней блочную синхронизацию.
+    // Строки состояния независимы — связывает их только скаляр k.q, который
+    // варп теперь считает себе сам, в той же бабочке, что u и w.
+    constexpr int kWarps = kBlock / 32;
+    static_assert(kDv % kWarps == 0, "строки состояния делятся между варпами");
+
     const int h = blockIdx.x;
     const int hk = h / kRatio;
-    const int rows_per_block = kDv / gridDim.z;
-    const int row_begin = blockIdx.z * rows_per_block;
-    const int row_end = row_begin + rows_per_block;
-
-    __shared__ float sk[kDk];
-    __shared__ float sq[kDk];
-    __shared__ float s_kq;
-
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    constexpr int kWarps = kBlock / 32;
-    __nv_bfloat16* S = state +
-        (size_t)(state_slot * kHv + h) * kDv * kDk;
+    const int row = blockIdx.z * kWarps + warp;
+    const int base = lane * kPerThread;
 
-    for (int row = row_begin + warp; row < row_end; row += kWarps) {
-        float2* srow = reinterpret_cast<float2*>(S + (size_t)row * kDk);
-        float2 packed = srow[lane];
-        __nv_bfloat162 p0 = *reinterpret_cast<__nv_bfloat162*>(&packed.x);
-        __nv_bfloat162 p1 = *reinterpret_cast<__nv_bfloat162*>(&packed.y);
-        float s[kPerThread];
-        s[0] = __bfloat162float(p0.x);
-        s[1] = __bfloat162float(p0.y);
-        s[2] = __bfloat162float(p1.x);
-        s[3] = __bfloat162float(p1.y);
-        const int base = lane * kPerThread;
+    __nv_bfloat16* S = state + (size_t)(state_slot * kHv + h) * kDv * kDk;
+    float2* srow = reinterpret_cast<float2*>(S + (size_t)row * kDk);
+    float2 packed = srow[lane];
+    __nv_bfloat162 p0 = *reinterpret_cast<__nv_bfloat162*>(&packed.x);
+    __nv_bfloat162 p1 = *reinterpret_cast<__nv_bfloat162*>(&packed.y);
+    float s[kPerThread];
+    s[0] = __bfloat162float(p0.x);
+    s[1] = __bfloat162float(p0.y);
+    s[2] = __bfloat162float(p1.x);
+    s[3] = __bfloat162float(p1.y);
 
-        for (int token = 0; token < tokens; ++token) {
-            const float* kp = k + (size_t)(token * kHk + hk) * kDk;
-            const float* qp = q + (size_t)(token * kHk + hk) * kDk;
-            for (int i = threadIdx.x; i < kDk; i += kBlock) {
-                sk[i] = kp[i];
-                sq[i] = qp[i];
-            }
-            __syncthreads();
+    for (int token = 0; token < tokens; ++token) {
+        const float4 kv = *reinterpret_cast<const float4*>(
+            k + (size_t)(token * kHk + hk) * kDk + base);
+        const float4 qv = *reinterpret_cast<const float4*>(
+            q + (size_t)(token * kHk + hk) * kDk + base);
 
-            if (threadIdx.x < 32) {
-                float acc = 0.0f;
-                for (int i = threadIdx.x; i < kDk; i += 32) {
-                    acc += sk[i] * sq[i];
-                }
-                acc = warp_sum(acc);
-                if (threadIdx.x == 0) {
-                    s_kq = acc;
-                }
-            }
-            __syncthreads();
+        float u = s[0] * kv.x + s[1] * kv.y + s[2] * kv.z + s[3] * kv.w;
+        float w = s[0] * qv.x + s[1] * qv.y + s[2] * qv.z + s[3] * qv.w;
+        float kq = kv.x * qv.x + kv.y * qv.y + kv.z * qv.z + kv.w * qv.w;
+        warp_sum3(u, w, kq);
 
-            float u = 0.0f;
-            float w = 0.0f;
-            #pragma unroll
-            for (int element = 0; element < kPerThread; ++element) {
-                u += s[element] * sk[base + element];
-                w += s[element] * sq[base + element];
-            }
-            u = __shfl_sync(0xffffffff, warp_sum(u), 0);
-            w = __shfl_sync(0xffffffff, warp_sum(w), 0);
-            const float a = alpha[token * kHv + h];
-            const float bt = beta[token * kHv + h];
-            const float value = v[(size_t)(token * kHv + h) * kDv + row];
-            const float c = bt * (value - a * u);
-            if (lane == 0) {
-                out[(size_t)(token * kHv + h) * kDv + row] =
-                    a * w + c * s_kq;
-            }
-            #pragma unroll
-            for (int element = 0; element < kPerThread; ++element) {
-                const float updated = a * s[element] + c * sk[base + element];
-                s[element] = kRoundPerToken
-                    ? __bfloat162float(__float2bfloat16(updated))
-                    : updated;
-            }
-            __syncthreads();
+        const float a = alpha[token * kHv + h];
+        const float bt = beta[token * kHv + h];
+        const float value = v[(size_t)(token * kHv + h) * kDv + row];
+        const float c = bt * (value - a * u);
+        if (lane == 0) {
+            out[(size_t)(token * kHv + h) * kDv + row] = a * w + c * kq;
         }
 
-        p0 = __nv_bfloat162(__float2bfloat16(s[0]), __float2bfloat16(s[1]));
-        p1 = __nv_bfloat162(__float2bfloat16(s[2]), __float2bfloat16(s[3]));
-        packed.x = *reinterpret_cast<float*>(&p0);
-        packed.y = *reinterpret_cast<float*>(&p1);
-        srow[lane] = packed;
+        const float update[kPerThread] = {
+            a * s[0] + c * kv.x,
+            a * s[1] + c * kv.y,
+            a * s[2] + c * kv.z,
+            a * s[3] + c * kv.w,
+        };
+        #pragma unroll
+        for (int element = 0; element < kPerThread; ++element) {
+            s[element] = kRoundPerToken
+                ? __bfloat162float(__float2bfloat16(update[element]))
+                : update[element];
+        }
     }
+
+    p0 = __nv_bfloat162(__float2bfloat16(s[0]), __float2bfloat16(s[1]));
+    p1 = __nv_bfloat162(__float2bfloat16(s[2]), __float2bfloat16(s[3]));
+    packed.x = *reinterpret_cast<float*>(&p0);
+    packed.y = *reinterpret_cast<float*>(&p1);
+    srow[lane] = packed;
 }
 
 } // namespace
@@ -323,7 +317,10 @@ extern "C" cudaError_t qwc_delta_prefill(
     alpha += (size_t)row_offset * kHv;
     beta += (size_t)row_offset * kHv;
     out += (size_t)row_offset * kHv * kDv;
-    dim3 grid(kHv, 1, splits_for(1));
+    // Одна строка состояния на варп: 48 голов x 16 блоков = 768 блоков на
+    // 170 SM. splits_for здесь не нужен — prefill всегда идёт одной
+    // последовательностью, и делить нечего, кроме строк.
+    dim3 grid(kHv, 1, kDv / (kBlock / 32));
     if (round_state_per_token) {
         delta_prefill_kernel<true><<<grid, kBlock, 0, stream>>>(
             static_cast<__nv_bfloat16*>(state), q, k, v, alpha, beta, out,
