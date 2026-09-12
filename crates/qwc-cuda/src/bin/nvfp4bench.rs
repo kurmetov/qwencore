@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "  {:->5}-+-{:->10}-+-{:->10}-+-{:->10}-+-{:->9}-+-{:->9}",
             "", "", "", "", "", ""
         );
-        for batch in [3usize, 4, 8, 16, 32] {
+        for batch in [3usize, 4, 8, 16, 32, 64, 128, 256, 512] {
             let input = DeviceBuffer::from_slice(&vec![bf16::from_f32(0.5); batch * in_features])?;
             let mut quantized = QuantizedActivation::zeroed(128.0, batch, in_features)?;
             let mut output = DeviceBuffer::<u16>::zeroed(batch * out_features)?;

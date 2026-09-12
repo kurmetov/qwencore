@@ -898,7 +898,7 @@ impl Executor {
         for (index, layer) in weights.layers.iter().enumerate() {
             match &layer.mixer {
                 Mixer::Linear(mixer) => {
-                    mark!("gemm.la_qkvab");
+                    mark!("gemm.la_qkv");
                     project_w4a4(
                         &mixer.qkv,
                         &prefill.normed,
@@ -908,6 +908,7 @@ impl Executor {
                         live,
                         &self.stream,
                     )?;
+                    mark!("gemm.la_z");
                     project_w4a4(
                         &mixer.z,
                         &prefill.normed,
@@ -917,6 +918,7 @@ impl Executor {
                         live,
                         &self.stream,
                     )?;
+                    mark!("gemm.la_ab");
                     project_w4a4(
                         &mixer.a,
                         &prefill.normed,
@@ -1194,7 +1196,7 @@ impl Executor {
         layer: usize,
         batch: usize,
     ) -> Result<()> {
-        self.mark("gemm.la_qkvab")?;
+        self.mark("gemm.la_qkv")?;
         project_decode(
             &mixer.qkv,
             &self.normed,
@@ -1204,6 +1206,7 @@ impl Executor {
             batch,
             &self.stream,
         )?;
+        self.mark("gemm.la_z")?;
         project_decode(
             &mixer.z,
             &self.normed,
@@ -1213,6 +1216,7 @@ impl Executor {
             batch,
             &self.stream,
         )?;
+        self.mark("gemm.la_ab")?;
         project_decode(
             &mixer.a,
             &self.normed,

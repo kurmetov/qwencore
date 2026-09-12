@@ -313,18 +313,23 @@ impl W4A4Workspace {
     pub fn for_shapes(batch: usize, shapes: &[(usize, usize)]) -> Result<Self> {
         assert!(batch > 0);
         assert!(!shapes.is_empty());
+        // Требование не монотонно по числу строк: узкая задача режется по K,
+        // и чем меньше M, тем больше блоков участвует в редукции. Арена
+        // предъявляет любое M до `batch`, поэтому берётся максимум по всем.
         let mut bytes = 0usize;
         for &(out_features, in_features) in shapes {
-            let mut needed = 0usize;
-            check(unsafe {
-                ffi::qwc_nvfp4_w4a4_workspace_size(
-                    batch as i32,
-                    out_features as i32,
-                    in_features as i32,
-                    &mut needed,
-                )
-            })?;
-            bytes = bytes.max(needed);
+            for rows in 1..=batch {
+                let mut needed = 0usize;
+                check(unsafe {
+                    ffi::qwc_nvfp4_w4a4_workspace_size(
+                        rows as i32,
+                        out_features as i32,
+                        in_features as i32,
+                        &mut needed,
+                    )
+                })?;
+                bytes = bytes.max(needed);
+            }
         }
         Ok(Self {
             // cudaMalloc(0) не имеет переносимой семантики; указатель при
