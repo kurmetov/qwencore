@@ -11,6 +11,11 @@ qwc-model = { path = "../qwc-model" }
 qwc-runtime = { path = "../qwc-runtime" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+axum = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1"
 
 [lints]
 workspace = true

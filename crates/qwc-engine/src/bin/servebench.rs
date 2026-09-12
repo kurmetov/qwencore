@@ -7,7 +7,7 @@
 //!
 //! Emits JSON for `bench/servebench.py` to score against the reference engines.
 
-use qwc_core::arch::VOCAB_SIZE;
+use qwc_core::arch::{KV_ELEMS_PER_TOKEN, VOCAB_SIZE};
 use qwc_cuda::paged_attention::KvCacheDtype;
 use qwc_engine::{Executor, ExecutorConfig, ModelWeights, PREFILL_CHUNK_SIZE};
 use qwc_model::Checkpoint;
@@ -24,6 +24,7 @@ struct Args {
     max_new: usize,
     context: usize,
     memory_limit: usize,
+    kv_cache_bytes: usize,
     kv_cache: KvCacheDtype,
 }
 
@@ -37,17 +38,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let load_seconds = load_started.elapsed().as_secs_f64();
 
     let max_blocks = args.context.div_ceil(qwc_cuda::paged_attention::PAGE_SIZE);
-    let mut executor = Executor::new_with_kv_cache(
+    let bytes_per_block = qwc_cuda::paged_attention::PAGE_SIZE
+        * KV_ELEMS_PER_TOKEN
+        * args.kv_cache.bytes_per_element();
+    let kv_pool_blocks = args.kv_cache_bytes / bytes_per_block;
+    if kv_pool_blocks < max_blocks {
+        return Err(format!(
+            "KV pool has {kv_pool_blocks} blocks, but --context {} needs at least {max_blocks}; increase --kv-cache-gb",
+            args.context
+        )
+        .into());
+    }
+    let mut executor = Executor::new_with_kv_pool(
         ExecutorConfig {
             max_batch: args.concurrency,
             max_context: args.context,
         },
         args.kv_cache,
+        kv_pool_blocks,
     )?;
     let cache_gb = executor.cache_bytes() as f64 / 1e9;
     let cache = CacheManager::new(
         args.concurrency,
-        args.concurrency * max_blocks,
+        executor.kv_pool_blocks(),
         qwc_cuda::paged_attention::PAGE_SIZE,
     );
     let mut scheduler = Scheduler::new(
@@ -122,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         concat!(
             "{{\"engine\":\"qwc\",\"version\":\"{}\",\"requests\":{},\"concurrency\":{},",
             "\"prompt_tokens\":{},\"max_new_tokens\":{},\"context\":{},\"kv_cache\":\"{}\",",
-            "\"load_seconds\":{:.3},\"cache_gb\":{:.2},\"engine_steps\":{},\"weight_passes\":{},",
+            "\"load_seconds\":{:.3},\"cache_gb\":{:.2},\"kv_pool_blocks\":{},\"engine_steps\":{},\"weight_passes\":{},",
             "\"wall_seconds\":{:.4},\"output_tokens\":{},",
             "\"output_tokens_per_second\":{:.2},\"requests_per_second\":{:.3},",
             "\"ttft_ms_p50\":{:.2},\"ttft_ms_p95\":{:.2},",
@@ -137,6 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.kv_cache.as_str(),
         load_seconds,
         cache_gb,
+        executor.kv_pool_blocks(),
         steps,
         passes,
         elapsed,
@@ -168,6 +182,9 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     let mut max_new = 128usize;
     let mut context = 2048usize;
     let mut memory_limit = 28_000_000_000usize;
+    // Physical pages are shared. Five GB is enough for four full 32K
+    // sequences or many short requests without reserving 32K for each slot.
+    let mut kv_cache_bytes = 5_000_000_000usize;
     let mut kv_cache = KvCacheDtype::Fp8;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -188,6 +205,13 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--memory-limit-gb" => {
                 let gb: f64 = args.next().ok_or("--memory-limit-gb")?.parse()?;
                 memory_limit = (gb * 1e9) as usize;
+            }
+            "--kv-cache-gb" => {
+                let gb: f64 = args.next().ok_or("--kv-cache-gb")?.parse()?;
+                if !gb.is_finite() || gb <= 0.0 {
+                    return Err("--kv-cache-gb must be positive".into());
+                }
+                kv_cache_bytes = (gb * 1e9) as usize;
             }
             other => return Err(format!("unknown argument: {other}").into()),
         }
@@ -216,6 +240,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         max_new,
         context,
         memory_limit,
+        kv_cache_bytes,
         kv_cache,
     })
 }

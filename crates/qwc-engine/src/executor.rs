@@ -68,6 +68,11 @@ pub struct Executor {
     max_batch: usize,
     max_context: usize,
     max_blocks: usize,
+    /// Total number of physical pages shared by every sequence. This is
+    /// deliberately independent of `max_batch * max_blocks`: 32K is a per-
+    /// request address-space limit, not a promise to reserve 32K for every
+    /// concurrent request.
+    kv_pool_blocks: usize,
     kv_cache_dtype: KvCacheDtype,
     decode_linear_mode: DecodeLinearMode,
     delta_state_mode: DeltaStateMode,
@@ -273,11 +278,46 @@ impl Executor {
         )
     }
 
+    /// Builds an executor backed by one shared physical KV page pool.
+    ///
+    /// `kv_pool_blocks` is the global capacity handed to `CacheManager`; the
+    /// logical block table of a sequence may still contain up to
+    /// `ceil(max_context / PAGE_SIZE)` entries.
+    pub fn new_with_kv_pool(
+        config: ExecutorConfig,
+        kv_cache_dtype: KvCacheDtype,
+        kv_pool_blocks: usize,
+    ) -> Result<Self> {
+        Self::new_with_pool_options(
+            config,
+            kv_cache_dtype,
+            DecodeLinearMode::Auto,
+            DeltaStateMode::Bf16,
+            Some(kv_pool_blocks),
+        )
+    }
+
     pub fn new_with_options(
         config: ExecutorConfig,
         kv_cache_dtype: KvCacheDtype,
         decode_linear_mode: DecodeLinearMode,
         delta_state_mode: DeltaStateMode,
+    ) -> Result<Self> {
+        Self::new_with_pool_options(
+            config,
+            kv_cache_dtype,
+            decode_linear_mode,
+            delta_state_mode,
+            None,
+        )
+    }
+
+    fn new_with_pool_options(
+        config: ExecutorConfig,
+        kv_cache_dtype: KvCacheDtype,
+        decode_linear_mode: DecodeLinearMode,
+        delta_state_mode: DeltaStateMode,
+        kv_pool_blocks: Option<usize>,
     ) -> Result<Self> {
         let batch = config.max_batch;
         assert!(
@@ -292,7 +332,16 @@ impl Executor {
             DecodeLinearMode::W4A4 => batch.max(3),
         };
         let max_blocks = config.max_context.div_ceil(PAGE_SIZE);
-        let cache_elements = batch * max_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
+        let kv_pool_blocks = kv_pool_blocks.unwrap_or(batch * max_blocks);
+        assert!(
+            kv_pool_blocks >= max_blocks,
+            "KV pool must hold at least one max-context sequence ({max_blocks} blocks)"
+        );
+        assert!(
+            u32::try_from(kv_pool_blocks).is_ok(),
+            "KV pool block IDs must fit in u32"
+        );
+        let cache_elements = kv_pool_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
         let cache_bytes = cache_elements * kv_cache_dtype.bytes_per_element();
 
         // Каждая последовательность владеет своим непрерывным диапазоном
@@ -324,6 +373,7 @@ impl Executor {
             max_batch: batch,
             max_context: config.max_context,
             max_blocks,
+            kv_pool_blocks,
             kv_cache_dtype,
             decode_linear_mode,
             delta_state_mode,
@@ -443,6 +493,10 @@ impl Executor {
         let keys: usize = self.key_caches.iter().map(DeviceBuffer::bytes).sum();
         let values: usize = self.value_caches.iter().map(DeviceBuffer::bytes).sum();
         state + conv + keys + values
+    }
+
+    pub fn kv_pool_blocks(&self) -> usize {
+        self.kv_pool_blocks
     }
 
     /// Один шаг decode для `tokens[i]` на позиции `positions[i]`.
@@ -767,7 +821,7 @@ impl Executor {
         assert!(
             block_ids
                 .iter()
-                .all(|&block| (block as usize) < self.max_batch * self.max_blocks),
+                .all(|&block| (block as usize) < self.kv_pool_blocks),
             "KV block ID exceeds executor pool"
         );
         if start_position == 0 {
@@ -1013,7 +1067,7 @@ impl Executor {
                         live,
                         &self.stream,
                     )?;
-                    let blocks = self.max_batch * self.max_blocks;
+                    let blocks = self.kv_pool_blocks;
                     mark!("attn.prepare");
                     mixer.prepare.prepare_decode(
                         &prefill.query_gate,
@@ -1259,7 +1313,7 @@ impl Executor {
             &self.stream,
         )?;
 
-        let blocks = self.max_batch * self.max_blocks;
+        let blocks = self.kv_pool_blocks;
         self.mark("attn.prepare")?;
         mixer.prepare.prepare_decode(
             &self.query_gate,
@@ -1312,7 +1366,7 @@ impl Executor {
         assert!(layout.position_starts.len() >= batch);
         assert!(layout.context_lens.len() >= batch);
         self.host_block_tables.fill(0);
-        let total_blocks = self.max_batch * self.max_blocks;
+        let total_blocks = self.kv_pool_blocks;
         let mut max_position = 0usize;
         for row in 0..batch {
             let position = layout.position_starts[row] as usize;
@@ -1422,6 +1476,12 @@ impl Executor {
         for (index, segment) in segments.iter().enumerate() {
             let blocks = &block_ids[block_bounds[index]..block_bounds[index + 1]];
             assert!(blocks.len() <= self.max_blocks, "KV block table overflows");
+            assert!(
+                blocks
+                    .iter()
+                    .all(|&block| (block as usize) < self.kv_pool_blocks),
+                "KV block ID exceeds executor pool"
+            );
             for step in 0..segment.tokens {
                 let row = segment.row_begin + step;
                 let position = segment.position_start + step;
