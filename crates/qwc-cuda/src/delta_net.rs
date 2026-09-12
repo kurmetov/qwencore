@@ -102,9 +102,9 @@ impl DeltaPreprocessor {
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_decode(
         &self,
-        mixed_qkv: &DeviceBuffer<u16>,
-        a_projection: &DeviceBuffer<u16>,
-        b_projection: &DeviceBuffer<u16>,
+        mixed_qkv: RowView<'_>,
+        a_projection: RowView<'_>,
+        b_projection: RowView<'_>,
         conv_state_pool: &mut DeviceBuffer<f32>,
         state_slots: &DeviceBuffer<u32>,
         output: &mut PreparedDelta,
@@ -113,9 +113,10 @@ impl DeltaPreprocessor {
         stream: &Stream,
     ) -> Result<()> {
         assert!(batch <= output.batch);
-        assert!(mixed_qkv.len() >= batch * qwc_core::arch::LA_CONV_CHANNELS);
-        assert!(a_projection.len() >= batch * GATE_ELEMS);
-        assert!(b_projection.len() >= batch * GATE_ELEMS);
+        assert!(mixed_qkv.fits(batch, qwc_core::arch::LA_CONV_CHANNELS));
+        assert!(a_projection.fits(batch, GATE_ELEMS));
+        assert!(b_projection.fits(batch, GATE_ELEMS));
+        assert_eq!(a_projection.stride(), b_projection.stride());
         assert_eq!(conv_state_pool.len(), state_capacity * CONV_STATE_ELEMS);
         assert!(state_slots.len() >= batch);
         check(unsafe {
@@ -135,6 +136,8 @@ impl DeltaPreprocessor {
                 output.beta.as_mut_ptr(),
                 state_capacity as i32,
                 batch as i32,
+                mixed_qkv.stride() as i32,
+                a_projection.stride() as i32,
                 stream.raw(),
             )
         })
@@ -144,9 +147,9 @@ impl DeltaPreprocessor {
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_prefill(
         &self,
-        mixed_qkv: &DeviceBuffer<u16>,
-        a_projection: &DeviceBuffer<u16>,
-        b_projection: &DeviceBuffer<u16>,
+        mixed_qkv: RowView<'_>,
+        a_projection: RowView<'_>,
+        b_projection: RowView<'_>,
         conv_state_pool: &mut DeviceBuffer<f32>,
         output: &mut PreparedDelta,
         state_capacity: usize,
@@ -157,12 +160,10 @@ impl DeltaPreprocessor {
     ) -> Result<()> {
         assert!(tokens > 0 && row_offset + tokens <= output.batch);
         assert!(state_slot < state_capacity);
-        assert_eq!(
-            mixed_qkv.len(),
-            output.batch * qwc_core::arch::LA_CONV_CHANNELS
-        );
-        assert_eq!(a_projection.len(), output.batch * GATE_ELEMS);
-        assert_eq!(b_projection.len(), output.batch * GATE_ELEMS);
+        assert!(mixed_qkv.fits(output.batch, qwc_core::arch::LA_CONV_CHANNELS));
+        assert!(a_projection.fits(output.batch, GATE_ELEMS));
+        assert!(b_projection.fits(output.batch, GATE_ELEMS));
+        assert_eq!(a_projection.stride(), b_projection.stride());
         assert_eq!(conv_state_pool.len(), state_capacity * CONV_STATE_ELEMS);
         check(unsafe {
             ffi::qwc_delta_prepare_prefill(
@@ -182,9 +183,57 @@ impl DeltaPreprocessor {
                 state_slot as i32,
                 tokens as i32,
                 row_offset as i32,
+                mixed_qkv.stride() as i32,
+                a_projection.stride() as i32,
                 stream.raw(),
             )
         })
+    }
+}
+
+/// Срез арены проекций: строки идут с шагом `stride`, начиная с `offset`.
+///
+/// Слитая проекция миксера кладёт qkv, z, a и b в одну матрицу, поэтому
+/// потребители получают не отдельный буфер, а вид на её столбцы. `packed`
+/// описывает прежний случай — отдельный плотный буфер.
+#[derive(Clone, Copy)]
+pub struct RowView<'a> {
+    buffer: &'a DeviceBuffer<u16>,
+    offset: usize,
+    stride: usize,
+}
+
+impl<'a> RowView<'a> {
+    pub fn packed(buffer: &'a DeviceBuffer<u16>, width: usize) -> Self {
+        Self {
+            buffer,
+            offset: 0,
+            stride: width,
+        }
+    }
+
+    pub fn strided(buffer: &'a DeviceBuffer<u16>, offset: usize, stride: usize) -> Self {
+        assert!(offset < stride, "срез начинается за пределами строки");
+        Self {
+            buffer,
+            offset,
+            stride,
+        }
+    }
+
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
+    /// Помещаются ли `rows` строк шириной `width`.
+    pub fn fits(&self, rows: usize, width: usize) -> bool {
+        assert!(self.offset + width <= self.stride, "срез шире строки");
+        rows == 0 || self.offset + (rows - 1) * self.stride + width <= self.buffer.len()
+    }
+
+    fn as_ptr(&self) -> *const std::ffi::c_void {
+        // SAFETY: смещение внутри буфера проверяется `fits` у вызывающего.
+        unsafe { (self.buffer.as_ptr() as *const u16).add(self.offset) as *const _ }
     }
 }
 
@@ -208,13 +257,13 @@ impl DeltaOutputNorm {
     pub fn forward(
         &self,
         input: &DeviceBuffer<f32>,
-        gate: &DeviceBuffer<u16>,
+        gate: RowView<'_>,
         output: &mut DeviceBuffer<u16>,
         batch: usize,
         stream: &Stream,
     ) -> Result<()> {
         assert!(input.len() >= batch * V_ELEMS);
-        assert!(gate.len() >= batch * V_ELEMS);
+        assert!(gate.fits(batch, V_ELEMS));
         assert!(output.len() >= batch * V_ELEMS);
         check(unsafe {
             ffi::qwc_delta_gated_rmsnorm(
@@ -224,6 +273,7 @@ impl DeltaOutputNorm {
                 output.as_mut_ptr(),
                 batch as i32,
                 self.epsilon,
+                gate.stride() as i32,
                 stream.raw(),
             )
         })

@@ -4,7 +4,7 @@
 use qwc_core::arch::{LA_CONV_CHANNELS, LA_K_HEAD_DIM, LA_NUM_K_HEADS, LA_V_HEAD_DIM};
 use qwc_cuda::delta_net::{
     self, CONV_STATE_ELEMS, DeltaInputs, DeltaOutputNorm, DeltaPreprocessor, DeltaStateMode,
-    GATE_ELEMS, PreparedDelta, QK_ELEMS, STATE_ELEMS, V_ELEMS,
+    GATE_ELEMS, PreparedDelta, QK_ELEMS, RowView, STATE_ELEMS, V_ELEMS,
 };
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
 
@@ -620,9 +620,9 @@ fn delta_preprocessor_matches_cpu_and_updates_only_selected_conv_slots() {
     let mut prepared = PreparedDelta::zeroed(batch).unwrap();
     preprocessor
         .prepare_decode(
-            &device_mixed,
-            &device_a,
-            &device_b,
+            RowView::packed(&device_mixed, LA_CONV_CHANNELS),
+            RowView::packed(&device_a, GATE_ELEMS),
+            RowView::packed(&device_b, GATE_ELEMS),
             &mut device_state,
             &device_slots,
             &mut prepared,
@@ -694,7 +694,13 @@ fn gated_rmsnorm_matches_qwen_dtype_boundaries() {
     let device_input = DeviceBuffer::from_slice(&input).unwrap();
     let device_gate = DeviceBuffer::from_slice(&gate).unwrap();
     let mut output = DeviceBuffer::<u16>::zeroed(input.len()).unwrap();
-    norm.forward(&device_input, &device_gate, &mut output, batch, &stream)
+    norm.forward(
+        &device_input,
+        RowView::packed(&device_gate, V_ELEMS),
+        &mut output,
+        batch,
+        &stream,
+    )
         .unwrap();
     stream.synchronize().unwrap();
     let actual = output.to_vec().unwrap();

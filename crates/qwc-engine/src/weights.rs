@@ -47,12 +47,22 @@ pub struct FullAttention {
     pub prepare: AttentionPreprocessor,
 }
 
+/// Ширина слитой входной проекции миксера и смещения её частей.
+///
+/// qkv, z, a и b читают один и тот же вход, а их global scales совпадают во
+/// всех слоях чекпоинта — склейка точна, не приближённа. Порознь они дают
+/// четыре запуска на слой, из них два по N=48: при тайле 128 это один блок на
+/// 170 SM, и две крошечные проекции стоили дороже, чем qkv и z вместе.
+pub const MIXER_GATE_WIDTH: usize = LA_NUM_V_HEADS;
+pub const MIXER_Z_OFFSET: usize = LA_CONV_CHANNELS;
+pub const MIXER_A_OFFSET: usize = MIXER_Z_OFFSET + LA_V_PROJ_DIM;
+pub const MIXER_B_OFFSET: usize = MIXER_A_OFFSET + MIXER_GATE_WIDTH;
+pub const MIXER_FUSED_WIDTH: usize = MIXER_B_OFFSET + MIXER_GATE_WIDTH;
+
 /// Gated DeltaNet слой.
 pub struct LinearAttention {
-    pub qkv: Projection,
-    pub z: Projection,
-    pub a: Projection,
-    pub b: Projection,
+    /// Слитая [MIXER_FUSED_WIDTH, HIDDEN_SIZE]: qkv, z, a, b подряд.
+    pub in_proj: Projection,
     pub out: Projection,
     /// conv1d + SiLU, L2-норма q/k, alpha/beta.
     pub prepare: DeltaPreprocessor,
@@ -377,10 +387,7 @@ fn load_layer(
             )?,
         }),
         LayerKind::LinearAttention => Mixer::Linear(LinearAttention {
-            qkv: projection("in_proj_qkv")?,
-            z: projection("in_proj_z")?,
-            a: projection("in_proj_a")?,
-            b: projection("in_proj_b")?,
+            in_proj: projection("in_proj")?,
             out: projection("out_proj")?,
             prepare: DeltaPreprocessor::from_host(
                 &take(&mut plain, index, "linear_attn.conv1d.weight")?,
@@ -426,10 +433,20 @@ fn load_projections(
     stats: &mut LoadStats,
 ) -> Result<HashMap<String, Projection>, LoadError> {
     let mut out = HashMap::new();
+    let mut fused: Vec<(String, qwc_model::checkpoint::QuantLinear<'_>)> = Vec::new();
     for (prefix, out_features, in_features) in names::quant_linears(index) {
         let quant = checkpoint
             .quant_linear(&prefix, out_features, in_features)
             .map_err(LoadError::Checkpoint)?;
+        let short = prefix
+            .rsplit('.')
+            .next()
+            .expect("имя проекции не пустое")
+            .to_string();
+        if MIXER_PARTS.contains(&short.as_str()) {
+            fused.push((short, quant));
+            continue;
+        }
         let linear = Linear::from_host(
             quant.packed,
             quant.block_scales,
@@ -439,11 +456,6 @@ fn load_projections(
         )?;
         stats.quantized_bytes += linear.resident_bytes();
         stats.projections += 1;
-        let short = prefix
-            .rsplit('.')
-            .next()
-            .expect("имя проекции не пустое")
-            .to_string();
         out.insert(
             short,
             Projection {
@@ -453,7 +465,82 @@ fn load_projections(
             },
         );
     }
+    if !fused.is_empty() {
+        let projection = fuse_mixer_input(&fused, decode_linear_mode, stats)?;
+        out.insert("in_proj".to_string(), projection);
+    }
     Ok(out)
+}
+
+/// Части слитой входной проекции — в том порядке, в каком они лежат в строке.
+const MIXER_PARTS: [&str; 4] = ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"];
+
+/// Склеивает qkv, z, a и b в одну матрицу.
+///
+/// Обе шкалы обязаны совпадать: alpha GEMM'а — один скаляр на запуск, и
+/// разные global scales склеить было бы нечем. В чекпоинте они совпадают во
+/// всех 48 слоях, поэтому расхождение здесь — это ошибка загрузки, а не
+/// случай, который нужно поддерживать.
+fn fuse_mixer_input(
+    parts: &[(String, qwc_model::checkpoint::QuantLinear<'_>)],
+    decode_linear_mode: DecodeLinearMode,
+    stats: &mut LoadStats,
+) -> Result<Projection, LoadError> {
+    if parts.len() != MIXER_PARTS.len() {
+        return Err(LoadError::Checkpoint(format!(
+            "слитая проекция миксера: частей {}, ожидалось {}",
+            parts.len(),
+            MIXER_PARTS.len()
+        )));
+    }
+    let mut packed = Vec::new();
+    let mut scales = Vec::new();
+    let mut out_features = 0usize;
+    let in_features = parts[0].1.in_features;
+    let weight_global_scale = parts[0].1.weight_global_scale;
+    let input_global_scale = parts[0].1.input_global_scale;
+    for name in MIXER_PARTS {
+        let quant = &parts
+            .iter()
+            .find(|(short, _)| short == name)
+            .ok_or_else(|| LoadError::Checkpoint(format!("нет {name}")))?
+            .1;
+        if quant.weight_global_scale != weight_global_scale
+            || quant.input_global_scale != input_global_scale
+        {
+            return Err(LoadError::Checkpoint(format!(
+                "{name}: global scale расходится с остальными частями миксера"
+            )));
+        }
+        if quant.in_features != in_features {
+            return Err(LoadError::Checkpoint(format!(
+                "{name}: K={} против {in_features}",
+                quant.in_features
+            )));
+        }
+        packed.extend_from_slice(quant.packed);
+        scales.extend_from_slice(quant.block_scales);
+        out_features += quant.out_features;
+    }
+    if out_features != MIXER_FUSED_WIDTH {
+        return Err(LoadError::Checkpoint(format!(
+            "слитая проекция миксера: N={out_features}, ожидалось {MIXER_FUSED_WIDTH}"
+        )));
+    }
+    let linear = Linear::from_host(
+        &packed,
+        &scales,
+        weight_global_scale,
+        out_features,
+        in_features,
+    )?;
+    stats.quantized_bytes += linear.resident_bytes();
+    stats.projections += 1;
+    Ok(Projection {
+        linear,
+        input_global_scale,
+        decode_linear_mode,
+    })
 }
 
 /// Неквантованные тензоры слоя по суффиксу имени. Список и формы приходят

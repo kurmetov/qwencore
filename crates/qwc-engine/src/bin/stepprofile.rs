@@ -253,7 +253,7 @@ struct Traffic {
 
 impl Traffic {
     fn measure(weights: &ModelWeights, decode_rows: usize, prefill_tokens: usize) -> Self {
-        let mut la_qkvab = 0u64;
+        let mut la_in = 0u64;
         let mut la_out = 0u64;
         let mut attn_qkv = 0u64;
         let mut attn_out = 0u64;
@@ -263,10 +263,7 @@ impl Traffic {
         for layer in &weights.layers {
             match &layer.mixer {
                 Mixer::Linear(mixer) => {
-                    la_qkvab += (mixer.qkv.resident_bytes()
-                        + mixer.z.resident_bytes()
-                        + mixer.a.resident_bytes()
-                        + mixer.b.resident_bytes()) as u64;
+                    la_in += mixer.in_proj.resident_bytes() as u64;
                     la_out += mixer.out.resident_bytes() as u64;
                     linear_layers += 1;
                 }
@@ -293,7 +290,7 @@ impl Traffic {
         let lm_head = weights.lm_head.resident_bytes() as u64;
 
         let phases = vec![
-            ("gemm.la_qkvab", la_qkvab),
+            ("gemm.la_in", la_in),
             ("gemm.la_out", la_out),
             ("gemm.attn_qkv", attn_qkv),
             ("gemm.attn_out", attn_out),

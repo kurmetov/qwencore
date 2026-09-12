@@ -21,12 +21,16 @@ __global__ __launch_bounds__(kHeadDim) void gated_rmsnorm_kernel(
     const __nv_bfloat16* __restrict__ gate,
     const __nv_bfloat16* __restrict__ weight,
     __nv_bfloat16* __restrict__ output,
-    float epsilon) {
+    float epsilon,
+    int gate_stride) {
   const int head = blockIdx.x;
   const int batch = blockIdx.y;
   const int dimension = threadIdx.x;
   const size_t offset =
       (static_cast<size_t>(batch) * kHeads + head) * kHeadDim + dimension;
+  // Гейт может лежать срезом слитой арены, вход и выход — всегда плотно.
+  const size_t gate_offset =
+      static_cast<size_t>(batch) * gate_stride + head * kHeadDim + dimension;
 
   // The recurrent implementation returns to its original BF16 dtype before
   // Qwen3_5RMSNormGated converts it back to FP32 for the variance.
@@ -53,7 +57,7 @@ __global__ __launch_bounds__(kHeadDim) void gated_rmsnorm_kernel(
   const __nv_bfloat16 normalized = __float2bfloat16(value * inverse);
   const __nv_bfloat16 weighted = __float2bfloat16(
       __bfloat162float(weight[dimension]) * __bfloat162float(normalized));
-  const float gate_value = __bfloat162float(gate[offset]);
+  const float gate_value = __bfloat162float(gate[gate_offset]);
   const float silu = gate_value / (1.0f + __expf(-gate_value));
   output[offset] = __float2bfloat16(__bfloat162float(weighted) * silu);
 }
@@ -67,9 +71,11 @@ extern "C" cudaError_t qwc_delta_gated_rmsnorm(
     void* output,
     int batch,
     float epsilon,
+    int gate_stride,
     cudaStream_t stream) {
   if (input == nullptr || gate == nullptr || weight == nullptr || output == nullptr ||
-      batch <= 0 || batch > 1024 || !isfinite(epsilon) || epsilon <= 0.0f) {
+      batch <= 0 || batch > 1024 || !isfinite(epsilon) || epsilon <= 0.0f ||
+      gate_stride < kHeads * kHeadDim) {
     return cudaErrorInvalidValue;
   }
   dim3 grid(kHeads, batch);
@@ -78,6 +84,7 @@ extern "C" cudaError_t qwc_delta_gated_rmsnorm(
       static_cast<const __nv_bfloat16*>(gate),
       static_cast<const __nv_bfloat16*>(weight),
       static_cast<__nv_bfloat16*>(output),
-      epsilon);
+      epsilon,
+      gate_stride);
   return cudaGetLastError();
 }

@@ -48,7 +48,8 @@ __global__ void causal_conv_split_kernel(
     float* __restrict__ query,
     float* __restrict__ key,
     float* __restrict__ value,
-    int batch) {
+    int batch,
+    int row_stride) {
   const int index = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = batch * kChannels;
   if (index >= total) {
@@ -59,7 +60,8 @@ __global__ void causal_conv_split_kernel(
   const uint32_t slot = state_slots[sequence];
   float* history =
       conv_state + (static_cast<size_t>(slot) * kChannels + channel) * kConvHistory;
-  const float current = __bfloat162float(mixed_qkv[index]);
+  const float current =
+      __bfloat162float(mixed_qkv[static_cast<size_t>(sequence) * row_stride + channel]);
   const __nv_bfloat16* weight = conv_weight + channel * 4;
   float convolved = __bfloat162float(weight[0]) * history[0];
   convolved = fmaf(__bfloat162float(weight[1]), history[1], convolved);
@@ -92,9 +94,10 @@ __device__ __forceinline__ float conv_input(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     const float* __restrict__ history,
     int token,
-    int channel) {
+    int channel,
+    int row_stride) {
   if (token >= 0) {
-    return __bfloat162float(mixed_qkv[static_cast<size_t>(token) * kChannels + channel]);
+    return __bfloat162float(mixed_qkv[static_cast<size_t>(token) * row_stride + channel]);
   }
   return history[kConvHistory + token];
 }
@@ -107,7 +110,8 @@ __global__ void causal_conv_prefill_kernel(
     float* __restrict__ key,
     float* __restrict__ value,
     int state_slot,
-    int tokens) {
+    int tokens,
+    int row_stride) {
   const int channel = blockIdx.x * blockDim.x + threadIdx.x;
   if (channel >= kChannels) {
     return;
@@ -118,13 +122,13 @@ __global__ void causal_conv_prefill_kernel(
   const __nv_bfloat16* weight = conv_weight + channel * 4;
 
   float convolved =
-      __bfloat162float(weight[0]) * conv_input(mixed_qkv, history, token - 3, channel);
+      __bfloat162float(weight[0]) * conv_input(mixed_qkv, history, token - 3, channel, row_stride);
   convolved = fmaf(__bfloat162float(weight[1]),
-                   conv_input(mixed_qkv, history, token - 2, channel), convolved);
+                   conv_input(mixed_qkv, history, token - 2, channel, row_stride), convolved);
   convolved = fmaf(__bfloat162float(weight[2]),
-                   conv_input(mixed_qkv, history, token - 1, channel), convolved);
+                   conv_input(mixed_qkv, history, token - 1, channel, row_stride), convolved);
   convolved = fmaf(__bfloat162float(weight[3]),
-                   conv_input(mixed_qkv, history, token, channel), convolved);
+                   conv_input(mixed_qkv, history, token, channel, row_stride), convolved);
 
   const float activated =
       __bfloat162float(__float2bfloat16(convolved * sigmoid(convolved)));
@@ -144,7 +148,8 @@ __global__ void conv_state_prefill_kernel(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     float* __restrict__ conv_state,
     int state_slot,
-    int tokens) {
+    int tokens,
+    int row_stride) {
   const int channel = blockIdx.x * blockDim.x + threadIdx.x;
   if (channel >= kChannels) {
     return;
@@ -154,7 +159,8 @@ __global__ void conv_state_prefill_kernel(
   const float previous[kConvHistory] = {history[0], history[1], history[2]};
   #pragma unroll
   for (int i = 0; i < kConvHistory; ++i) {
-    history[i] = conv_input(mixed_qkv, previous, tokens - kConvHistory + i, channel);
+    history[i] =
+        conv_input(mixed_qkv, previous, tokens - kConvHistory + i, channel, row_stride);
   }
 }
 
@@ -166,7 +172,8 @@ __global__ __launch_bounds__(kHeadDim) void normalize_and_gate_kernel(
     const __nv_bfloat16* __restrict__ a_log,
     const __nv_bfloat16* __restrict__ dt_bias,
     float* __restrict__ alpha,
-    float* __restrict__ beta) {
+    float* __restrict__ beta,
+    int gate_stride) {
   const int head = blockIdx.x;
   const int batch = blockIdx.y;
   const int dimension = threadIdx.x;
@@ -204,9 +211,11 @@ __global__ __launch_bounds__(kHeadDim) void normalize_and_gate_kernel(
 
   if (dimension < 3) {
     const int value_head = head * 3 + dimension;
+    // Гейты читаются из арены с её шагом, а alpha/beta пишутся плотно.
+    const size_t gate_read = static_cast<size_t>(batch) * gate_stride + value_head;
     const size_t gate_offset = static_cast<size_t>(batch) * kVHeads + value_head;
-    const float projected_a = __bfloat162float(a_projection[gate_offset]);
-    const float projected_b = __bfloat162float(b_projection[gate_offset]);
+    const float projected_a = __bfloat162float(a_projection[gate_read]);
+    const float projected_b = __bfloat162float(b_projection[gate_read]);
     const float log_a = __bfloat162float(a_log[value_head]);
     const float bias = __bfloat162float(dt_bias[value_head]);
     const float log_decay = -__expf(log_a) * softplus(projected_a + bias);
@@ -233,12 +242,15 @@ extern "C" cudaError_t qwc_delta_prepare_decode(
     void* beta,
     int state_capacity,
     int batch,
+    int mixed_stride,
+    int gate_stride,
     cudaStream_t stream) {
   if (mixed_qkv == nullptr || a_projection == nullptr || b_projection == nullptr ||
       conv_weight == nullptr || a_log == nullptr || dt_bias == nullptr ||
       conv_state == nullptr || state_slots == nullptr || query == nullptr ||
       key == nullptr || value == nullptr || alpha == nullptr || beta == nullptr ||
-      state_capacity < batch || batch <= 0 || batch > 128) {
+      state_capacity < batch || batch <= 0 || batch > 128 ||
+      mixed_stride < kChannels || gate_stride < kVHeads) {
     return cudaErrorInvalidValue;
   }
   constexpr int threads = 256;
@@ -251,7 +263,8 @@ extern "C" cudaError_t qwc_delta_prepare_decode(
       static_cast<float*>(query),
       static_cast<float*>(key),
       static_cast<float*>(value),
-      batch);
+      batch,
+      mixed_stride);
   cudaError_t launched = cudaGetLastError();
   if (launched != cudaSuccess) {
     return launched;
@@ -265,7 +278,8 @@ extern "C" cudaError_t qwc_delta_prepare_decode(
       static_cast<const __nv_bfloat16*>(a_log),
       static_cast<const __nv_bfloat16*>(dt_bias),
       static_cast<float*>(alpha),
-      static_cast<float*>(beta));
+      static_cast<float*>(beta),
+      gate_stride);
   return cudaGetLastError();
 }
 
@@ -286,23 +300,25 @@ extern "C" cudaError_t qwc_delta_prepare_prefill(
     int state_slot,
     int tokens,
     int row_offset,
+    int mixed_stride,
+    int gate_stride,
     cudaStream_t stream) {
   if (mixed_qkv == nullptr || a_projection == nullptr || b_projection == nullptr ||
       conv_weight == nullptr || a_log == nullptr || dt_bias == nullptr ||
       conv_state == nullptr || query == nullptr || key == nullptr || value == nullptr ||
       alpha == nullptr || beta == nullptr || state_capacity <= 0 || state_slot < 0 ||
       state_slot >= state_capacity || tokens <= 0 || tokens > 1024 ||
-      row_offset < 0) {
+      row_offset < 0 || mixed_stride < kChannels || gate_stride < kVHeads) {
     return cudaErrorInvalidValue;
   }
   // One slice of a fused multi-sequence token arena; see qwc_delta_prefill.
   const __nv_bfloat16* mixed_qkv_rows =
       static_cast<const __nv_bfloat16*>(mixed_qkv) +
-      (size_t)row_offset * kChannels;
+      (size_t)row_offset * mixed_stride;
   const __nv_bfloat16* a_rows =
-      static_cast<const __nv_bfloat16*>(a_projection) + (size_t)row_offset * kVHeads;
+      static_cast<const __nv_bfloat16*>(a_projection) + (size_t)row_offset * gate_stride;
   const __nv_bfloat16* b_rows =
-      static_cast<const __nv_bfloat16*>(b_projection) + (size_t)row_offset * kVHeads;
+      static_cast<const __nv_bfloat16*>(b_projection) + (size_t)row_offset * gate_stride;
   float* query_rows = static_cast<float*>(query) + (size_t)row_offset * kQkElements;
   float* key_rows = static_cast<float*>(key) + (size_t)row_offset * kQkElements;
   float* value_rows = static_cast<float*>(value) + (size_t)row_offset * kVElements;
@@ -319,13 +335,15 @@ extern "C" cudaError_t qwc_delta_prepare_prefill(
       key_rows,
       value_rows,
       state_slot,
-      tokens);
+      tokens,
+      mixed_stride);
   cudaError_t launched = cudaGetLastError();
   if (launched != cudaSuccess) {
     return launched;
   }
   conv_state_prefill_kernel<<<blocks, threads, 0, stream>>>(
-      mixed_qkv_rows, static_cast<float*>(conv_state), state_slot, tokens);
+      mixed_qkv_rows, static_cast<float*>(conv_state), state_slot, tokens,
+      mixed_stride);
   launched = cudaGetLastError();
   if (launched != cudaSuccess) {
     return launched;
@@ -339,6 +357,7 @@ extern "C" cudaError_t qwc_delta_prepare_prefill(
       static_cast<const __nv_bfloat16*>(a_log),
       static_cast<const __nv_bfloat16*>(dt_bias),
       alpha_rows,
-      beta_rows);
+      beta_rows,
+      gate_stride);
   return cudaGetLastError();
 }

@@ -171,6 +171,8 @@ unsafe extern "C" {
         beta: *mut c_void,
         state_capacity: c_int,
         batch: c_int,
+        mixed_stride: c_int,
+        gate_stride: c_int,
         stream: Stream,
     ) -> c_int;
 
@@ -192,6 +194,8 @@ unsafe extern "C" {
         state_slot: c_int,
         tokens: c_int,
         row_offset: c_int,
+        mixed_stride: c_int,
+        gate_stride: c_int,
         stream: Stream,
     ) -> c_int;
 
@@ -211,6 +215,7 @@ unsafe extern "C" {
         output: *mut c_void,
         batch: c_int,
         epsilon: f32,
+        gate_stride: c_int,
         stream: Stream,
     ) -> c_int;
 

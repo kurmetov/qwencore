@@ -147,7 +147,12 @@ fn verify_first_projection(
     let expected = checkpoint
         .bytes(name)
         .ok_or("нет in_proj_qkv.weight_packed")?;
-    let actual = mixer.qkv.linear.packed_to_host()?;
+    // qkv лежит в начале слитой входной проекции: сверка заодно проверяет,
+    // что склейка не переставила части местами.
+    let fused = mixer.in_proj.linear.packed_to_host()?;
+    let actual = fused
+        .get(..expected.len())
+        .ok_or("слитая проекция короче in_proj_qkv")?;
     if actual != expected {
         return Err(format!(
             "in_proj_qkv слоя 0 разошёлся с чекпоинтом ({} байт)",
@@ -156,8 +161,10 @@ fn verify_first_projection(
         .into());
     }
     println!(
-        "\nСверка: in_proj_qkv слоя 0 совпадает с чекпоинтом побайтно ({:.1} MB)",
-        actual.len() as f64 / 1e6
+        "\nСверка: in_proj_qkv слоя 0 совпадает с началом слитой проекции \
+         побайтно ({:.1} MB из {:.1} MB)",
+        actual.len() as f64 / 1e6,
+        fused.len() as f64 / 1e6
     );
     Ok(())
 }

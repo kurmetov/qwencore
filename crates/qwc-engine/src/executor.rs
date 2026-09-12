@@ -7,11 +7,12 @@
 //! численный тракт, а не политику вытеснения.
 
 use crate::weights::{
-    DecodeLinearMode, FullAttention, LinearAttention, Mixer, ModelWeights, Projection,
+    DecodeLinearMode, FullAttention, LinearAttention, MIXER_A_OFFSET, MIXER_B_OFFSET,
+    MIXER_FUSED_WIDTH, MIXER_Z_OFFSET, Mixer, ModelWeights, Projection,
 };
 use qwc_core::arch::*;
 use qwc_cuda::delta_net::{
-    self, CONV_STATE_ELEMS, DeltaStateMode, GATE_ELEMS, PreparedDelta, STATE_ELEMS, V_ELEMS,
+    self, CONV_STATE_ELEMS, DeltaStateMode, PreparedDelta, RowView, STATE_ELEMS, V_ELEMS,
 };
 use qwc_cuda::graph::CudaGraph;
 use qwc_cuda::nvfp4::{self, QuantizedActivation, W4A4Workspace};
@@ -85,10 +86,8 @@ pub struct Executor {
     projection_workspace: W4A4Workspace,
 
     // Gated DeltaNet.
-    mixed_qkv: DeviceBuffer<u16>,
-    z_gate: DeviceBuffer<u16>,
-    a_projection: DeviceBuffer<u16>,
-    b_projection: DeviceBuffer<u16>,
+    /// Слитый вход миксера: qkv, z, a и b одной строкой.
+    mixer_in: DeviceBuffer<u16>,
     prepared: PreparedDelta,
     delta_out: DeviceBuffer<f32>,
     delta_normed: DeviceBuffer<u16>,
@@ -147,10 +146,8 @@ struct PrefillBuffers {
     mlp_hidden: DeviceBuffer<u16>,
     mlp_out: DeviceBuffer<u16>,
 
-    mixed_qkv: DeviceBuffer<u16>,
-    z_gate: DeviceBuffer<u16>,
-    a_projection: DeviceBuffer<u16>,
-    b_projection: DeviceBuffer<u16>,
+    /// Слитый вход миксера: qkv, z, a и b одной строкой.
+    mixer_in: DeviceBuffer<u16>,
     prepared: PreparedDelta,
     delta_out: DeviceBuffer<f32>,
     delta_normed: DeviceBuffer<u16>,
@@ -203,9 +200,7 @@ impl PrefillBuffers {
             }
         }
         let shapes = [
-            (LA_CONV_CHANNELS, HIDDEN_SIZE),
-            (LA_V_PROJ_DIM, HIDDEN_SIZE),
-            (GATE_ELEMS, HIDDEN_SIZE),
+            (MIXER_FUSED_WIDTH, HIDDEN_SIZE),
             (HIDDEN_SIZE, LA_V_PROJ_DIM),
             (2 * Q_PROJ_DIM, HIDDEN_SIZE),
             (KV_PROJ_DIM, HIDDEN_SIZE),
@@ -221,10 +216,7 @@ impl PrefillBuffers {
             mlp_up: DeviceBuffer::zeroed(rows * INTERMEDIATE_SIZE)?,
             mlp_hidden: DeviceBuffer::zeroed(rows * INTERMEDIATE_SIZE)?,
             mlp_out: DeviceBuffer::zeroed(rows * HIDDEN_SIZE)?,
-            mixed_qkv: DeviceBuffer::zeroed(rows * LA_CONV_CHANNELS)?,
-            z_gate: DeviceBuffer::zeroed(rows * LA_V_PROJ_DIM)?,
-            a_projection: DeviceBuffer::zeroed(rows * GATE_ELEMS)?,
-            b_projection: DeviceBuffer::zeroed(rows * GATE_ELEMS)?,
+            mixer_in: DeviceBuffer::zeroed(rows * MIXER_FUSED_WIDTH)?,
             prepared: PreparedDelta::zeroed(rows)?,
             delta_out: DeviceBuffer::zeroed(rows * V_ELEMS)?,
             delta_normed: DeviceBuffer::zeroed(rows * V_ELEMS)?,
@@ -348,9 +340,7 @@ impl Executor {
             projection_workspace: W4A4Workspace::for_shapes(
                 decode_rows,
                 &[
-                    (LA_CONV_CHANNELS, HIDDEN_SIZE),
-                    (LA_V_PROJ_DIM, HIDDEN_SIZE),
-                    (GATE_ELEMS, HIDDEN_SIZE),
+                    (MIXER_FUSED_WIDTH, HIDDEN_SIZE),
                     (HIDDEN_SIZE, LA_V_PROJ_DIM),
                     (2 * Q_PROJ_DIM, HIDDEN_SIZE),
                     (KV_PROJ_DIM, HIDDEN_SIZE),
@@ -359,10 +349,7 @@ impl Executor {
                     (HIDDEN_SIZE, INTERMEDIATE_SIZE),
                 ],
             )?,
-            mixed_qkv: DeviceBuffer::zeroed(decode_rows * LA_CONV_CHANNELS)?,
-            z_gate: DeviceBuffer::zeroed(decode_rows * LA_V_PROJ_DIM)?,
-            a_projection: DeviceBuffer::zeroed(decode_rows * GATE_ELEMS)?,
-            b_projection: DeviceBuffer::zeroed(decode_rows * GATE_ELEMS)?,
+            mixer_in: DeviceBuffer::zeroed(decode_rows * MIXER_FUSED_WIDTH)?,
             prepared: PreparedDelta::zeroed(batch)?,
             delta_out: DeviceBuffer::zeroed(batch * V_ELEMS)?,
             delta_normed: DeviceBuffer::zeroed(decode_rows * V_ELEMS)?,
@@ -898,41 +885,12 @@ impl Executor {
         for (index, layer) in weights.layers.iter().enumerate() {
             match &layer.mixer {
                 Mixer::Linear(mixer) => {
-                    mark!("gemm.la_qkv");
+                    mark!("gemm.la_in");
                     project_w4a4(
-                        &mixer.qkv,
+                        &mixer.in_proj,
                         &prefill.normed,
                         &mut prefill.quant_hidden,
-                        &mut prefill.mixed_qkv,
-                        &mut prefill.projection_workspace,
-                        live,
-                        &self.stream,
-                    )?;
-                    mark!("gemm.la_z");
-                    project_w4a4(
-                        &mixer.z,
-                        &prefill.normed,
-                        &mut prefill.quant_hidden,
-                        &mut prefill.z_gate,
-                        &mut prefill.projection_workspace,
-                        live,
-                        &self.stream,
-                    )?;
-                    mark!("gemm.la_ab");
-                    project_w4a4(
-                        &mixer.a,
-                        &prefill.normed,
-                        &mut prefill.quant_hidden,
-                        &mut prefill.a_projection,
-                        &mut prefill.projection_workspace,
-                        live,
-                        &self.stream,
-                    )?;
-                    project_w4a4(
-                        &mixer.b,
-                        &prefill.normed,
-                        &mut prefill.quant_hidden,
-                        &mut prefill.b_projection,
+                        &mut prefill.mixer_in,
                         &mut prefill.projection_workspace,
                         live,
                         &self.stream,
@@ -942,9 +900,17 @@ impl Executor {
                     if decode_rows > 0 {
                         mark!("delta.prepare");
                         mixer.prepare.prepare_decode(
-                            &prefill.mixed_qkv,
-                            &prefill.a_projection,
-                            &prefill.b_projection,
+                            RowView::packed(&prefill.mixer_in, MIXER_FUSED_WIDTH),
+                            RowView::strided(
+                                &prefill.mixer_in,
+                                MIXER_A_OFFSET,
+                                MIXER_FUSED_WIDTH,
+                            ),
+                            RowView::strided(
+                                &prefill.mixer_in,
+                                MIXER_B_OFFSET,
+                                MIXER_FUSED_WIDTH,
+                            ),
                             &mut self.conv_pools[linear_layer],
                             &prefill.decode_slots,
                             &mut prefill.prepared,
@@ -966,9 +932,17 @@ impl Executor {
                     for segment in &segments[decode_rows..] {
                         mark!("delta.prepare_prefill");
                         mixer.prepare.prepare_prefill(
-                            &prefill.mixed_qkv,
-                            &prefill.a_projection,
-                            &prefill.b_projection,
+                            RowView::packed(&prefill.mixer_in, MIXER_FUSED_WIDTH),
+                            RowView::strided(
+                                &prefill.mixer_in,
+                                MIXER_A_OFFSET,
+                                MIXER_FUSED_WIDTH,
+                            ),
+                            RowView::strided(
+                                &prefill.mixer_in,
+                                MIXER_B_OFFSET,
+                                MIXER_FUSED_WIDTH,
+                            ),
                             &mut self.conv_pools[linear_layer],
                             &mut prefill.prepared,
                             self.max_batch,
@@ -993,7 +967,7 @@ impl Executor {
                     mark!("delta.norm");
                     mixer.output_norm.forward(
                         &prefill.delta_out,
-                        &prefill.z_gate,
+                        RowView::strided(&prefill.mixer_in, MIXER_Z_OFFSET, MIXER_FUSED_WIDTH),
                         &mut prefill.delta_normed,
                         live,
                         &self.stream,
@@ -1196,41 +1170,12 @@ impl Executor {
         layer: usize,
         batch: usize,
     ) -> Result<()> {
-        self.mark("gemm.la_qkv")?;
+        self.mark("gemm.la_in")?;
         project_decode(
-            &mixer.qkv,
+            &mixer.in_proj,
             &self.normed,
             &mut self.quant_hidden,
-            &mut self.mixed_qkv,
-            &mut self.projection_workspace,
-            batch,
-            &self.stream,
-        )?;
-        self.mark("gemm.la_z")?;
-        project_decode(
-            &mixer.z,
-            &self.normed,
-            &mut self.quant_hidden,
-            &mut self.z_gate,
-            &mut self.projection_workspace,
-            batch,
-            &self.stream,
-        )?;
-        self.mark("gemm.la_ab")?;
-        project_decode(
-            &mixer.a,
-            &self.normed,
-            &mut self.quant_hidden,
-            &mut self.a_projection,
-            &mut self.projection_workspace,
-            batch,
-            &self.stream,
-        )?;
-        project_decode(
-            &mixer.b,
-            &self.normed,
-            &mut self.quant_hidden,
-            &mut self.b_projection,
+            &mut self.mixer_in,
             &mut self.projection_workspace,
             batch,
             &self.stream,
@@ -1238,9 +1183,9 @@ impl Executor {
 
         self.mark("delta.prepare")?;
         mixer.prepare.prepare_decode(
-            &self.mixed_qkv,
-            &self.a_projection,
-            &self.b_projection,
+            RowView::packed(&self.mixer_in, MIXER_FUSED_WIDTH),
+            RowView::strided(&self.mixer_in, MIXER_A_OFFSET, MIXER_FUSED_WIDTH),
+            RowView::strided(&self.mixer_in, MIXER_B_OFFSET, MIXER_FUSED_WIDTH),
             &mut self.conv_pools[layer],
             &self.state_slots,
             &mut self.prepared,
@@ -1261,7 +1206,7 @@ impl Executor {
         self.mark("delta.norm")?;
         mixer.output_norm.forward(
             &self.delta_out,
-            &self.z_gate,
+            RowView::strided(&self.mixer_in, MIXER_Z_OFFSET, MIXER_FUSED_WIDTH),
             &mut self.delta_normed,
             batch,
             &self.stream,
