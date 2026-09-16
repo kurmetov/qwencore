@@ -45,6 +45,41 @@ __device__ __forceinline__ float cache_to_float(const void* cache, size_t offset
   }
 }
 
+// Сколько элементов кладёт в shared один поток за раз. Поэлементная укладка
+// KV стоила больше инструкций, чем все MMA тайла вместе взятые.
+constexpr int kStageVector = 8;
+
+// Восемь элементов кэша за одно обращение.
+//
+// Поэлементное чтение превращало укладку тайла в 16384 двухбайтовых загрузки
+// на CTA. Выровнено оно всегда: измерение кратно восьми, а шаг ряда в shared
+// кратен 16 байтам.
+template <bool Bf16Cache>
+__device__ __forceinline__ void stage_eight(
+    const void* cache, size_t offset, __nv_bfloat16* destination) {
+  __nv_bfloat16 staged[kStageVector];
+  if constexpr (Bf16Cache) {
+    const float4 raw = *reinterpret_cast<const float4*>(
+        static_cast<const __nv_bfloat16*>(cache) + offset);
+    *reinterpret_cast<float4*>(destination) = raw;
+    return;
+  } else {
+    const uint2 raw = *reinterpret_cast<const uint2*>(
+        static_cast<const uint8_t*>(cache) + offset);
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&raw);
+#pragma unroll
+    for (int e = 0; e < kStageVector; ++e) {
+      staged[e] = __float2bfloat16(fp8_to_float(bytes[e]));
+    }
+  }
+  *reinterpret_cast<float4*>(destination) =
+      *reinterpret_cast<const float4*>(staged);
+}
+
+__device__ __forceinline__ void stage_eight_zero(__nv_bfloat16* destination) {
+  *reinterpret_cast<float4*>(destination) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
 __device__ __forceinline__ size_t cache_offset(
     uint32_t block, int kv_head, int token_in_block, int dimension) {
   return (((static_cast<size_t>(block) * kKvHeads + kv_head) * kPageSize +
@@ -397,56 +432,13 @@ __global__ __launch_bounds__(kThreads) void paged_attention_prefill_kernel(
 // фаза упирается в выдачу инструкций, а не в память. Здесь обе матрицы идут
 // через mma.m16n8k16, то есть одна инструкция на 16x8x16.
 //
-// CTA — четыре варпа, тайл из kMmaRows строк запроса одной головы группы.
-// KV-тайл кладётся в shared: K как [токен][dim], V транспонированно
-// [dim][токен]. Так у обоих операндов B соседние по k элементы лежат рядом и
-// фрагмент читается одним 32-битным словом.
-//
 // Тайл строк обязан принадлежать одной последовательности: таблица страниц
 // берётся у первой строки тайла. Для чанка префилла это так по построению.
-constexpr int kMmaWarps = 4;
-constexpr int kMmaThreads = kMmaWarps * 32;
-constexpr int kMmaRows = 16;                              // M
-constexpr int kMmaKeys = 32;                              // KV-тайл
-constexpr int kMmaDimPerWarp = kHeadDim / kMmaWarps;      // 64
-constexpr int kMmaTilesPerWarp = kMmaDimPerWarp / 8;      // 8 n-тайлов
+
 // Фрагмент читается дорожкой по адресу (grp * ряд + pos * 2): без набивки
 // grp уходит кратно 32 банкам и весь варп садится на четыре банка. Набивка
 // делает шаг ряда нечётным в банках и разводит дорожки по всем 32.
-constexpr int kRowPad = kHeadDim + 8;     // ряд q_tile, k_tile и v_tile
-constexpr int kProbPad = kMmaKeys + 8;    // ряд p_tile
-// Сколько элементов кладёт в shared один поток за раз. Поэлементная укладка
-// KV стоила больше инструкций, чем все MMA тайла вместе взятые.
-constexpr int kStageVector = 8;
-// Сколько голов группы обслуживает одна CTA на общем KV-тайле. kGroup = 6,
-// поэтому делители: 1, 2, 3, 6.
-constexpr int kMmaGroups = 1;
-// Блоков на SM, которые ptxas обязан уместить. Без этого числа он при
-// динамической shared считает, что блоков влезет много, и экономит регистры
-// в ущерб параллелизму инструкций.
-constexpr int kMmaBlocksPerSm = 2;
-
-// Раскладка shared одним типом: смещения полей — константы, и доступ
-// компилируется так же, как к статическим массивам.
-struct MmaShared {
-  __nv_bfloat16 query[kMmaGroups * kMmaRows * kRowPad];
-  __nv_bfloat16 key[kMmaKeys * kRowPad];
-  __nv_bfloat16 value[kMmaKeys * kRowPad];
-  __nv_bfloat16 probability[kMmaGroups * kMmaRows * kProbPad];
-  float score[kMmaGroups * kMmaRows * kMmaKeys];
-  float row_max[kMmaGroups * kMmaRows];
-  float row_sum[kMmaGroups * kMmaRows];
-  float row_scale[kMmaGroups * kMmaRows];
-  int row_context[kMmaRows];
-};
-
-constexpr size_t mma_shared_bytes() {
-  return sizeof(MmaShared);
-}
-
-__device__ __forceinline__ uint32_t pack_bf16(const __nv_bfloat16* source) {
-  return *reinterpret_cast<const uint32_t*>(source);
-}
+constexpr int kRowPad = kHeadDim + 8;
 
 __device__ __forceinline__ uint32_t pack_pair(
     __nv_bfloat16 low, __nv_bfloat16 high) {
@@ -463,12 +455,87 @@ __device__ __forceinline__ void mma_m16n8k16(
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
+// Загрузка фрагментов одной инструкцией вместо четырёх скалярных чтений.
+//
+// `ldmatrix` читает восемь строк 8x8 сразу и раскладывает их по дорожкам
+// ровно так, как их ждёт `mma.m16n8k16`. Адрес даёт каждая дорожка своя: для
+// .x4 дорожка L задаёт строку L%8 матрицы L/8, для .x2 — то же среди первых
+// шестнадцати. Вариант .trans разворачивает тайл на лету, и операнд V,
+// лежащий в shared как [ключ][измерение], не приходится ни перекладывать,
+// ни собирать по два байта.
+__device__ __forceinline__ uint32_t shared_address(const void* pointer) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
+}
+
+__device__ __forceinline__ void ldmatrix_x4(
+    uint32_t (&fragment)[4], const __nv_bfloat16* source) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(fragment[0]), "=r"(fragment[1]), "=r"(fragment[2]),
+        "=r"(fragment[3])
+      : "r"(shared_address(source)));
+}
+
+__device__ __forceinline__ void ldmatrix_x2(
+    uint32_t (&fragment)[2], const __nv_bfloat16* source) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+      : "=r"(fragment[0]), "=r"(fragment[1])
+      : "r"(shared_address(source)));
+}
+
+__device__ __forceinline__ void ldmatrix_x2_trans(
+    uint32_t (&fragment)[2], const __nv_bfloat16* source) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+      : "=r"(fragment[0]), "=r"(fragment[1])
+      : "r"(shared_address(source)));
+}
+
+// Тайл в 64 строки запроса: варп владеет своими шестнадцатью строками и
+// всеми ключами тайла.
+//
+// Прежняя форма делила работу поперёк: 16 строк на CTA, четыре варпа резали
+// по ключам в QK^T и по измерениям в PV. Из-за этого счёт шёл через shared —
+// S туда, обратно под softmax, P снова туда, — и на каждые 32 ключа
+// приходилось два барьера. Хуже другое: уложенный тайл KV обслуживал 16
+// строк запроса, и весь контекст перечитывался на каждые 16 строк.
+//
+// Здесь тайл KV общий на 64 строки: укладка та же, а MMA на ней вчетверо
+// больше. Softmax живёт в регистрах варпа (бабочка по четырём дорожкам с
+// одинаковым grp), P из аккумулятора QK^T идёт в операнд A без единой
+// перекладки, и барьеры остались только у стейджинга.
+constexpr int kFlashWarps = 4;
+constexpr int kFlashThreads = kFlashWarps * 32;
+constexpr int kFlashRows = kFlashWarps * 16;
+constexpr int kFlashKeys = 32;
+constexpr int kFlashKeyTiles = kFlashKeys / 8;      // n-тайлов в QK^T
+constexpr int kFlashKeyGroups = kFlashKeys / 16;    // k-групп в PV
+constexpr int kFlashDimTiles = kHeadDim / 8;        // n-тайлов аккумулятора
+
+struct FlashShared {
+  __nv_bfloat16 query[kFlashRows * kRowPad];
+  __nv_bfloat16 key[kFlashKeys * kRowPad];
+  __nv_bfloat16 value[kFlashKeys * kRowPad];
+  int row_context[kFlashRows];
+};
+
+constexpr size_t flash_shared_bytes() { return sizeof(FlashShared); }
+
+// Максимум и сумма строки: строка живёт на четырёх дорожках с одинаковым grp,
+// то есть на соседних по младшим двум битам.
+__device__ __forceinline__ float flash_row_max(float value) {
+  value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 1));
+  return fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 2));
+}
+
+__device__ __forceinline__ float flash_row_sum(float value) {
+  value += __shfl_xor_sync(0xffffffffu, value, 1);
+  return value + __shfl_xor_sync(0xffffffffu, value, 2);
+}
+
 template <bool Bf16Cache>
-// Второй аргумент обязателен: shared здесь динамическая, её размер ptxas на
-// этапе компиляции не видит, решает что блоков влезет много и экономит
-// регистры — теряя параллелизм инструкций. Блоков на SM всё равно не больше
-// двух-трёх, и бюджет регистров надо назвать явно.
-__global__ __launch_bounds__(kMmaThreads, kMmaBlocksPerSm) void paged_attention_prefill_mma_kernel(
+__global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flash_kernel(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ query_gate_projection,
     const void* __restrict__ key_cache,
@@ -482,58 +549,36 @@ __global__ __launch_bounds__(kMmaThreads, kMmaBlocksPerSm) void paged_attention_
     float softmax_scale) {
   const int kv_head = blockIdx.x;
   const int tile = blockIdx.y;
-  const int head_base = blockIdx.z * kMmaGroups;
+  const int query_head = kv_head * kGroup + blockIdx.z;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-  // Раскладка фрагментов m16n8k16: дорожка держит строки grp и grp+8, а по
-  // столбцам — пару, начинающуюся с pos*2.
   const int grp = lane >> 2;
   const int pos = lane & 3;
 
-  const int tile_first = tile * kMmaRows;
-  const int tile_rows = min(kMmaRows, rows - tile_first);
+  const int tile_first = tile * kFlashRows;
+  const int tile_rows = min(kFlashRows, rows - tile_first);
   if (tile_rows <= 0) {
     return;
   }
+  const int row0 = warp * 16;
 
-  // Shared динамическая: при kMmaGroups > 1 раскладка уже не влезает в
-  // статические 48 КБ на блок. Разложена структурой, а не указательной
-  // арифметикой: так смещения остаются константами времени компиляции, а
-  // выравнивание — видимым компилятору.
-  extern __shared__ __align__(16) char mma_shared[];
-  MmaShared& shared = *reinterpret_cast<MmaShared*>(mma_shared);
-  __nv_bfloat16* const q_tile = shared.query;
-  __nv_bfloat16* const k_tile = shared.key;
-  __nv_bfloat16* const v_tile = shared.value;
-  __nv_bfloat16* const p_tile = shared.probability;
-  float* const s_tile = shared.score;
-  float* const row_max = shared.row_max;
-  float* const row_sum = shared.row_sum;
-  float* const row_scale = shared.row_scale;
-  int* const row_context = shared.row_context;
+  extern __shared__ __align__(16) char flash_shared_raw[];
+  FlashShared& shared = *reinterpret_cast<FlashShared*>(flash_shared_raw);
 
-  for (int i = threadIdx.x; i < kMmaGroups * kMmaRows * kHeadDim;
-       i += kMmaThreads) {
+  for (int i = threadIdx.x; i < kFlashRows * kHeadDim; i += kFlashThreads) {
     const int dimension = i % kHeadDim;
-    const int slot = i / kHeadDim;
-    const int r = slot % kMmaRows;
-    const int g = slot / kMmaRows;
+    const int r = i / kHeadDim;
     __nv_bfloat16 value = __float2bfloat16(0.0f);
     if (r < tile_rows) {
       const size_t base =
           (static_cast<size_t>(row_base + tile_first + r) * kQueryHeads +
-           kv_head * kGroup + head_base + g) * kHeadDim;
+           query_head) * kHeadDim;
       value = query[base + dimension];
     }
-    q_tile[slot * kRowPad + dimension] = value;
+    shared.query[r * kRowPad + dimension] = value;
   }
-  for (int i = threadIdx.x; i < kMmaGroups * kMmaRows; i += kMmaThreads) {
-    row_max[i] = -CUDART_INF_F;
-    row_sum[i] = 0.0f;
-  }
-  if (threadIdx.x < kMmaRows) {
-    const int r = threadIdx.x;
-    row_context[r] = r < tile_rows
+  for (int r = threadIdx.x; r < kFlashRows; r += kFlashThreads) {
+    shared.row_context[r] = r < tile_rows
         ? static_cast<int>(context_lengths[row_base + tile_first + r])
         : 0;
   }
@@ -541,34 +586,25 @@ __global__ __launch_bounds__(kMmaThreads, kMmaBlocksPerSm) void paged_attention_
 
   int max_context = 0;
 #pragma unroll
-  for (int r = 0; r < kMmaRows; ++r) {
-    max_context = max(max_context, row_context[r]);
+  for (int r = 0; r < kFlashRows; ++r) {
+    max_context = max(max_context, shared.row_context[r]);
   }
-
   // Таблица страниц общая на тайл: строки чанка принадлежат одной
   // последовательности.
   const uint32_t* table =
       block_tables + static_cast<size_t>(row_base + tile_first) * max_blocks;
+  // Причинные префиксы строк варпа: за ними ему в тайле делать нечего.
+  const int warp_context =
+      max(shared.row_context[row0 + 15], shared.row_context[row0]);
 
-  float accumulator[kMmaGroups][kMmaTilesPerWarp][4];
-#pragma unroll
-  for (int g = 0; g < kMmaGroups; ++g) {
-#pragma unroll
-    for (int t = 0; t < kMmaTilesPerWarp; ++t) {
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        accumulator[g][t][i] = 0.0f;
-      }
-    }
-  }
+  float accumulator[kFlashDimTiles][4] = {};
+  float running_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
+  float running_sum[2] = {0.0f, 0.0f};
 
-  for (int key_base = 0; key_base < max_context; key_base += kMmaKeys) {
+  for (int key_base = 0; key_base < max_context; key_base += kFlashKeys) {
     __syncthreads();
-    // Уложенный тайл обслуживает все kMmaGroups голов группы: раньше его
-    // грузила каждая из шести CTA по отдельности, и это и была основная
-    // статья расхода ядра.
-    for (int i = threadIdx.x * kStageVector; i < kMmaKeys * kHeadDim;
-         i += kMmaThreads * kStageVector) {
+    for (int i = threadIdx.x * kStageVector; i < kFlashKeys * kHeadDim;
+         i += kFlashThreads * kStageVector) {
       const int key = i / kHeadDim;
       const int dimension = i - key * kHeadDim;
       const int token = key_base + key;
@@ -576,162 +612,150 @@ __global__ __launch_bounds__(kMmaThreads, kMmaBlocksPerSm) void paged_attention_
         const uint32_t block = table[token / kPageSize];
         const size_t offset =
             cache_offset(block, kv_head, token % kPageSize, dimension);
-#pragma unroll
-        for (int e = 0; e < kStageVector; ++e) {
-          k_tile[key * kRowPad + dimension + e] = __float2bfloat16(
-              cache_to_float<Bf16Cache>(key_cache, offset + e));
-          v_tile[key * kRowPad + dimension + e] = __float2bfloat16(
-              cache_to_float<Bf16Cache>(value_cache, offset + e));
-        }
+        stage_eight<Bf16Cache>(
+            key_cache, offset, &shared.key[key * kRowPad + dimension]);
+        stage_eight<Bf16Cache>(
+            value_cache, offset, &shared.value[key * kRowPad + dimension]);
       } else {
-#pragma unroll
-        for (int e = 0; e < kStageVector; ++e) {
-          k_tile[key * kRowPad + dimension + e] = __float2bfloat16(0.0f);
-          v_tile[key * kRowPad + dimension + e] = __float2bfloat16(0.0f);
-        }
+        stage_eight_zero(&shared.key[key * kRowPad + dimension]);
+        stage_eight_zero(&shared.value[key * kRowPad + dimension]);
       }
     }
     __syncthreads();
+    if (key_base >= warp_context) {
+      continue;   // барьеры варп отработал, считать ему нечего
+    }
 
-    // QK^T: варп берёт свои восемь ключей тайла и проходит весь head_dim.
-    const int key_column = warp * 8;
+    // QK^T: строки варпа против всех ключей тайла.
+    float scores[kFlashKeyTiles][4] = {};
+    // Адреса для ldmatrix: дорожка задаёт строку своей 8x8 матрицы.
+    const int matrix = lane >> 3;
+    const int matrix_row = lane & 7;
+    const __nv_bfloat16* query_row =
+        &shared.query[(row0 + matrix_row + 8 * (matrix & 1)) * kRowPad
+                      + 8 * (matrix >> 1)];
+    const __nv_bfloat16* key_row =
+        &shared.key[(size_t)matrix_row * kRowPad + 8 * (matrix & 1)];
+    for (int k0 = 0; k0 < kHeadDim; k0 += 16) {
+      uint32_t a[4];
+      ldmatrix_x4(a, query_row + k0);
 #pragma unroll
-    for (int g = 0; g < kMmaGroups; ++g) {
-      float scores[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-      // Смещения в shared считаются 32-битными: size_t уводит адресацию в
-      // обобщённое пространство, а это уже не дешёвый shared-доступ.
-      const int q_base = g * kMmaRows * kRowPad;
-      for (int k0 = 0; k0 < kHeadDim; k0 += 16) {
-        uint32_t a[4];
+      for (int t = 0; t < kFlashKeyTiles; ++t) {
         uint32_t b[2];
-        a[0] = pack_bf16(&q_tile[q_base + grp * kRowPad + k0 + pos * 2]);
-        a[1] = pack_bf16(&q_tile[q_base + (grp + 8) * kRowPad + k0 + pos * 2]);
-        a[2] = pack_bf16(&q_tile[q_base + grp * kRowPad + k0 + pos * 2 + 8]);
-        a[3] = pack_bf16(&q_tile[q_base + (grp + 8) * kRowPad + k0 + pos * 2 + 8]);
-        b[0] = pack_bf16(&k_tile[(key_column + grp) * kRowPad + k0 + pos * 2]);
-        b[1] = pack_bf16(&k_tile[(key_column + grp) * kRowPad + k0 + pos * 2 + 8]);
-        mma_m16n8k16(scores, a, b);
+        ldmatrix_x2(b, key_row + (size_t)(t * 8) * kRowPad + k0);
+        mma_m16n8k16(scores[t], a, b);
       }
+    }
+
+    // Масштаб и причинная маска. Дорожка держит строки grp и grp+8.
+    const int context_low = shared.row_context[row0 + grp];
+    const int context_high = shared.row_context[row0 + grp + 8];
+#pragma unroll
+    for (int t = 0; t < kFlashKeyTiles; ++t) {
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const int r = grp + (i >= 2 ? 8 : 0);
-        const int column = key_column + pos * 2 + (i & 1);
-        const int token = key_base + column;
-        s_tile[(g * kMmaRows + r) * kMmaKeys + column] =
-            token < row_context[r] ? scores[i] * softmax_scale : -CUDART_INF_F;
+        const int token = key_base + t * 8 + pos * 2 + (i & 1);
+        const int limit = (i >= 2) ? context_high : context_low;
+        scores[t][i] =
+            token < limit ? scores[t][i] * softmax_scale : -CUDART_INF_F;
       }
     }
-    __syncthreads();
 
-    // Строка достаётся восьми соседним дорожкам: максимум и сумма сходятся
-    // бабочкой внутри восьмёрки, а не последовательным проходом одного потока.
-    for (int slot = threadIdx.x >> 3; slot < kMmaGroups * kMmaRows;
-         slot += kMmaThreads / 8) {
-      const int part = threadIdx.x & 7;
-      const int score_base = slot * kMmaKeys;
-      float local_max = -CUDART_INF_F;
+    // Онлайн-softmax: всё в регистрах варпа, ни одного обращения к shared.
+    float tile_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
 #pragma unroll
-      for (int c = part; c < kMmaKeys; c += 8) {
-        local_max = fmaxf(local_max, s_tile[score_base + c]);
-      }
+    for (int t = 0; t < kFlashKeyTiles; ++t) {
+      tile_max[0] = fmaxf(tile_max[0], fmaxf(scores[t][0], scores[t][1]));
+      tile_max[1] = fmaxf(tile_max[1], fmaxf(scores[t][2], scores[t][3]));
+    }
+    tile_max[0] = flash_row_max(tile_max[0]);
+    tile_max[1] = flash_row_max(tile_max[1]);
+
+    float correction[2];
 #pragma unroll
-      for (int offset = 4; offset > 0; offset >>= 1) {
-        local_max =
-            fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, offset));
-      }
-      const float merged = fmaxf(row_max[slot], local_max);
-      // Строки внутри варпа расходятся по этому условию, поэтому ветка не
-      // должна содержать шаффл: маска 0xffffffff требует всех дорожек.
+    for (int half = 0; half < 2; ++half) {
+      const float merged = fmaxf(running_max[half], tile_max[half]);
+      // Строка, у которой в тайле нет ни одного разрешённого ключа: вычитать
+      // из -inf нельзя, это NaN.
       const bool empty = merged == -CUDART_INF_F;
-      float local_sum = 0.0f;
+      correction[half] = (empty || running_max[half] == -CUDART_INF_F)
+          ? (empty ? 1.0f : 0.0f)
+          : __expf(running_max[half] - merged);
+      float sum = 0.0f;
 #pragma unroll
-      for (int c = part; c < kMmaKeys; c += 8) {
-        float weight = 0.0f;
-        if (!empty) {
-          const float score = s_tile[score_base + c];
-          weight = score == -CUDART_INF_F ? 0.0f : __expf(score - merged);
-        }
-        p_tile[slot * kProbPad + c] = __float2bfloat16(weight);
-        local_sum += weight;
-      }
+      for (int t = 0; t < kFlashKeyTiles; ++t) {
 #pragma unroll
-      for (int offset = 4; offset > 0; offset >>= 1) {
-        local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
-      }
-      if (part == 0) {
-        if (empty) {
-          row_scale[slot] = 1.0f;
-        } else {
-          const float correction = row_max[slot] == -CUDART_INF_F
-              ? 0.0f
-              : __expf(row_max[slot] - merged);
-          row_sum[slot] = row_sum[slot] * correction + local_sum;
-          row_max[slot] = merged;
-          row_scale[slot] = correction;
+        for (int i = 0; i < 2; ++i) {
+          float& slot = scores[t][half * 2 + i];
+          const float weight =
+              (empty || slot == -CUDART_INF_F) ? 0.0f : __expf(slot - merged);
+          slot = weight;
+          sum += weight;
         }
+      }
+      sum = flash_row_sum(sum);
+      if (!empty) {
+        running_sum[half] = running_sum[half] * correction[half] + sum;
+        running_max[half] = merged;
       }
     }
-    __syncthreads();
+#pragma unroll
+    for (int t = 0; t < kFlashDimTiles; ++t) {
+      accumulator[t][0] *= correction[0];
+      accumulator[t][1] *= correction[0];
+      accumulator[t][2] *= correction[1];
+      accumulator[t][3] *= correction[1];
+    }
 
+    // P из аккумулятора QK^T прямо в операнд A: раскладка m16n8k16 совпадает,
+    // если считать столбец ключа индексом k.
+    uint32_t probability[kFlashKeyGroups][4];
 #pragma unroll
-    for (int g = 0; g < kMmaGroups; ++g) {
-      // Перенос онлайн-softmax на накопитель: дорожка держит grp и grp+8.
-      const float scale_low = row_scale[g * kMmaRows + grp];
-      const float scale_high = row_scale[g * kMmaRows + grp + 8];
+    for (int g = 0; g < kFlashKeyGroups; ++g) {
+      probability[g][0] = pack_pair(__float2bfloat16(scores[2 * g][0]),
+                                    __float2bfloat16(scores[2 * g][1]));
+      probability[g][1] = pack_pair(__float2bfloat16(scores[2 * g][2]),
+                                    __float2bfloat16(scores[2 * g][3]));
+      probability[g][2] = pack_pair(__float2bfloat16(scores[2 * g + 1][0]),
+                                    __float2bfloat16(scores[2 * g + 1][1]));
+      probability[g][3] = pack_pair(__float2bfloat16(scores[2 * g + 1][2]),
+                                    __float2bfloat16(scores[2 * g + 1][3]));
+    }
+    // V лежит как [ключ][измерение], а операнду B нужен ключ по k: тайл
+    // разворачивает сама инструкция.
+    const __nv_bfloat16* value_row =
+        &shared.value[(size_t)(matrix_row + 8 * matrix) * kRowPad];
 #pragma unroll
-      for (int t = 0; t < kMmaTilesPerWarp; ++t) {
-        accumulator[g][t][0] *= scale_low;
-        accumulator[g][t][1] *= scale_low;
-        accumulator[g][t][2] *= scale_high;
-        accumulator[g][t][3] *= scale_high;
-      }
-      // PV: варп владеет своей четвертью head_dim.
-      const int p_base = g * kMmaRows * kProbPad;
+    for (int g = 0; g < kFlashKeyGroups; ++g) {
 #pragma unroll
-      for (int t = 0; t < kMmaTilesPerWarp; ++t) {
-        const int dimension_column = warp * kMmaDimPerWarp + t * 8;
-        for (int k0 = 0; k0 < kMmaKeys; k0 += 16) {
-          uint32_t a[4];
-          uint32_t b[2];
-          a[0] = pack_bf16(&p_tile[p_base + grp * kProbPad + k0 + pos * 2]);
-          a[1] = pack_bf16(&p_tile[p_base + (grp + 8) * kProbPad + k0 + pos * 2]);
-          a[2] = pack_bf16(&p_tile[p_base + grp * kProbPad + k0 + pos * 2 + 8]);
-          a[3] = pack_bf16(&p_tile[p_base + (grp + 8) * kProbPad + k0 + pos * 2 + 8]);
-          const int dimension = dimension_column + grp;
-          b[0] = pack_pair(v_tile[(k0 + pos * 2) * kRowPad + dimension],
-                           v_tile[(k0 + pos * 2 + 1) * kRowPad + dimension]);
-          b[1] = pack_pair(v_tile[(k0 + pos * 2 + 8) * kRowPad + dimension],
-                           v_tile[(k0 + pos * 2 + 9) * kRowPad + dimension]);
-          mma_m16n8k16(accumulator[g][t], a, b);
-        }
+      for (int t = 0; t < kFlashDimTiles; ++t) {
+        uint32_t b[2];
+        ldmatrix_x2_trans(
+            b, value_row + (size_t)(g * 16) * kRowPad + t * 8);
+        mma_m16n8k16(accumulator[t], probability[g], b);
       }
     }
   }
 
 #pragma unroll
-  for (int g = 0; g < kMmaGroups; ++g) {
-    const int query_head = kv_head * kGroup + head_base + g;
+  for (int t = 0; t < kFlashDimTiles; ++t) {
 #pragma unroll
-    for (int t = 0; t < kMmaTilesPerWarp; ++t) {
-      const int dimension_base = warp * kMmaDimPerWarp + t * 8 + pos * 2;
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const int r = grp + (i >= 2 ? 8 : 0);
-        if (r >= tile_rows) {
-          continue;
-        }
-        const int dimension = dimension_base + (i & 1);
-        const int batch_row = row_base + tile_first + r;
-        const float denominator = row_sum[g * kMmaRows + r];
-        const float value =
-            denominator > 0.0f ? accumulator[g][t][i] / denominator : 0.0f;
-        const size_t offset =
-            (static_cast<size_t>(batch_row) * kQueryHeads + query_head) *
-                kHeadDim + dimension;
-        output[offset] = __float2bfloat16(
-            value * output_gate(
-                        query_gate_projection, batch_row, query_head, dimension));
+    for (int i = 0; i < 4; ++i) {
+      const int r = row0 + grp + (i >= 2 ? 8 : 0);
+      if (r >= tile_rows) {
+        continue;
       }
+      const int dimension = t * 8 + pos * 2 + (i & 1);
+      const int batch_row = row_base + tile_first + r;
+      const float denominator = running_sum[i >= 2 ? 1 : 0];
+      const float value =
+          denominator > 0.0f ? accumulator[t][i] / denominator : 0.0f;
+      const size_t offset =
+          (static_cast<size_t>(batch_row) * kQueryHeads + query_head) *
+              kHeadDim + dimension;
+      output[offset] = __float2bfloat16(
+          value * output_gate(
+                      query_gate_projection, batch_row, query_head, dimension));
     }
   }
 }
@@ -1113,22 +1137,17 @@ cudaError_t launch_prefill_attention_mma(
       output == nullptr || rows <= 0 || row_base < 0 || max_blocks <= 0) {
     return cudaErrorInvalidValue;
   }
-  static_assert(kGroup % kMmaGroups == 0, "головы группы делятся между CTA");
-  const size_t shared = mma_shared_bytes();
-  if (shared > 48u * 1024u) {
-    // Динамическая shared сверх 48 КБ доступна только по явному запросу.
-    const cudaError_t opted = cudaFuncSetAttribute(
-        paged_attention_prefill_mma_kernel<Bf16Cache>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(shared));
-    if (opted != cudaSuccess) {
-      return opted;
-    }
+  const size_t shared = flash_shared_bytes();
+  static const cudaError_t opted = cudaFuncSetAttribute(
+      paged_attention_prefill_flash_kernel<Bf16Cache>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(shared));
+  if (opted != cudaSuccess) {
+    return opted;
   }
-  const dim3 grid(
-      kKvHeads, (rows + kMmaRows - 1) / kMmaRows, kGroup / kMmaGroups);
-  paged_attention_prefill_mma_kernel<Bf16Cache>
-      <<<grid, kMmaThreads, shared, stream>>>(
+  const dim3 grid(kKvHeads, (rows + kFlashRows - 1) / kFlashRows, kGroup);
+  paged_attention_prefill_flash_kernel<Bf16Cache>
+      <<<grid, kFlashThreads, shared, stream>>>(
           static_cast<const __nv_bfloat16*>(query),
           static_cast<const __nv_bfloat16*>(query_gate_projection),
           key_cache,
