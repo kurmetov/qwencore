@@ -11,8 +11,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use qwc_core::arch::{KV_ELEMS_PER_TOKEN, VOCAB_SIZE};
+use qwc_cuda::delta_net::DeltaStateMode;
 use qwc_cuda::paged_attention::{KvCacheDtype, PAGE_SIZE};
-use qwc_engine::{Executor, ExecutorConfig, ModelWeights, PREFILL_CHUNK_SIZE};
+use qwc_engine::{DecodeLinearMode, Executor, ExecutorConfig, ModelWeights, PREFILL_CHUNK_SIZE};
 use qwc_model::Checkpoint;
 use qwc_runtime::{BatchLayout, CacheManager, FinishReason, Request, Scheduler, SchedulerConfig};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,7 @@ struct Args {
     memory_limit: usize,
     kv_cache_bytes: usize,
     kv_cache_dtype: KvCacheDtype,
+    delta_state: DeltaStateMode,
 }
 
 struct WorkerConfig {
@@ -57,6 +59,7 @@ struct WorkerConfig {
     memory_limit: usize,
     kv_pool_blocks: usize,
     kv_cache_dtype: KvCacheDtype,
+    delta_state: DeltaStateMode,
     eos_ids: Vec<u32>,
 }
 
@@ -209,6 +212,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         memory_limit: args.memory_limit,
         kv_pool_blocks,
         kv_cache_dtype: args.kv_cache_dtype,
+        delta_state: args.delta_state,
         eos_ids,
     };
     std::thread::Builder::new()
@@ -617,13 +621,15 @@ fn initialize_worker(config: &WorkerConfig) -> Result<(Executor, ModelWeights, S
     qwc_cuda::set_memory_limit(config.memory_limit).map_err(str::to_owned)?;
     let checkpoint = Checkpoint::open(&config.model_path).map_err(|error| error.to_string())?;
     let weights = ModelWeights::load(&checkpoint).map_err(|error| error.to_string())?;
-    let executor = Executor::new_with_kv_pool(
+    let executor = Executor::new_with_pool_options(
         ExecutorConfig {
             max_batch: config.max_seqs,
             max_context: config.max_context,
         },
         config.kv_cache_dtype,
-        config.kv_pool_blocks,
+        DecodeLinearMode::Auto,
+        config.delta_state,
+        Some(config.kv_pool_blocks),
     )
     .map_err(|error| error.to_string())?;
     let cache = CacheManager::new(config.max_seqs, config.kv_pool_blocks, PAGE_SIZE);
@@ -989,6 +995,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut memory_limit = 28_000_000_000usize;
     let mut kv_cache_bytes = 5_000_000_000usize;
     let mut kv_cache_dtype = KvCacheDtype::Fp8;
+    let mut delta_state = DeltaStateMode::Bf16;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1008,6 +1015,14 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                 let gb: f64 = args.next().ok_or("--kv-cache-gb")?.parse()?;
                 kv_cache_bytes = (gb * 1e9) as usize;
             }
+            "--delta-state" => {
+                delta_state = match args.next().ok_or("--delta-state")?.as_str() {
+                    "bf16" => DeltaStateMode::Bf16,
+                    "fp32" => DeltaStateMode::Fp32,
+                    "wy" => DeltaStateMode::Wy,
+                    other => return Err(format!("unsupported delta state: {other}").into()),
+                }
+            }
             "--kv-cache" => {
                 kv_cache_dtype = match args.next().ok_or("--kv-cache")?.as_str() {
                     "fp8" => KvCacheDtype::Fp8,
@@ -1017,7 +1032,10 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             }
             "--help" | "-h" => {
                 println!(
-                    "qwc serve [--model PATH] [--bind 127.0.0.1:8000] [--context 32768] \\\n+                     [--max-seqs 32] [--kv-cache fp8|bf16] [--kv-cache-gb 5] \\\n+                     [--memory-limit-gb 28] [--served-model-name NAME]"
+                    "qwc serve [--model PATH] [--bind 127.0.0.1:8000] \
+[--context 32768] [--max-seqs 32] [--kv-cache fp8|bf16] [--kv-cache-gb 5] \
+[--memory-limit-gb 28] [--prefill-chunk N] [--delta-state bf16|fp32|wy] \
+[--served-model-name NAME]"
                 );
                 std::process::exit(0);
             }
@@ -1053,6 +1071,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         memory_limit,
         kv_cache_bytes,
         kv_cache_dtype,
+        delta_state,
     })
 }
 
