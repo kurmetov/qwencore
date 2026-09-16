@@ -846,3 +846,264 @@ fn chunked_wy_form_matches_the_recurrent_scan() {
         println!("токенов {tokens}, чанк {chunk}, decay {decay}: худшее по выходу {worst:.3e}");
     }
 }
+
+/// WY-скан на GPU против чанкового эталона на CPU.
+///
+/// Эталон здесь именно чанковый: `prefill_chunked_fp32` с тем же чанком
+/// `WY_CHUNK_SIZE`, то есть с тем же порядком операций. Расхождение с
+/// рекуррентной формой проверено отдельно на CPU
+/// (`chunked_wy_form_matches_the_recurrent_scan`) — смешивать две проверки
+/// значит не знать, что именно сломалось.
+///
+/// Длины берутся вокруг границы чанка, а затухание — до 0.05 на токен.
+/// Слабое затухание ничего не проверяет: при alpha около единицы любая форма
+/// накопления gamma сходится. Ломается всё на сильном, где произведение
+/// alpha по чанку уходит под fp32.
+#[test]
+fn wy_prefill_matches_the_chunked_reference() {
+    for (tokens, decay) in [
+        (130usize, 0.94f32),
+        (64, 0.5),
+        (33, 0.15),
+        (512, 0.05),
+        (1, 0.9),
+    ] {
+        check_wy_prefill(tokens, decay);
+    }
+}
+
+fn check_wy_prefill(tokens: usize, decay: f32) {
+    use qwc_cuda::delta_net::{DeltaPrefillWorkspace, WY_CHUNK_SIZE};
+
+    let capacity = 2;
+    let slot = 1;
+    let mut rng = Rng(0x000D_E17A_5CA4);
+    let initial: Vec<u16> = (0..capacity * STATE_ELEMS)
+        .map(|_| bf16::from_f32(rng.next_f32() * 0.05))
+        .collect();
+    let mut q: Vec<f32> = (0..tokens * QK_ELEMS).map(|_| rng.next_f32()).collect();
+    let mut k: Vec<f32> = (0..tokens * QK_ELEMS).map(|_| rng.next_f32()).collect();
+    l2_normalize_heads(&mut q, LA_NUM_K_HEADS, LA_K_HEAD_DIM);
+    l2_normalize_heads(&mut k, LA_NUM_K_HEADS, LA_K_HEAD_DIM);
+    let v: Vec<f32> = (0..tokens * V_ELEMS)
+        .map(|_| rng.next_f32() * 0.2)
+        .collect();
+    let alpha: Vec<f32> = (0..tokens * GATE_ELEMS)
+        .map(|_| decay + rng.next_f32() * 0.02 * decay)
+        .collect();
+    let beta: Vec<f32> = (0..tokens * GATE_ELEMS)
+        .map(|_| 0.45 + rng.next_f32() * 0.2)
+        .collect();
+
+    let mut expected_state = initial[slot * STATE_ELEMS..][..STATE_ELEMS].to_vec();
+    let mut expected_out = vec![0.0f32; tokens * V_ELEMS];
+    delta_net::reference::prefill_chunked_fp32(
+        &mut expected_state,
+        &q,
+        &k,
+        &v,
+        &alpha,
+        &beta,
+        &mut expected_out,
+        tokens,
+        WY_CHUNK_SIZE,
+    );
+
+    let stream = Stream::new().unwrap();
+    let device_q = DeviceBuffer::from_slice(&q).unwrap();
+    let device_k = DeviceBuffer::from_slice(&k).unwrap();
+    let device_kq = DeviceBuffer::from_slice(&kq_rows(&q, &k)).unwrap();
+    let device_v = DeviceBuffer::from_slice(&v).unwrap();
+    let device_alpha = DeviceBuffer::from_slice(&alpha).unwrap();
+    let device_beta = DeviceBuffer::from_slice(&beta).unwrap();
+    let inputs = DeltaInputs {
+        q: &device_q,
+        k: &device_k,
+        v: &device_v,
+        alpha: &device_alpha,
+        beta: &device_beta,
+        kq: &device_kq,
+    };
+    let mut workspace = DeltaPrefillWorkspace::new().unwrap();
+    let mut device_state = DeviceBuffer::from_slice(&initial).unwrap();
+    let mut output = DeviceBuffer::<f32>::zeroed(tokens * V_ELEMS).unwrap();
+    delta_net::prefill_slot_wy(
+        &mut device_state,
+        &inputs,
+        &mut output,
+        &mut workspace,
+        capacity,
+        slot,
+        tokens,
+        0,
+        &stream,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    let actual_out = output.to_vec().unwrap();
+    let pool = device_state.to_vec().unwrap();
+    let actual_state = &pool[slot * STATE_ELEMS..][..STATE_ELEMS];
+
+    // Эталон считает в FP32, ядро кладёт q, k и состояние в BF16 ради MMA,
+    // поэтому поэлементная относительная ошибка бессмысленна: на выходе есть
+    // значения около нуля, где она произвольно велика. Порог абсолютный:
+    // входы нормированы (|q| = |k| = 1, v порядка 0.2), и на всех проверяемых
+    // формах ошибка держится около 4e-4 — это пол BF16, а не расхождение
+    // алгоритмов. Ошибки, которые здесь ловились раньше, были в 200 раз
+    // больше: неверная форма давала 9.9e-2, NaN от нуля в gamma — столько же.
+    let scale = expected_out.iter().fold(0.0f32, |a, b| a.max(b.abs()));
+    let mut worst = 0.0f32;
+    let mut worst_index = 0usize;
+    let mut squared = 0.0f64;
+    for (index, (&actual, &expected)) in actual_out.iter().zip(&expected_out).enumerate() {
+        let error = (actual - expected).abs();
+        squared += f64::from(error) * f64::from(error);
+        if error > worst {
+            worst = error;
+            worst_index = index;
+        }
+    }
+    let rmse = (squared / actual_out.len() as f64).sqrt();
+    assert!(
+        worst <= 8e-4 && rmse <= 1.5e-4,
+        "WY-выход расходится с эталоном на {worst:.2e} (RMSE {rmse:.2e}) \
+         при масштабе {scale:.2e} \
+         в позиции {worst_index}: токен {}, голова {}, строка {}: gpu={}, cpu={}",
+        worst_index / V_ELEMS,
+        (worst_index % V_ELEMS) / LA_V_HEAD_DIM,
+        worst_index % LA_V_HEAD_DIM,
+        actual_out[worst_index],
+        expected_out[worst_index],
+    );
+
+    let state_scale = expected_state
+        .iter()
+        .fold(0.0f32, |a, &b| a.max(bf16::to_f32(b).abs()));
+    let mut state_worst = 0.0f32;
+    for (&actual, &expected) in actual_state.iter().zip(&expected_state) {
+        let (actual, expected) = (bf16::to_f32(actual), bf16::to_f32(expected));
+        state_worst = state_worst.max((actual - expected).abs());
+    }
+    assert!(
+        state_worst <= 1e-3,
+        "WY-состояние расходится с эталоном на {state_worst:.2e} при масштабе {state_scale:.2e}"
+    );
+    assert_eq!(&pool[..STATE_ELEMS], &initial[..STATE_ELEMS]);
+    println!(
+        "токенов {tokens}, затухание {decay}: выход max {worst:.3e}, \
+         RMSE {rmse:.3e} при масштабе {scale:.3e}; \
+         состояние max {state_worst:.3e} при масштабе {state_scale:.3e}"
+    );
+}
+
+/// Слитый шаг кладёт несколько последовательностей в одну арену токенов, и
+/// WY-скан обязан читать и писать только свой отрезок. Та же форма, что
+/// когда-то прятала неверный префилл внимания: со сдвигом ничего не
+/// проверялось, потому что со сдвигом ничего и не тестировалось.
+#[test]
+fn wy_prefill_row_offset_reads_and_writes_only_its_slice() {
+    use qwc_cuda::delta_net::{DeltaPrefillWorkspace, KQ_ELEMS};
+
+    let tokens = 70;
+    let offset = 37;
+    let arena = tokens + offset + 5;
+    let mut rng = Rng(0x0FF5_E700);
+    let initial: Vec<u16> = (0..STATE_ELEMS)
+        .map(|_| bf16::from_f32(rng.next_f32() * 0.05))
+        .collect();
+    let mut q: Vec<f32> = (0..arena * QK_ELEMS).map(|_| rng.next_f32()).collect();
+    let mut k: Vec<f32> = (0..arena * QK_ELEMS).map(|_| rng.next_f32()).collect();
+    l2_normalize_heads(&mut q, LA_NUM_K_HEADS, LA_K_HEAD_DIM);
+    l2_normalize_heads(&mut k, LA_NUM_K_HEADS, LA_K_HEAD_DIM);
+    let v: Vec<f32> = (0..arena * V_ELEMS).map(|_| rng.next_f32() * 0.2).collect();
+    let alpha: Vec<f32> = (0..arena * GATE_ELEMS)
+        .map(|_| 0.6 + rng.next_f32() * 0.2)
+        .collect();
+    let beta: Vec<f32> = (0..arena * GATE_ELEMS)
+        .map(|_| 0.45 + rng.next_f32() * 0.2)
+        .collect();
+
+    let stream = Stream::new().unwrap();
+    let kq = kq_rows(&q, &k);
+    let mut workspace = DeltaPrefillWorkspace::new().unwrap();
+
+    // Тот же отрезок, поданный с нулевого смещения, — эталон для сдвинутого.
+    let mut run = |row_offset: usize, rows: usize| {
+        let slice = |data: &[f32], width: usize| {
+            data[row_offset * width..][..rows * width].to_vec()
+        };
+        let device_q = DeviceBuffer::from_slice(&slice(&q, QK_ELEMS)).unwrap();
+        let device_k = DeviceBuffer::from_slice(&slice(&k, QK_ELEMS)).unwrap();
+        let device_kq = DeviceBuffer::from_slice(&slice(&kq, KQ_ELEMS)).unwrap();
+        let device_v = DeviceBuffer::from_slice(&slice(&v, V_ELEMS)).unwrap();
+        let device_alpha = DeviceBuffer::from_slice(&slice(&alpha, GATE_ELEMS)).unwrap();
+        let device_beta = DeviceBuffer::from_slice(&slice(&beta, GATE_ELEMS)).unwrap();
+        let inputs = DeltaInputs {
+            q: &device_q,
+            k: &device_k,
+            v: &device_v,
+            alpha: &device_alpha,
+            beta: &device_beta,
+            kq: &device_kq,
+        };
+        let mut state = DeviceBuffer::from_slice(&initial).unwrap();
+        let mut output = DeviceBuffer::<f32>::zeroed(rows * V_ELEMS).unwrap();
+        delta_net::prefill_slot_wy(
+            &mut state, &inputs, &mut output, &mut workspace,
+            1, 0, rows, 0, &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        (output.to_vec().unwrap(), state.to_vec().unwrap())
+    };
+    let (expected_out, expected_state) = run(offset, tokens);
+
+    let device_q = DeviceBuffer::from_slice(&q).unwrap();
+    let device_k = DeviceBuffer::from_slice(&k).unwrap();
+    let device_kq = DeviceBuffer::from_slice(&kq).unwrap();
+    let device_v = DeviceBuffer::from_slice(&v).unwrap();
+    let device_alpha = DeviceBuffer::from_slice(&alpha).unwrap();
+    let device_beta = DeviceBuffer::from_slice(&beta).unwrap();
+    let inputs = DeltaInputs {
+        q: &device_q,
+        k: &device_k,
+        v: &device_v,
+        alpha: &device_alpha,
+        beta: &device_beta,
+        kq: &device_kq,
+    };
+    let sentinel = -7.5f32;
+    let mut state = DeviceBuffer::from_slice(&initial).unwrap();
+    let mut output =
+        DeviceBuffer::from_slice(&vec![sentinel; arena * V_ELEMS]).unwrap();
+    delta_net::prefill_slot_wy(
+        &mut state, &inputs, &mut output, &mut workspace,
+        1, 0, tokens, offset, &stream,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    let actual = output.to_vec().unwrap();
+    for (index, (&got, &want)) in actual[offset * V_ELEMS..][..tokens * V_ELEMS]
+        .iter()
+        .zip(&expected_out)
+        .enumerate()
+    {
+        assert_eq!(
+            got, want,
+            "сдвинутый запуск разошёлся с несдвинутым в позиции {index}"
+        );
+    }
+    assert!(
+        actual[..offset * V_ELEMS].iter().all(|&x| x == sentinel),
+        "скан записал строки до своего отрезка"
+    );
+    assert!(
+        actual[(offset + tokens) * V_ELEMS..]
+            .iter()
+            .all(|&x| x == sentinel),
+        "скан записал строки после своего отрезка"
+    );
+    assert_eq!(state.to_vec().unwrap(), expected_state);
+}

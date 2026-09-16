@@ -8,7 +8,9 @@
 //! Emits JSON for `bench/servebench.py` to score against the reference engines.
 
 use qwc_core::arch::{KV_ELEMS_PER_TOKEN, VOCAB_SIZE};
+use qwc_cuda::delta_net::DeltaStateMode;
 use qwc_cuda::paged_attention::KvCacheDtype;
+use qwc_engine::DecodeLinearMode;
 use qwc_engine::{Executor, ExecutorConfig, ModelWeights, PREFILL_CHUNK_SIZE};
 use qwc_model::Checkpoint;
 use qwc_runtime::{BatchLayout, CacheManager, Request, Scheduler, SchedulerConfig, SeqId};
@@ -27,6 +29,7 @@ struct Args {
     memory_limit: usize,
     kv_cache_bytes: usize,
     kv_cache: KvCacheDtype,
+    delta_state: DeltaStateMode,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,13 +53,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let mut executor = Executor::new_with_kv_pool(
+    let mut executor = Executor::new_with_pool_options(
         ExecutorConfig {
             max_batch: args.concurrency,
             max_context: args.context,
         },
         args.kv_cache,
-        kv_pool_blocks,
+        DecodeLinearMode::Auto,
+        args.delta_state,
+        Some(kv_pool_blocks),
     )?;
     let cache_gb = executor.cache_bytes() as f64 / 1e9;
     let cache = CacheManager::new(
@@ -195,6 +200,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     // sequences or many short requests without reserving 32K for each slot.
     let mut kv_cache_bytes = 5_000_000_000usize;
     let mut kv_cache = KvCacheDtype::Fp8;
+    let mut delta_state = DeltaStateMode::Bf16;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -206,6 +212,20 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--context" => context = args.next().ok_or("--context")?.parse()?,
             "--prefill-chunk" => {
                 prefill_chunk = args.next().ok_or("--prefill-chunk")?.parse()?
+            }
+            "--delta-state" => {
+                delta_state = match args
+                    .next()
+                    .ok_or("--delta-state needs bf16, fp32 or wy")?
+                    .as_str()
+                {
+                    "bf16" => DeltaStateMode::Bf16,
+                    "fp32" => DeltaStateMode::Fp32,
+                    "wy" => DeltaStateMode::Wy,
+                    other => {
+                        return Err(format!("неизвестное значение --delta-state: {other}").into());
+                    }
+                };
             }
             "--kv-cache" => {
                 kv_cache = match args.next().ok_or("--kv-cache needs fp8 or bf16")?.as_str() {
@@ -258,6 +278,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         memory_limit,
         kv_cache_bytes,
         kv_cache,
+        delta_state,
     })
 }
 

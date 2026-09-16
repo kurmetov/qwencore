@@ -997,9 +997,10 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--qwc-delta-state",
-        choices=("bf16", "fp32"),
+        choices=("bf16", "fp32", "wy"),
         default="bf16",
-        help="recurrent state precision inside a prefill chunk; fp32 is an A/B diagnostic",
+        help="prefill chunk scan: recurrent state precision (bf16/fp32) or the "
+        "matrix WY form (wy)",
     )
     run.add_argument("--context", type=int)
     run.add_argument("--gpu-memory-utilization", type=float, default=0.8)

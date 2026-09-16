@@ -358,9 +358,10 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
                 };
             }
             "--delta-state" => {
-                delta_state = match args.next().ok_or("--delta-state needs bf16 or fp32")?.as_str() {
+                delta_state = match args.next().ok_or("--delta-state needs bf16, fp32 or wy")?.as_str() {
                     "bf16" => DeltaStateMode::Bf16,
                     "fp32" => DeltaStateMode::Fp32,
+                    "wy" => DeltaStateMode::Wy,
                     other => return Err(format!("неизвестное значение --delta-state: {other}").into()),
                 };
             }

@@ -1,4 +1,4 @@
-// Gated DeltaNet: рекуррентный шаг decode.
+// Gated DeltaNet: рекуррентный шаг decode и чанковый скан prefill.
 //
 // 48 из 64 слоёв Qwen3.8 — линейное внимание с рекуррентным состоянием
 // S размера [48 голов, 128, 128]. На каждый токен состояние читается и
@@ -84,9 +84,10 @@ constexpr int kPrefillRows = 4;
 // ложатся на 170 SM.
 constexpr int kPrefillBlock = 64;
 
-// The WY path trades the token-by-token state recurrence for four small
-// matrix products per tile.  Sixty-four is large enough to amortize launches
-// and small enough that all per-head triangular factors stay resident.
+// Чанк матричной (WY) формы: она меняет проход по токенам на пять матричных
+// умножений на тайл. 64 — компромисс: меньше, и подготовка (её стоимость на
+// токен не зависит от длины чанка) перестаёт окупаться; больше, и матрица
+// 64x64 на голову с её обратной перестаёт помещаться в shared блока.
 constexpr int kWyChunk = 64;
 
 __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
@@ -389,152 +390,536 @@ __global__ __launch_bounds__(32) void wy_gemm_kernel(
     }
 }
 
-__global__ void wy_initialize_state_kernel(
-    const __nv_bfloat16* __restrict__ source,
-    float* __restrict__ state_fp32,
-    __nv_bfloat16* __restrict__ state_bf16) {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    const int elements = kHv * kDv * kDk;
-    if (index < elements) {
-        const __nv_bfloat16 value = source[index];
-        state_bf16[index] = value;
-        state_fp32[index] = __bfloat162float(value);
-    }
-}
-
+// Тайлы q и k лежат как [чанк][голова][токен][измерение]: индекс батча в
+// `wy_gemm_kernel` — это chunk * головы + голова, поэтому раздача одной
+// k-головы на три v-головы (`b_group`) остаётся делением индекса.
+//
+// Ни одна фаза до слитого ядра не зависит от состояния, поэтому все они
+// считаются сразу по всем чанкам сегмента — по одному запуску на слой.
 __global__ void wy_prepare_qk_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
     __nv_bfloat16* __restrict__ query_tile,
     __nv_bfloat16* __restrict__ key_tile,
-    __nv_bfloat16* __restrict__ key_transposed,
-    int start, int length) {
+    int tokens, int chunks) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    const int elements = kHk * kWyChunk * kDk;
-    if (index >= elements) {
+    constexpr int kPerChunk = kHk * kWyChunk * kDk;
+    if (index >= chunks * kPerChunk) {
         return;
     }
     const int dimension = index % kDk;
     const int token = (index / kDk) % kWyChunk;
-    const int head = index / (kWyChunk * kDk);
+    const int head = (index / (kWyChunk * kDk)) % kHk;
+    const int chunk = index / kPerChunk;
+    const int row = chunk * kWyChunk + token;
     __nv_bfloat16 qv = __float2bfloat16(0.0f);
     __nv_bfloat16 kv = __float2bfloat16(0.0f);
-    if (token < length) {
-        const size_t source = (size_t)(start + token) * kHk * kDk
+    if (row < tokens) {
+        const size_t source = (size_t)row * kHk * kDk
             + (size_t)head * kDk + dimension;
         qv = __float2bfloat16(q[source]);
         kv = __float2bfloat16(k[source]);
     }
     query_tile[index] = qv;
     key_tile[index] = kv;
-    key_transposed[(size_t)(head * kDk + dimension) * kWyChunk + token] = kv;
 }
 
-__global__ void wy_gamma_kernel(
+// Затухание копится в логарифмах, а не произведением.
+//
+// Произведение alpha по чанку — это то самое gamma_t, на которое домножается
+// вклад входного состояния. На 64 токенах оно легко уходит под 1e-38: при
+// alpha = 0.2 уже к концу чанка. Дальше отношения gamma_t / gamma_r
+// превращаются в 0/0, и скан выдаёт NaN. Разность логарифмов всегда конечна,
+// а exp от неё либо честный ноль, либо число.
+__global__ void wy_decay_kernel(
     const float* __restrict__ alpha,
-    float* __restrict__ gamma,
-    int start, int length) {
-    const int head = blockIdx.x;
-    if (threadIdx.x != 0 || head >= kHv) {
+    float* __restrict__ log_decay,
+    int tokens, int chunks) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= chunks * kHv) {
         return;
     }
-    float product = 1.0f;
+    const int head = index % kHv;
+    const int start = (index / kHv) * kWyChunk;
+    float* destination = log_decay + (size_t)index * kWyChunk;
+    float sum = 0.0f;
     for (int token = 0; token < kWyChunk; ++token) {
-        if (token < length) {
-            product *= alpha[(size_t)(start + token) * kHv + head];
-            gamma[head * kWyChunk + token] = product;
+        if (start + token < tokens) {
+            // Нижняя граница держит логарифм конечным: alpha = 0 дало бы
+            // -inf в обеих частях разности и NaN вместо нуля.
+            sum += __logf(fmaxf(alpha[(size_t)(start + token) * kHv + head],
+                                1.0e-38f));
+            destination[token] = sum;
         } else {
-            gamma[head * kWyChunk + token] = 0.0f;
+            destination[token] = -INFINITY;
         }
     }
 }
 
-__global__ void wy_transform_kernel(
+// Множители причинной части и обратная к единично-нижнетреугольной A = I + M.
+//
+// Обе строятся из одних и тех же граммов и gamma, поэтому считаются одним
+// блоком: M не выходит за пределы shared и в глобальную память не попадает.
+// Прямая подстановка идёт по столбцам, а столбцы независимы — поток владеет
+// столбцом и читает только его, так что барьер нужен один, после сборки M.
+// Раньше подстановка шла в пространстве значений (128 измерений на токен) и
+// перечитывала коэффициенты из глобальной памяти: 50 МБ на чанк слоя и две
+// трети времени всего скана.
+__global__ __launch_bounds__(kWyChunk) void wy_factor_kernel(
     const float* __restrict__ beta,
-    const float* __restrict__ gamma,
+    const float* __restrict__ log_decay,
     const float* __restrict__ gram_kk,
     const float* __restrict__ gram_qk,
-    float* __restrict__ triangular,
+    __nv_bfloat16* __restrict__ inverse,
     __nv_bfloat16* __restrict__ output_factor,
-    int start, int length) {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    const int elements = kHv * kWyChunk * kWyChunk;
-    if (index >= elements) {
-        return;
-    }
-    const int previous = index % kWyChunk;
-    const int token = (index / kWyChunk) % kWyChunk;
-    const int head = index / (kWyChunk * kWyChunk);
-    float a = 0.0f;
-    float f = 0.0f;
-    if (token < length && previous <= token) {
-        const float ratio = gamma[head * kWyChunk + token]
-            / gamma[head * kWyChunk + previous];
-        const int key_head = head / kRatio;
-        const size_t gram_offset = (size_t)(key_head * kWyChunk + token)
-            * kWyChunk + previous;
-        f = ratio * gram_qk[gram_offset];
-        if (previous < token) {
-            a = beta[(size_t)(start + token) * kHv + head]
-                * ratio * gram_kk[gram_offset];
+    int tokens) {
+    __shared__ float m[kWyChunk][kWyChunk];
+    __shared__ float t[kWyChunk][kWyChunk];
+    const int head = blockIdx.x;
+    const int chunk = blockIdx.y;
+    const int column = threadIdx.x;
+    const int start = chunk * kWyChunk;
+    const int length = min(kWyChunk, tokens - start);
+    const float* chunk_decay =
+        log_decay + (size_t)(chunk * kHv + head) * kWyChunk;
+    const size_t gram_base =
+        (size_t)(chunk * kHk + head / kRatio) * kWyChunk * kWyChunk;
+    const size_t head_base = (size_t)(chunk * kHv + head) * kWyChunk * kWyChunk;
+    const float column_decay = chunk_decay[column];
+
+    for (int row = 0; row < kWyChunk; ++row) {
+        float a = 0.0f;
+        float f = 0.0f;
+        if (row < length && column <= row) {
+            const float ratio = __expf(chunk_decay[row] - column_decay);
+            const size_t offset = gram_base + (size_t)row * kWyChunk + column;
+            f = ratio * gram_qk[offset];
+            if (column < row) {
+                a = beta[(size_t)(start + row) * kHv + head] * ratio
+                    * gram_kk[offset];
+            }
         }
+        m[row][column] = a;
+        output_factor[head_base + (size_t)row * kWyChunk + column] =
+            __float2bfloat16(f);
     }
-    triangular[index] = a;
-    output_factor[index] = __float2bfloat16(f);
+    __syncthreads();
+
+    // Строки за длиной чанка остаются единичными: правая часть там занулена,
+    // так что нули доходят до конца сами, без масок в следующих фазах.
+    // Четыре частичные суммы вместо одной: строка подстановки — цепочка
+    // зависимых FMA, и на длине 64 она упирается не в пропускную
+    // способность, а в задержку.
+    for (int row = 0; row < kWyChunk; ++row) {
+        float sum[4] = {(row == column) ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
+        int previous = 0;
+        for (; previous + 4 <= row; previous += 4) {
+            #pragma unroll
+            for (int index = 0; index < 4; ++index) {
+                sum[index] -= m[row][previous + index] * t[previous + index][column];
+            }
+        }
+        for (; previous < row; ++previous) {
+            sum[0] -= m[row][previous] * t[previous][column];
+        }
+        const float value = (sum[0] + sum[1]) + (sum[2] + sum[3]);
+        t[row][column] = value;
+        inverse[head_base + (size_t)row * kWyChunk + column] =
+            __float2bfloat16(value);
+    }
 }
 
-__global__ __launch_bounds__(128) void wy_solve_kernel(
+// Правая часть системы, сразу транспонированная: [голова][измерение][токен].
+// P на входе — это S_0 K^T в той же раскладке, поэтому транспонирования между
+// фазами не нужно ни одного.
+// ------------------------------------------------------------------ //
+// Слитый последовательный скан: один запуск на слой вместо восьми на чанк.
+//
+// Последовательность чанков разорвать нельзя — состояние конца чанка нужно
+// следующему. Но всё, что между ними, помещается в один варп: варп владеет
+// 16 строками состояния (dv) на всю глубину dk и делает над ними пять
+// матричных умножений подряд, ни разу не выкладывая состояние в память.
+// Раньше те же пять умножений были пятью запусками, и состояние ходило в
+// глобальную память и обратно на каждом чанке.
+//
+// Раскладка фрагментов m16n8k16 одна и та же для трёх ролей состояния:
+// аккумулятор (строка dv, столбец dk), операнд A в P = S K^T и операнд B в
+// Q S^T. Во всех трёх дорожка держит строки grp и grp+8 и пару столбцов с
+// pos*2 — поэтому упакованная BF16-копия аккумулятора годится как есть и
+// перекладка не нужна.
+constexpr int kFusedWarps = 4;
+constexpr int kFusedThreads = kFusedWarps * 32;
+constexpr int kFusedRows = 16;                       // dv-строк на варп
+constexpr int kFusedSlice = kFusedWarps * kFusedRows;
+constexpr int kFusedSlices = kDv / kFusedSlice;
+constexpr int kDkTiles = kDk / 8;                    // n-тайлов состояния
+constexpr int kChunkTiles = kWyChunk / 8;            // n-тайлов по токенам
+constexpr int kKeyPad = kDk + 8;
+
+struct WyFusedShared {
+    __nv_bfloat16 key[kWyChunk * kKeyPad];
+    __nv_bfloat16 query[kWyChunk * kKeyPad];
+    float gamma[kWyChunk];
+    float weight[kWyChunk];   // gamma_C / gamma_t — вес чанковой границы
+    float decay[kWyChunk];    // beta_t * gamma_t — вклад входного состояния
+};
+
+constexpr size_t wy_fused_shared_bytes() { return sizeof(WyFusedShared); }
+
+__device__ __forceinline__ uint32_t wy_pack(float low, float high) {
+    const __nv_bfloat16 a = __float2bfloat16(low);
+    const __nv_bfloat16 b = __float2bfloat16(high);
+    return static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&a))
+        | (static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(&b)) << 16);
+}
+
+__device__ __forceinline__ uint32_t wy_pack_shared(
+    const __nv_bfloat16* source) {
+    return *reinterpret_cast<const uint32_t*>(source);
+}
+
+__device__ __forceinline__ uint32_t wy_pack_strided(
+    const __nv_bfloat16* low, const __nv_bfloat16* high) {
+    return static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(low))
+        | (static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(high)) << 16);
+}
+
+// Копия строк в shared по 8 элементов (16 байт) за раз. Набивка выбрана так,
+// что шаг ряда кратен 16 байтам, иначе векторная запись развалится.
+template <int kRow, int kPad>
+__device__ __forceinline__ void wy_stage_rows(
+    const __nv_bfloat16* __restrict__ source, __nv_bfloat16* destination,
+    int rows, int thread, int threads) {
+    constexpr int kVector = 8;
+    constexpr int kPerRow = kRow / kVector;
+    for (int index = thread; index < rows * kPerRow; index += threads) {
+        const int row = index / kPerRow;
+        const int column = (index % kPerRow) * kVector;
+        *reinterpret_cast<float4*>(destination + row * kPad + column) =
+            *reinterpret_cast<const float4*>(source + (size_t)row * kRow + column);
+    }
+}
+
+__global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
+    const __nv_bfloat16* __restrict__ key_tile,
+    const __nv_bfloat16* __restrict__ query_tile,
+    const __nv_bfloat16* __restrict__ inverse,
+    const __nv_bfloat16* __restrict__ factor,
+    const __nv_bfloat16* __restrict__ value_tile,
+    const float* __restrict__ log_decay,
+    const float* __restrict__ beta,
+    __nv_bfloat16* __restrict__ state,
+    float* __restrict__ out,
+    int tokens, int chunks) {
+    extern __shared__ __align__(16) char wy_fused_raw[];
+    WyFusedShared& shared = *reinterpret_cast<WyFusedShared*>(wy_fused_raw);
+
+    const int head = blockIdx.x;
+    const int key_head = head / kRatio;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int grp = lane >> 2;
+    const int pos = lane & 3;
+    const int row0 = blockIdx.y * kFusedSlice + warp * kFusedRows;
+
+    // Состояние: строки row0+grp и row0+grp+8, столбцы tile*8+pos*2 и +1.
+    float state_acc[kDkTiles][4];
+    {
+        const __nv_bfloat16* source = state + (size_t)head * kDv * kDk;
+        #pragma unroll
+        for (int tile = 0; tile < kDkTiles; ++tile) {
+            const int column = tile * 8 + pos * 2;
+            const uint32_t low = *reinterpret_cast<const uint32_t*>(
+                source + (size_t)(row0 + grp) * kDk + column);
+            const uint32_t high = *reinterpret_cast<const uint32_t*>(
+                source + (size_t)(row0 + grp + 8) * kDk + column);
+            const __nv_bfloat16* lowp = reinterpret_cast<const __nv_bfloat16*>(&low);
+            const __nv_bfloat16* highp = reinterpret_cast<const __nv_bfloat16*>(&high);
+            state_acc[tile][0] = __bfloat162float(lowp[0]);
+            state_acc[tile][1] = __bfloat162float(lowp[1]);
+            state_acc[tile][2] = __bfloat162float(highp[0]);
+            state_acc[tile][3] = __bfloat162float(highp[1]);
+        }
+    }
+
+    for (int chunk = 0; chunk < chunks; ++chunk) {
+        const int start = chunk * kWyChunk;
+        const int length = min(kWyChunk, tokens - start);
+        const size_t qk_base =
+            ((size_t)chunk * kHk + key_head) * kWyChunk * kDk;
+        const size_t head_base =
+            ((size_t)chunk * kHv + head) * kWyChunk * kWyChunk;
+        const float* chunk_decay =
+            log_decay + (size_t)(chunk * kHv + head) * kWyChunk;
+
+        __syncthreads();
+        wy_stage_rows<kDk, kKeyPad>(
+            key_tile + qk_base, shared.key, kWyChunk, threadIdx.x, kFusedThreads);
+        wy_stage_rows<kDk, kKeyPad>(
+            query_tile + qk_base, shared.query, kWyChunk, threadIdx.x, kFusedThreads);
+        for (int token = threadIdx.x; token < kWyChunk; token += kFusedThreads) {
+            const float cumulative = chunk_decay[token];
+            const float value = __expf(cumulative);
+            shared.gamma[token] = value;
+            if (token < length) {
+                // Вес границы чанка — отношение затуханий, то есть exp от
+                // разности логарифмов: оно не больше единицы при любом alpha.
+                shared.weight[token] =
+                    __expf(chunk_decay[length - 1] - cumulative);
+                shared.decay[token] =
+                    beta[(size_t)(start + token) * kHv + head] * value;
+            } else {
+                shared.weight[token] = 0.0f;
+                shared.decay[token] = 0.0f;
+            }
+        }
+        __syncthreads();
+
+        // BF16-копия состояния: пара (строка, строка+8) на каждый столбцовый
+        // тайл. Она же операнд A для S K^T и операнд B для Q S^T.
+        uint32_t state_pack[kDkTiles][2];
+        #pragma unroll
+        for (int tile = 0; tile < kDkTiles; ++tile) {
+            state_pack[tile][0] = wy_pack(state_acc[tile][0], state_acc[tile][1]);
+            state_pack[tile][1] = wy_pack(state_acc[tile][2], state_acc[tile][3]);
+        }
+
+        // P = S_0 K^T: [16 строк dv] x [64 токена].
+        float product[kChunkTiles][4] = {};
+        #pragma unroll
+        for (int group = 0; group < kDk / 16; ++group) {
+            const uint32_t a[4] = {
+                state_pack[2 * group][0], state_pack[2 * group][1],
+                state_pack[2 * group + 1][0], state_pack[2 * group + 1][1]};
+            #pragma unroll
+            for (int tile = 0; tile < kChunkTiles; ++tile) {
+                const __nv_bfloat16* row =
+                    shared.key + (size_t)(tile * 8 + grp) * kKeyPad + group * 16;
+                const uint32_t b[2] = {
+                    wy_pack_shared(row + pos * 2),
+                    wy_pack_shared(row + pos * 2 + 8)};
+                wy_mma_m16n8k16(product[tile], a, b);
+            }
+        }
+
+        // Правая часть: b_t v_t - b_t gamma_t S_0 k_t, сразу в BF16-фрагменты
+        // операнда A для умножения на T^T.
+        uint32_t right[kChunkTiles][2];
+        {
+            const __nv_bfloat16* values =
+                value_tile + ((size_t)chunk * kHv + head) * kDv * kWyChunk;
+            #pragma unroll
+            for (int tile = 0; tile < kChunkTiles; ++tile) {
+                const int token = tile * 8 + pos * 2;
+                const float d0 = shared.decay[token];
+                const float d1 = shared.decay[token + 1];
+                const uint32_t low = *reinterpret_cast<const uint32_t*>(
+                    values + (size_t)(row0 + grp) * kWyChunk + token);
+                const uint32_t high = *reinterpret_cast<const uint32_t*>(
+                    values + (size_t)(row0 + grp + 8) * kWyChunk + token);
+                const __nv_bfloat16* lowp = reinterpret_cast<const __nv_bfloat16*>(&low);
+                const __nv_bfloat16* highp = reinterpret_cast<const __nv_bfloat16*>(&high);
+                right[tile][0] = wy_pack(
+                    __bfloat162float(lowp[0]) - d0 * product[tile][0],
+                    __bfloat162float(lowp[1]) - d1 * product[tile][1]);
+                right[tile][1] = wy_pack(
+                    __bfloat162float(highp[0]) - d0 * product[tile][2],
+                    __bfloat162float(highp[1]) - d1 * product[tile][3]);
+            }
+        }
+
+        // C^T = RHS^T T^T.
+        float coefficient[kChunkTiles][4] = {};
+        #pragma unroll
+        for (int group = 0; group < kWyChunk / 16; ++group) {
+            const uint32_t a[4] = {
+                right[2 * group][0], right[2 * group][1],
+                right[2 * group + 1][0], right[2 * group + 1][1]};
+            #pragma unroll
+            for (int tile = 0; tile < kChunkTiles; ++tile) {
+                const __nv_bfloat16* row = inverse + head_base
+                    + (size_t)(tile * 8 + grp) * kWyChunk + group * 16;
+                const uint32_t b[2] = {
+                    wy_pack_shared(row + pos * 2),
+                    wy_pack_shared(row + pos * 2 + 8)};
+                wy_mma_m16n8k16(coefficient[tile], a, b);
+            }
+        }
+
+        // O = diag(gamma) Q S_0^T + F C. Строки здесь — токены, столбцы —
+        // 16 dv-строк варпа, поэтому m-тайлов четыре, а n-тайлов два.
+        constexpr int kOutRowTiles = kWyChunk / 16;
+        float output[kOutRowTiles][2][4] = {};
+        #pragma unroll
+        for (int group = 0; group < kDk / 16; ++group) {
+            #pragma unroll
+            for (int mt = 0; mt < kOutRowTiles; ++mt) {
+                const __nv_bfloat16* row =
+                    shared.query + (size_t)(mt * 16 + grp) * kKeyPad + group * 16;
+                const __nv_bfloat16* row8 =
+                    shared.query + (size_t)(mt * 16 + grp + 8) * kKeyPad + group * 16;
+                const uint32_t a[4] = {
+                    wy_pack_shared(row + pos * 2),
+                    wy_pack_shared(row8 + pos * 2),
+                    wy_pack_shared(row + pos * 2 + 8),
+                    wy_pack_shared(row8 + pos * 2 + 8)};
+                #pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const uint32_t b[2] = {
+                        state_pack[2 * group][nt], state_pack[2 * group + 1][nt]};
+                    wy_mma_m16n8k16(output[mt][nt], a, b);
+                }
+            }
+        }
+        #pragma unroll
+        for (int mt = 0; mt < kOutRowTiles; ++mt) {
+            const float g0 = shared.gamma[mt * 16 + grp];
+            const float g8 = shared.gamma[mt * 16 + grp + 8];
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                output[mt][nt][0] *= g0;
+                output[mt][nt][1] *= g0;
+                output[mt][nt][2] *= g8;
+                output[mt][nt][3] *= g8;
+            }
+        }
+        // C в роли операнда B: n — это dv-строка, k — токен.
+        uint32_t coefficient_pack[kChunkTiles][2];
+        #pragma unroll
+        for (int tile = 0; tile < kChunkTiles; ++tile) {
+            coefficient_pack[tile][0] =
+                wy_pack(coefficient[tile][0], coefficient[tile][1]);
+            coefficient_pack[tile][1] =
+                wy_pack(coefficient[tile][2], coefficient[tile][3]);
+        }
+        #pragma unroll
+        for (int group = 0; group < kWyChunk / 16; ++group) {
+            #pragma unroll
+            for (int mt = 0; mt < kOutRowTiles; ++mt) {
+                const __nv_bfloat16* row = factor + head_base
+                    + (size_t)(mt * 16 + grp) * kWyChunk + group * 16;
+                const __nv_bfloat16* row8 = factor + head_base
+                    + (size_t)(mt * 16 + grp + 8) * kWyChunk + group * 16;
+                const uint32_t a[4] = {
+                    wy_pack_shared(row + pos * 2),
+                    wy_pack_shared(row8 + pos * 2),
+                    wy_pack_shared(row + pos * 2 + 8),
+                    wy_pack_shared(row8 + pos * 2 + 8)};
+                #pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const uint32_t b[2] = {
+                        coefficient_pack[2 * group][nt],
+                        coefficient_pack[2 * group + 1][nt]};
+                    wy_mma_m16n8k16(output[mt][nt], a, b);
+                }
+            }
+        }
+        #pragma unroll
+        for (int mt = 0; mt < kOutRowTiles; ++mt) {
+            #pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                const int column = row0 + nt * 8 + pos * 2;
+                const int token0 = mt * 16 + grp;
+                const int token8 = token0 + 8;
+                float* base = out + ((size_t)(start + token0) * kHv + head) * kDv;
+                if (token0 < length) {
+                    base[column] = output[mt][nt][0];
+                    base[column + 1] = output[mt][nt][1];
+                }
+                if (token8 < length) {
+                    float* base8 = out + ((size_t)(start + token8) * kHv + head) * kDv;
+                    base8[column] = output[mt][nt][2];
+                    base8[column + 1] = output[mt][nt][3];
+                }
+            }
+        }
+
+        // S_C = gamma_C S_0 + C_weighted^T K.
+        const float last = shared.gamma[length - 1];
+        #pragma unroll
+        for (int tile = 0; tile < kDkTiles; ++tile) {
+            #pragma unroll
+            for (int index = 0; index < 4; ++index) {
+                state_acc[tile][index] *= last;
+            }
+        }
+        #pragma unroll
+        for (int tile = 0; tile < kChunkTiles; ++tile) {
+            const int token = tile * 8 + pos * 2;
+            const float w0 = shared.weight[token];
+            const float w1 = shared.weight[token + 1];
+            coefficient_pack[tile][0] = wy_pack(
+                coefficient[tile][0] * w0, coefficient[tile][1] * w1);
+            coefficient_pack[tile][1] = wy_pack(
+                coefficient[tile][2] * w0, coefficient[tile][3] * w1);
+        }
+        #pragma unroll
+        for (int group = 0; group < kWyChunk / 16; ++group) {
+            const uint32_t a[4] = {
+                coefficient_pack[2 * group][0], coefficient_pack[2 * group][1],
+                coefficient_pack[2 * group + 1][0], coefficient_pack[2 * group + 1][1]};
+            #pragma unroll
+            for (int tile = 0; tile < kDkTiles; ++tile) {
+                const int column = tile * 8 + grp;
+                const __nv_bfloat16* base = shared.key + column;
+                const int token = group * 16 + pos * 2;
+                const uint32_t b[2] = {
+                    wy_pack_strided(base + (size_t)token * kKeyPad,
+                                    base + (size_t)(token + 1) * kKeyPad),
+                    wy_pack_strided(base + (size_t)(token + 8) * kKeyPad,
+                                    base + (size_t)(token + 9) * kKeyPad)};
+                wy_mma_m16n8k16(state_acc[tile], a, b);
+            }
+        }
+    }
+
+    // Состояние последовательности переживает шаг, поэтому пишется обратно
+    // один раз, в конце.
+    {
+        __nv_bfloat16* destination = state + (size_t)head * kDv * kDk;
+        #pragma unroll
+        for (int tile = 0; tile < kDkTiles; ++tile) {
+            const int column = tile * 8 + pos * 2;
+            const uint32_t low = wy_pack(state_acc[tile][0], state_acc[tile][1]);
+            const uint32_t high = wy_pack(state_acc[tile][2], state_acc[tile][3]);
+            *reinterpret_cast<uint32_t*>(
+                destination + (size_t)(row0 + grp) * kDk + column) = low;
+            *reinterpret_cast<uint32_t*>(
+                destination + (size_t)(row0 + grp + 8) * kDk + column) = high;
+        }
+    }
+}
+
+// Тайл значений в BF16 и транспонированный: [чанк][голова][измерение][токен].
+// Слитое ядро читает его в раскладке аккумулятора, где строка — измерение, а
+// столбец — токен; транспонировать там было бы негде.
+__global__ __launch_bounds__(256) void wy_prepare_value_kernel(
     const float* __restrict__ v,
     const float* __restrict__ beta,
-    const float* __restrict__ gamma,
-    const float* __restrict__ triangular,
-    float* __restrict__ coefficients,
-    __nv_bfloat16* __restrict__ coefficients_transposed,
-    __nv_bfloat16* __restrict__ weighted_coefficients_transposed,
-    int start, int length) {
+    __nv_bfloat16* __restrict__ value_tile,
+    int tokens) {
+    __shared__ float tile[kWyChunk][kDv + 1];
     const int head = blockIdx.x;
-    const int value_dimension = threadIdx.x;
-    const size_t matrix_base = (size_t)head * kWyChunk * kDv;
-    const size_t triangle_base = (size_t)head * kWyChunk * kWyChunk;
-    for (int token = 0; token < length; ++token) {
-        const float bt = beta[(size_t)(start + token) * kHv + head];
-        const size_t slot = matrix_base + (size_t)token * kDv + value_dimension;
-        float c = bt * (
-            v[((size_t)(start + token) * kHv + head) * kDv + value_dimension]
-            - gamma[head * kWyChunk + token] * coefficients[slot]);
-        for (int previous = 0; previous < token; ++previous) {
-            c -= triangular[triangle_base + (size_t)token * kWyChunk + previous]
-                * coefficients[matrix_base + (size_t)previous * kDv + value_dimension];
-        }
-        coefficients[slot] = c;
-    }
-    const float last = gamma[head * kWyChunk + length - 1];
-    for (int token = 0; token < kWyChunk; ++token) {
-        float c = 0.0f;
-        float weighted = 0.0f;
+    const int chunk = blockIdx.y;
+    const int start = chunk * kWyChunk;
+    const int length = min(kWyChunk, tokens - start);
+    for (int index = threadIdx.x; index < kWyChunk * kDv; index += 256) {
+        const int dimension = index % kDv;
+        const int token = index / kDv;
+        float value = 0.0f;
         if (token < length) {
-            c = coefficients[matrix_base + (size_t)token * kDv + value_dimension];
-            weighted = c * last / gamma[head * kWyChunk + token];
+            const size_t row = (size_t)(start + token) * kHv + head;
+            value = beta[row] * v[row * kDv + dimension];
         }
-        const size_t transposed = (size_t)(head * kDv + value_dimension)
-            * kWyChunk + token;
-        coefficients_transposed[transposed] = __float2bfloat16(c);
-        weighted_coefficients_transposed[transposed] = __float2bfloat16(weighted);
+        tile[token][dimension] = value;
     }
-}
-
-__global__ void wy_refresh_state_kernel(
-    const float* __restrict__ state_fp32,
-    __nv_bfloat16* __restrict__ state_bf16,
-    __nv_bfloat16* __restrict__ final_state) {
-    const int index = blockIdx.x * blockDim.x + threadIdx.x;
-    const int elements = kHv * kDv * kDk;
-    if (index < elements) {
-        const __nv_bfloat16 value = __float2bfloat16(state_fp32[index]);
-        state_bf16[index] = value;
-        if (final_state != nullptr) {
-            final_state[index] = value;
-        }
+    __syncthreads();
+    __nv_bfloat16* destination =
+        value_tile + ((size_t)chunk * kHv + head) * kDv * kWyChunk;
+    for (int index = threadIdx.x; index < kDv * kWyChunk; index += 256) {
+        const int token = index % kWyChunk;
+        const int dimension = index / kWyChunk;
+        destination[index] = __float2bfloat16(tile[token][dimension]);
     }
 }
 
@@ -656,19 +1041,14 @@ extern "C" cudaError_t qwc_delta_prefill_wy(
     const float* alpha,
     const float* beta,
     float* out,
-    void* state_fp32_pointer,
-    void* state_bf16_pointer,
     void* query_tile_pointer,
     void* key_tile_pointer,
-    void* key_transposed_pointer,
     void* gram_kk_pointer,
     void* gram_qk_pointer,
-    void* triangular_pointer,
+    void* inverse_pointer,
     void* output_factor_pointer,
-    void* coefficients_pointer,
-    void* coefficients_transposed_pointer,
-    void* weighted_coefficients_transposed_pointer,
-    void* gamma_pointer,
+    void* value_tile_pointer,
+    void* log_decay_pointer,
     int state_capacity,
     int state_slot,
     int tokens,
@@ -676,38 +1056,27 @@ extern "C" cudaError_t qwc_delta_prefill_wy(
     cudaStream_t stream) {
     if (state == nullptr || q == nullptr || k == nullptr || v == nullptr ||
         alpha == nullptr || beta == nullptr || out == nullptr ||
-        state_fp32_pointer == nullptr || state_bf16_pointer == nullptr ||
         query_tile_pointer == nullptr || key_tile_pointer == nullptr ||
-        key_transposed_pointer == nullptr || gram_kk_pointer == nullptr ||
-        gram_qk_pointer == nullptr || triangular_pointer == nullptr ||
-        output_factor_pointer == nullptr || coefficients_pointer == nullptr ||
-        coefficients_transposed_pointer == nullptr ||
-        weighted_coefficients_transposed_pointer == nullptr ||
-        gamma_pointer == nullptr || state_capacity <= 0 || state_slot < 0 ||
+        gram_kk_pointer == nullptr || gram_qk_pointer == nullptr ||
+        inverse_pointer == nullptr || output_factor_pointer == nullptr ||
+        value_tile_pointer == nullptr || log_decay_pointer == nullptr ||
+        state_capacity <= 0 || state_slot < 0 ||
         state_slot >= state_capacity || tokens <= 0 ||
         tokens > qwc::kMaxStepRows || row_offset < 0) {
         return cudaErrorInvalidValue;
     }
 
     auto* state_pool = static_cast<__nv_bfloat16*>(state);
-    auto* state_fp32 = static_cast<float*>(state_fp32_pointer);
-    auto* state_bf16 = static_cast<__nv_bfloat16*>(state_bf16_pointer);
     auto* query_tile = static_cast<__nv_bfloat16*>(query_tile_pointer);
     auto* key_tile = static_cast<__nv_bfloat16*>(key_tile_pointer);
-    auto* key_transposed = static_cast<__nv_bfloat16*>(key_transposed_pointer);
     auto* gram_kk = static_cast<float*>(gram_kk_pointer);
     auto* gram_qk = static_cast<float*>(gram_qk_pointer);
-    auto* triangular = static_cast<float*>(triangular_pointer);
+    auto* inverse = static_cast<__nv_bfloat16*>(inverse_pointer);
     auto* output_factor = static_cast<__nv_bfloat16*>(output_factor_pointer);
-    auto* coefficients = static_cast<float*>(coefficients_pointer);
-    auto* coefficients_transposed =
-        static_cast<__nv_bfloat16*>(coefficients_transposed_pointer);
-    auto* weighted_coefficients_transposed =
-        static_cast<__nv_bfloat16*>(weighted_coefficients_transposed_pointer);
-    auto* gamma = static_cast<float*>(gamma_pointer);
+    auto* value_tile = static_cast<__nv_bfloat16*>(value_tile_pointer);
+    auto* log_decay = static_cast<float*>(log_decay_pointer);
 
-    // The Rust side validates the full fused arena.  From here on all row
-    // coordinates are relative to the selected sequence segment.
+    // Дальше все координаты строк — внутри выбранного сегмента арены.
     q += (size_t)row_offset * kHk * kDk;
     k += (size_t)row_offset * kHk * kDk;
     v += (size_t)row_offset * kHv * kDv;
@@ -718,90 +1087,52 @@ extern "C" cudaError_t qwc_delta_prefill_wy(
     constexpr int kThreads = 256;
     constexpr int kStateElements = kHv * kDv * kDk;
     constexpr int kQkTileElements = kHk * kWyChunk * kDk;
-    constexpr int kHeadMatrixElements = kHv * kWyChunk * kWyChunk;
-    const int state_blocks = (kStateElements + kThreads - 1) / kThreads;
-    const int qk_blocks = (kQkTileElements + kThreads - 1) / kThreads;
-    const int matrix_blocks = (kHeadMatrixElements + kThreads - 1) / kThreads;
+    const int chunks = (tokens + kWyChunk - 1) / kWyChunk;
+    const int qk_blocks = (chunks * kQkTileElements + kThreads - 1) / kThreads;
+    const int decay_blocks = (chunks * kHv + kThreads - 1) / kThreads;
     __nv_bfloat16* selected_state =
         state_pool + (size_t)state_slot * kStateElements;
-    wy_initialize_state_kernel<<<state_blocks, kThreads, 0, stream>>>(
-        selected_state, state_fp32, state_bf16);
 
-    for (int start = 0; start < tokens; start += kWyChunk) {
-        const int length = min(kWyChunk, tokens - start);
-        wy_prepare_qk_kernel<<<qk_blocks, kThreads, 0, stream>>>(
-            q, k, query_tile, key_tile, key_transposed, start, length);
-        wy_gamma_kernel<<<kHv, 1, 0, stream>>>(
-            alpha, gamma, start, length);
+    // Подготовка не зависит от состояния и считается сразу по всем чанкам —
+    // по одному запуску на слой. Когда каждая из этих фаз запускалась на
+    // каждый чанк, пусковая задержка стоила больше самой работы.
+    wy_prepare_qk_kernel<<<qk_blocks, kThreads, 0, stream>>>(
+        q, k, query_tile, key_tile, tokens, chunks);
+    wy_decay_kernel<<<decay_blocks, kThreads, 0, stream>>>(
+        alpha, log_decay, tokens, chunks);
+    // K K^T и Q K^T общие для трёх v-голов одной k-головы.
+    launch_wy_gemm(
+        key_tile, key_tile, gram_kk, nullptr, nullptr, nullptr,
+        kWyChunk, kWyChunk, kDk, kHk * chunks,
+        kWyChunk * kDk, kWyChunk * kDk,
+        kWyChunk * kWyChunk, 0,
+        kDk, kDk, kWyChunk, 0,
+        1, 1, 0, 0, 0, 0.0f, stream);
+    launch_wy_gemm(
+        query_tile, key_tile, gram_qk, nullptr, nullptr, nullptr,
+        kWyChunk, kWyChunk, kDk, kHk * chunks,
+        kWyChunk * kDk, kWyChunk * kDk,
+        kWyChunk * kWyChunk, 0,
+        kDk, kDk, kWyChunk, 0,
+        1, 1, 0, 0, 0, 0.0f, stream);
+    wy_factor_kernel<<<dim3(kHv, chunks), kWyChunk, 0, stream>>>(
+        beta, log_decay, gram_kk, gram_qk, inverse, output_factor, tokens);
+    wy_prepare_value_kernel<<<dim3(kHv, chunks), 256, 0, stream>>>(
+        v, beta, value_tile, tokens);
 
-        // K K^T and Q K^T are shared by the three value heads in a key-head
-        // group.  The following scalar transforms add beta and gamma ratios.
-        launch_wy_gemm(
-            key_tile, key_tile, gram_kk, nullptr, nullptr, nullptr,
-            kWyChunk, kWyChunk, kDk, kHk,
-            kWyChunk * kDk, kWyChunk * kDk,
-            kWyChunk * kWyChunk, 0,
-            kDk, kDk, kWyChunk, 0,
-            1, 1, 0, 0, 0, 0.0f, stream);
-        launch_wy_gemm(
-            query_tile, key_tile, gram_qk, nullptr, nullptr, nullptr,
-            kWyChunk, kWyChunk, kDk, kHk,
-            kWyChunk * kDk, kWyChunk * kDk,
-            kWyChunk * kWyChunk, 0,
-            kDk, kDk, kWyChunk, 0,
-            1, 1, 0, 0, 0, 0.0f, stream);
-        wy_transform_kernel<<<matrix_blocks, kThreads, 0, stream>>>(
-            beta, gamma, gram_kk, gram_qk, triangular, output_factor,
-            start, length);
-
-        // P = K S_0^T.  `wy_solve_kernel` turns P into the right-hand side
-        // and performs the forward substitution independently for 128 values.
-        launch_wy_gemm(
-            key_tile, state_bf16, coefficients, nullptr, nullptr, nullptr,
-            kWyChunk, kDv, kDk, kHv,
-            kWyChunk * kDk, kDv * kDk,
-            kWyChunk * kDv, 0,
-            kDk, kDk, kDv, 0,
-            kRatio, 1, 0, 0, 0, 0.0f, stream);
-        wy_solve_kernel<<<kHv, kDv, 0, stream>>>(
-            v, beta, gamma, triangular, coefficients,
-            coefficients_transposed, weighted_coefficients_transposed,
-            start, length);
-
-        // O_0 = diag(gamma) Q S_0^T, directly into the fused row-major
-        // output arena.  Then add F C using the causal factor matrix.
-        launch_wy_gemm(
-            query_tile, state_bf16, out + (size_t)start * kHv * kDv,
-            nullptr, gamma, nullptr,
-            kWyChunk, kDv, kDk, kHv,
-            kWyChunk * kDk, kDv * kDk,
-            kDv, 0,
-            kDk, kDk, kHv * kDv, 0,
-            kRatio, 1, kWyChunk, 0, 0, 0.0f, stream);
-        launch_wy_gemm(
-            output_factor, coefficients_transposed,
-            out + (size_t)start * kHv * kDv,
-            out + (size_t)start * kHv * kDv,
-            nullptr, nullptr,
-            kWyChunk, kDv, kWyChunk, kHv,
-            kWyChunk * kWyChunk, kDv * kWyChunk,
-            kDv, kDv,
-            kWyChunk, kWyChunk, kHv * kDv, kHv * kDv,
-            1, 1, 0, 0, 0, 1.0f, stream);
-
-        // S_C = gamma_C S_0 + C_weighted^T K.  Keep the accumulator in
-        // FP32 across tiles, but materialize BF16 once for the next MMA.
-        launch_wy_gemm(
-            weighted_coefficients_transposed, key_transposed,
-            state_fp32, state_fp32, nullptr, gamma,
-            kDv, kDk, kWyChunk, kHv,
-            kDv * kWyChunk, kDk * kWyChunk,
-            kDv * kDk, kDv * kDk,
-            kWyChunk, kWyChunk, kDk, kDk,
-            1, kRatio, 0, kWyChunk, length - 1, 1.0f, stream);
-        const bool final_tile = start + length == tokens;
-        wy_refresh_state_kernel<<<state_blocks, kThreads, 0, stream>>>(
-            state_fp32, state_bf16, final_tile ? selected_state : nullptr);
+    // Цепочка чанков разорвана быть не может: состояние конца чанка нужно
+    // следующему. Слитое ядро проходит её целиком, держа состояние в
+    // регистрах варпа.
+    static const cudaError_t opted = cudaFuncSetAttribute(
+        wy_fused_scan_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(wy_fused_shared_bytes()));
+    if (opted != cudaSuccess) {
+        return opted;
     }
+    wy_fused_scan_kernel<<<dim3(kHv, kFusedSlices), kFusedThreads,
+        wy_fused_shared_bytes(), stream>>>(
+        key_tile, query_tile, inverse, output_factor, value_tile,
+        log_decay, beta, selected_state, out, tokens, chunks);
     return cudaGetLastError();
 }

@@ -12,7 +12,7 @@ use crate::weights::{
 };
 use qwc_core::arch::*;
 use qwc_cuda::delta_net::{
-    self, CONV_STATE_ELEMS, DeltaStateMode, PreparedDelta, RowView,
+    self, CONV_STATE_ELEMS, DeltaPrefillWorkspace, DeltaStateMode, PreparedDelta, RowView,
     STATE_ELEMS, V_ELEMS,
 };
 use qwc_cuda::graph::CudaGraph;
@@ -113,6 +113,11 @@ pub struct Executor {
     state_slots: DeviceBuffer<u32>,
     state_pools: Vec<DeviceBuffer<u16>>,
     conv_pools: Vec<DeviceBuffer<f32>>,
+    /// Скретч WY-скана. Общий на все слои и все последовательности: скан
+    /// вызывается до 48 раз за шаг, и аллокация внутри вызова сериализовала
+    /// бы этот путь. Заводится только в режиме `Wy` — он стоит десятки
+    /// мегабайт, которые остальным режимам не нужны.
+    delta_prefill: Option<DeltaPrefillWorkspace>,
 
     // Full attention.
     query_gate: DeviceBuffer<u16>,
@@ -332,7 +337,9 @@ impl Executor {
         )
     }
 
-    fn new_with_pool_options(
+    /// Полный набор переключателей: KV, путь проекций decode и форма
+    /// prefill-скана. Стенды берут именно его, потому что свипают все три.
+    pub fn new_with_pool_options(
         config: ExecutorConfig,
         kv_cache_dtype: KvCacheDtype,
         decode_linear_mode: DecodeLinearMode,
@@ -374,6 +381,10 @@ impl Executor {
         }
         let slots: Vec<u32> = (0..batch as u32).collect();
 
+        let delta_prefill = match delta_state_mode {
+            DeltaStateMode::Wy => Some(DeltaPrefillWorkspace::new()?),
+            _ => None,
+        };
         let mut state_pools = Vec::with_capacity(NUM_LINEAR_LAYERS);
         let mut conv_pools = Vec::with_capacity(NUM_LINEAR_LAYERS);
         for _ in 0..NUM_LINEAR_LAYERS {
@@ -426,6 +437,7 @@ impl Executor {
             state_slots: DeviceBuffer::from_slice(&slots)?,
             state_pools,
             conv_pools,
+            delta_prefill,
             query_gate: DeviceBuffer::zeroed(decode_rows * 2 * Q_PROJ_DIM)?,
             key_projection: DeviceBuffer::zeroed(decode_rows * KV_PROJ_DIM)?,
             value_projection: DeviceBuffer::zeroed(decode_rows * KV_PROJ_DIM)?,
@@ -1026,17 +1038,30 @@ impl Executor {
                             &self.stream,
                         )?;
                         mark!("delta.scan_prefill");
-                        delta_net::prefill_slot(
-                            &mut self.state_pools[linear_layer],
-                            &prefill.prepared.inputs(),
-                            &mut prefill.delta_out,
-                            self.max_batch,
-                            segment.state_slot,
-                            segment.tokens,
-                            segment.row_begin,
-                            self.delta_state_mode,
-                            &self.stream,
-                        )?;
+                        match &mut self.delta_prefill {
+                            Some(workspace) => delta_net::prefill_slot_wy(
+                                &mut self.state_pools[linear_layer],
+                                &prefill.prepared.inputs(),
+                                &mut prefill.delta_out,
+                                workspace,
+                                self.max_batch,
+                                segment.state_slot,
+                                segment.tokens,
+                                segment.row_begin,
+                                &self.stream,
+                            )?,
+                            None => delta_net::prefill_slot(
+                                &mut self.state_pools[linear_layer],
+                                &prefill.prepared.inputs(),
+                                &mut prefill.delta_out,
+                                self.max_batch,
+                                segment.state_slot,
+                                segment.tokens,
+                                segment.row_begin,
+                                self.delta_state_mode,
+                                &self.stream,
+                            )?,
+                        }
                     }
                     mark!("delta.norm");
                     mixer.output_norm.forward(

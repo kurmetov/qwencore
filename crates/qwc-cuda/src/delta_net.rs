@@ -23,18 +23,26 @@ pub const CONV_STATE_ELEMS: usize = qwc_core::arch::LA_CONV_CHANNELS * 3;
 /// Matrix tile used by the parallel WY prefill scan.
 pub const WY_CHUNK_SIZE: usize = 64;
 
-/// Точность рекуррентного состояния внутри одного chunk prefill.
+/// Как считается chunk на prefill.
 ///
-/// `Bf16` округляет состояние до BF16 после каждого токена, поэтому chunk
-/// воспроизводит повторный decode бит в бит. `Fp32` держит строку состояния в
-/// FP32-регистрах до конца chunk и округляет только запись на границе — так
-/// делает эталонная реализация (flash-linear-attention копит `b_h` в FP32
-/// через все чанки последовательности). Диагностический A/B: изолирует
-/// потокенное округление как источник расхождения.
+/// `Bf16` и `Fp32` — один и тот же рекуррентный проход по токенам, разной
+/// точности состояния. `Bf16` округляет состояние после каждого токена,
+/// поэтому chunk воспроизводит повторный decode бит в бит. `Fp32` держит
+/// строку состояния в регистрах до конца chunk и округляет только запись на
+/// границе — так делает эталонная реализация (flash-linear-attention копит
+/// `b_h` в FP32 через все чанки). Их A/B изолирует потокенное округление как
+/// источник расхождения.
+///
+/// `Wy` — другой алгоритм, а не другая точность: chunk считается матрицами
+/// на тензорных ядрах (`bench/results/deltanet-wy-2026-09-16.md`). Состояние
+/// внутри chunk копится в FP32, поэтому по округлениям `Wy` ближе всего к
+/// `Fp32`. Это быстрейший путь на промптах длиннее пары чанков и он требует
+/// `DeltaPrefillWorkspace`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeltaStateMode {
     Bf16,
     Fp32,
+    Wy,
 }
 
 impl DeltaStateMode {
@@ -42,62 +50,79 @@ impl DeltaStateMode {
         match self {
             Self::Bf16 => "bf16",
             Self::Fp32 => "fp32",
+            Self::Wy => "wy",
         }
     }
 
+    /// Только для рекуррентного пути: WY-скан токены поштучно не округляет,
+    /// и вызов на нём — ошибка вызывающего, а не режим по умолчанию.
     fn round_per_token(self) -> i32 {
         match self {
             Self::Bf16 => 1,
             Self::Fp32 => 0,
+            Self::Wy => unreachable!("WY-скан не округляет состояние по токенам"),
         }
     }
 }
 
-const WY_STATE_ELEMS: usize = STATE_ELEMS;
-const WY_QK_TILE_ELEMS: usize = LA_NUM_K_HEADS * WY_CHUNK_SIZE * LA_K_HEAD_DIM;
-const WY_GRAM_ELEMS: usize = LA_NUM_K_HEADS * WY_CHUNK_SIZE * WY_CHUNK_SIZE;
-const WY_HEAD_MATRIX_ELEMS: usize = GATE_ELEMS * WY_CHUNK_SIZE * WY_CHUNK_SIZE;
-const WY_VALUE_TILE_ELEMS: usize = GATE_ELEMS * WY_CHUNK_SIZE * LA_V_HEAD_DIM;
+/// Чанков в самом длинном шаге: фазы, не зависящие от состояния, считаются
+/// сразу по всем, поэтому их буферы рассчитаны на полную арену.
+const WY_MAX_CHUNKS: usize = crate::MAX_STEP_ROWS / WY_CHUNK_SIZE;
+
+const WY_QK_TILE_ELEMS: usize =
+    WY_MAX_CHUNKS * LA_NUM_K_HEADS * WY_CHUNK_SIZE * LA_K_HEAD_DIM;
+const WY_GRAM_ELEMS: usize =
+    WY_MAX_CHUNKS * LA_NUM_K_HEADS * WY_CHUNK_SIZE * WY_CHUNK_SIZE;
+const WY_HEAD_MATRIX_ELEMS: usize =
+    WY_MAX_CHUNKS * GATE_ELEMS * WY_CHUNK_SIZE * WY_CHUNK_SIZE;
+const WY_DECAY_ELEMS: usize = WY_MAX_CHUNKS * GATE_ELEMS * WY_CHUNK_SIZE;
+const WY_VALUE_TILE_ELEMS: usize =
+    WY_MAX_CHUNKS * GATE_ELEMS * WY_CHUNK_SIZE * LA_V_HEAD_DIM;
 
 /// Resident scratch for the matrix (WY) prefill scan.
 ///
 /// It is deliberately owned by the executor rather than allocated by the
 /// launch.  A layer step invokes the scan up to 48 times and runtime CUDA
-/// allocations would serialize that path.  The tile is fixed at 64 tokens;
-/// therefore the workspace stays constant when the scheduler arena grows.
+/// allocations would serialize that path.
+///
+/// Тайл фиксирован на 64 токена, но фазы, не зависящие от состояния,
+/// считаются сразу по всем чанкам сегмента — поэтому буферы рассчитаны на
+/// полную арену (`MAX_STEP_ROWS`) и стоят около 84 МБ.
 pub struct DeltaPrefillWorkspace {
-    state_fp32: DeviceBuffer<f32>,
-    state_bf16: DeviceBuffer<u16>,
     query: DeviceBuffer<u16>,
     key: DeviceBuffer<u16>,
-    key_transposed: DeviceBuffer<u16>,
     gram_kk: DeviceBuffer<f32>,
     gram_qk: DeviceBuffer<f32>,
-    triangular: DeviceBuffer<f32>,
+    inverse: DeviceBuffer<u16>,
     output_factor: DeviceBuffer<u16>,
-    coefficients: DeviceBuffer<f32>,
-    coefficients_transposed: DeviceBuffer<u16>,
-    weighted_coefficients_transposed: DeviceBuffer<u16>,
-    gamma: DeviceBuffer<f32>,
+    value_tile: DeviceBuffer<u16>,
+    log_decay: DeviceBuffer<f32>,
 }
 
 impl DeltaPrefillWorkspace {
     pub fn new() -> Result<Self> {
         Ok(Self {
-            state_fp32: DeviceBuffer::zeroed(WY_STATE_ELEMS)?,
-            state_bf16: DeviceBuffer::zeroed(WY_STATE_ELEMS)?,
             query: DeviceBuffer::zeroed(WY_QK_TILE_ELEMS)?,
             key: DeviceBuffer::zeroed(WY_QK_TILE_ELEMS)?,
-            key_transposed: DeviceBuffer::zeroed(WY_QK_TILE_ELEMS)?,
             gram_kk: DeviceBuffer::zeroed(WY_GRAM_ELEMS)?,
             gram_qk: DeviceBuffer::zeroed(WY_GRAM_ELEMS)?,
-            triangular: DeviceBuffer::zeroed(WY_HEAD_MATRIX_ELEMS)?,
+            inverse: DeviceBuffer::zeroed(WY_HEAD_MATRIX_ELEMS)?,
             output_factor: DeviceBuffer::zeroed(WY_HEAD_MATRIX_ELEMS)?,
-            coefficients: DeviceBuffer::zeroed(WY_VALUE_TILE_ELEMS)?,
-            coefficients_transposed: DeviceBuffer::zeroed(WY_VALUE_TILE_ELEMS)?,
-            weighted_coefficients_transposed: DeviceBuffer::zeroed(WY_VALUE_TILE_ELEMS)?,
-            gamma: DeviceBuffer::zeroed(GATE_ELEMS * WY_CHUNK_SIZE)?,
+            value_tile: DeviceBuffer::zeroed(WY_VALUE_TILE_ELEMS)?,
+            log_decay: DeviceBuffer::zeroed(WY_DECAY_ELEMS)?,
         })
+    }
+
+    /// Байты, которые режим `Wy` добавляет к бюджету памяти движка.
+    pub fn bytes(&self) -> usize {
+        self.query.bytes()
+            + self.key.bytes()
+            + self.gram_kk.bytes()
+            + self.gram_qk.bytes()
+            + self.inverse.bytes()
+            + self.output_factor.bytes()
+            + self.value_tile.bytes()
+            + self.log_decay.bytes()
     }
 }
 
@@ -465,11 +490,12 @@ pub fn prefill_slot(
     })
 }
 
-/// Parallel 64-token WY scan for the FP32 prefill state mode.
+/// Чанковый (WY) скан: `DeltaStateMode::Wy`.
 ///
-/// The recurrent kernel remains the implementation of `DeltaStateMode::Bf16`:
-/// rounding after every token is itself a recurrence and cannot be represented
-/// by the matrix form.  This entry point keeps the distinction explicit.
+/// Рекуррентный кернел остаётся реализацией `Bf16` и `Fp32`: округление после
+/// каждого токена — само по себе рекуррентность, матричной формой она не
+/// выражается. Поэтому это отдельная точка входа, а не флаг внутри
+/// `prefill_slot`.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_slot_wy(
     state_pool: &mut DeviceBuffer<u16>,
@@ -501,19 +527,14 @@ pub fn prefill_slot_wy(
             inputs.alpha.as_ptr().cast(),
             inputs.beta.as_ptr().cast(),
             out.as_mut_ptr().cast(),
-            workspace.state_fp32.as_mut_ptr(),
-            workspace.state_bf16.as_mut_ptr(),
             workspace.query.as_mut_ptr(),
             workspace.key.as_mut_ptr(),
-            workspace.key_transposed.as_mut_ptr(),
             workspace.gram_kk.as_mut_ptr(),
             workspace.gram_qk.as_mut_ptr(),
-            workspace.triangular.as_mut_ptr(),
+            workspace.inverse.as_mut_ptr(),
             workspace.output_factor.as_mut_ptr(),
-            workspace.coefficients.as_mut_ptr(),
-            workspace.coefficients_transposed.as_mut_ptr(),
-            workspace.weighted_coefficients_transposed.as_mut_ptr(),
-            workspace.gamma.as_mut_ptr(),
+            workspace.value_tile.as_mut_ptr(),
+            workspace.log_decay.as_mut_ptr(),
             state_capacity as i32,
             state_slot as i32,
             tokens as i32,
@@ -585,10 +606,7 @@ pub mod reference {
         }
     }
 
-    /// Эталон chunk-скана с FP32-состоянием: округление до BF16 происходит
-    /// только на границе chunk, как в `DeltaStateMode::Fp32`.
-    #[allow(clippy::too_many_arguments)]
-    /// Тот же скан в чанковой (WY) форме: рекуррентность по токенам заменена
+    /// Скан в чанковой (WY) форме: рекуррентность по токенам заменена
     /// матрицами внутри чанка длины `chunk`.
     ///
     /// Вывод. Обозначим за `S_t` состояние после токена t, за gamma_t —
@@ -606,8 +624,11 @@ pub mod reference {
     ///   S_C   = gamma_C S_0 + sum_t (gamma_C / gamma_t) c_t k_t^T.
     ///
     /// Все множители — отношения gamma по парам (r <= t), а alpha в (0, 1],
-    /// поэтому каждое из них не больше единицы: делить на gamma_r, которое
-    /// экспоненциально мало, нигде не приходится.
+    /// поэтому каждое из них не больше единицы. Считать их делением всё равно
+    /// нельзя: gamma само по себе — произведение до 64 множителей и уходит
+    /// под fp32 уже при alpha около 0.2, после чего отношение превращается в
+    /// 0/0. Поэтому затухание копится в логарифмах, а отношение берётся как
+    /// exp от разности.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_chunked_fp32(
         state: &mut [u16],
@@ -636,14 +657,18 @@ pub mod reference {
                 let key = |t: usize| &k[((start + t) * LA_NUM_K_HEADS + hk) * DK..][..DK];
                 let query = |t: usize| &q[((start + t) * LA_NUM_K_HEADS + hk) * DK..][..DK];
 
-                // gamma_t накапливается по чанку, ratio[t][r] = gamma_t / gamma_r.
-                let mut gamma = vec![0.0f32; len];
-                let mut running = 1.0f32;
-                for (t, slot) in gamma.iter_mut().enumerate() {
-                    running *= alpha[(start + t) * HV + h];
+                // Затухание копится в логарифмах: произведение alpha по чанку
+                // уходит под fp32 уже при alpha около 0.2, и отношения
+                // gamma_t / gamma_r превращаются в 0/0. Разность логарифмов
+                // конечна всегда.
+                let mut cumulative = vec![0.0f32; len];
+                let mut running = 0.0f32;
+                for (t, slot) in cumulative.iter_mut().enumerate() {
+                    running += alpha[(start + t) * HV + h].max(1.0e-38).ln();
                     *slot = running;
                 }
-                let ratio = |t: usize, r: usize| gamma[t] / gamma[r];
+                let gamma: Vec<f32> = cumulative.iter().map(|x| x.exp()).collect();
+                let ratio = |t: usize, r: usize| (cumulative[t] - cumulative[r]).exp();
 
                 // Правая часть: b_t v_t - b_t gamma_t (S_0 k_t).
                 let mut c = vec![0.0f32; len * DV];
@@ -705,7 +730,7 @@ pub mod reference {
                     }
                 }
                 for t in 0..len {
-                    let weight = last / gamma[t];
+                    let weight = ratio(len - 1, t);
                     let kt = key(t);
                     for row in 0..DV {
                         let scaled = weight * c[t * DV + row];
@@ -722,6 +747,9 @@ pub mod reference {
         }
     }
 
+    /// Эталон рекуррентного chunk-скана с FP32-состоянием: округление до
+    /// BF16 происходит только на границе chunk, как в `DeltaStateMode::Fp32`.
+    #[allow(clippy::too_many_arguments)]
     pub fn prefill_chunk_fp32(
         state: &mut [u16],
         q: &[f32],

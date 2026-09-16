@@ -346,11 +346,12 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--delta-state" => {
                 delta_state = match args
                     .next()
-                    .ok_or("--delta-state needs bf16 or fp32")?
+                    .ok_or("--delta-state needs bf16, fp32 or wy")?
                     .as_str()
                 {
                     "bf16" => DeltaStateMode::Bf16,
                     "fp32" => DeltaStateMode::Fp32,
+                    "wy" => DeltaStateMode::Wy,
                     other => return Err(format!("unsupported --delta-state value: {other}").into()),
                 };
             }
@@ -383,7 +384,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: qwc-eval --model PATH --corpus FILE [--top-k 20] [--batch 1] [--context N] [--embedding fp8|bf16] [--lm-head fp8|bf16] [--kv-cache fp8|bf16] [--decode-linear auto|w4a4] [--delta-state bf16|fp32]"
+                    "usage: qwc-eval --model PATH --corpus FILE [--top-k 20] [--batch 1] [--context N] [--embedding fp8|bf16] [--lm-head fp8|bf16] [--kv-cache fp8|bf16] [--decode-linear auto|w4a4] [--delta-state bf16|fp32|wy]"
                 );
                 std::process::exit(0);
             }
