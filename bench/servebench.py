@@ -41,7 +41,13 @@ def run_qwc(args) -> dict:
         "--kv-cache-gb", str(args.kv_cache_gb),
         "--memory-limit-gb", str(args.memory_limit_gb),
         "--kv-cache", args.kv_cache_dtype,
+        "--delta-state", args.delta_state,
     ]
+    # Ширина шага prefill — такой же свипаемый параметр, как
+    # max_num_batched_tokens у vLLM: держать его фиксированным значит
+    # занижать одну из сторон.
+    if args.prefill_chunk:
+        command.extend(("--prefill-chunk", str(args.prefill_chunk)))
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
     if result.returncode:
         sys.stderr.write(result.stdout + result.stderr)
@@ -160,6 +166,9 @@ def main() -> int:
     parser.add_argument("--kv-cache-dtype", choices=("fp8", "bf16"), default="fp8")
     # vLLM only: match qwc's 512-token prefill arena to isolate chunk width.
     parser.add_argument("--max-batched-tokens", type=int, default=0)
+    parser.add_argument("--prefill-chunk", type=int, default=0)
+    parser.add_argument(
+        "--delta-state", choices=("wy", "bf16", "fp32"), default="wy")
     parser.add_argument("--kv-cache-gb", type=float, default=5.0)
     parser.add_argument("--memory-limit-gb", type=float, default=28.0)
     parser.add_argument("--output", type=Path)
