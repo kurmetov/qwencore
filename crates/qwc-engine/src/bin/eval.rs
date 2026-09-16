@@ -323,7 +323,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut max_context = None;
     let mut embedding = EmbeddingDtype::Fp8;
     let mut lm_head = LmHeadDtype::Fp8;
-    let mut delta_state = DeltaStateMode::Bf16;
+    let mut delta_state = DeltaStateMode::Wy;
     let mut kv_cache = KvCacheDtype::Fp8;
     let mut decode_linear = DecodeLinearMode::Auto;
     let mut args = std::env::args().skip(1);
@@ -384,7 +384,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             }
             "-h" | "--help" => {
                 println!(
-                    "usage: qwc-eval --model PATH --corpus FILE [--top-k 20] [--batch 1] [--context N] [--embedding fp8|bf16] [--lm-head fp8|bf16] [--kv-cache fp8|bf16] [--decode-linear auto|w4a4] [--delta-state bf16|fp32|wy]"
+                    "usage: qwc-eval --model PATH --corpus FILE [--top-k 20] [--batch 1] [--context N] [--embedding fp8|bf16] [--lm-head fp8|bf16] [--kv-cache fp8|bf16] [--decode-linear auto|w4a4] [--delta-state wy|bf16|fp32]"
                 );
                 std::process::exit(0);
             }

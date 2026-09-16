@@ -338,7 +338,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     let mut context = 2048usize;
     let mut memory_limit = 30_000_000_000usize;
     let mut kv_cache = KvCacheDtype::Fp8;
-    let mut delta_state = DeltaStateMode::Bf16;
+    let mut delta_state = DeltaStateMode::Wy;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {

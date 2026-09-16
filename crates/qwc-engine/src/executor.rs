@@ -290,7 +290,7 @@ impl Executor {
             config,
             KvCacheDtype::Fp8,
             DecodeLinearMode::Auto,
-            DeltaStateMode::Bf16,
+            DeltaStateMode::Wy,
         )
     }
 
@@ -299,7 +299,7 @@ impl Executor {
             config,
             kv_cache_dtype,
             DecodeLinearMode::Auto,
-            DeltaStateMode::Bf16,
+            DeltaStateMode::Wy,
         )
     }
 
@@ -317,7 +317,7 @@ impl Executor {
             config,
             kv_cache_dtype,
             DecodeLinearMode::Auto,
-            DeltaStateMode::Bf16,
+            DeltaStateMode::Wy,
             Some(kv_pool_blocks),
         )
     }
@@ -524,7 +524,13 @@ impl Executor {
         let conv: usize = self.conv_pools.iter().map(DeviceBuffer::bytes).sum();
         let keys: usize = self.key_caches.iter().map(DeviceBuffer::bytes).sum();
         let values: usize = self.value_caches.iter().map(DeviceBuffer::bytes).sum();
-        state + conv + keys + values
+        // Скретч WY-скана живёт столько же, сколько состояние, и в бюджете
+        // карты весит так же — молчать о нём значит занижать отчёт.
+        let scan: usize = self
+            .delta_prefill
+            .as_ref()
+            .map_or(0, DeltaPrefillWorkspace::bytes);
+        state + conv + keys + values + scan
     }
 
     pub fn kv_pool_blocks(&self) -> usize {

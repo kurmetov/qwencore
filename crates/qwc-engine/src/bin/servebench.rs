@@ -200,7 +200,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     // sequences or many short requests without reserving 32K for each slot.
     let mut kv_cache_bytes = 5_000_000_000usize;
     let mut kv_cache = KvCacheDtype::Fp8;
-    let mut delta_state = DeltaStateMode::Bf16;
+    let mut delta_state = DeltaStateMode::Wy;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {

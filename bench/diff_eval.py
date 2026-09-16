@@ -997,8 +997,8 @@ def parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--qwc-delta-state",
-        choices=("bf16", "fp32", "wy"),
-        default="bf16",
+        choices=("wy", "bf16", "fp32"),
+        default="wy",
         help="prefill chunk scan: recurrent state precision (bf16/fp32) or the "
         "matrix WY form (wy)",
     )

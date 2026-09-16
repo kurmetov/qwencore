@@ -995,7 +995,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut memory_limit = 28_000_000_000usize;
     let mut kv_cache_bytes = 5_000_000_000usize;
     let mut kv_cache_dtype = KvCacheDtype::Fp8;
-    let mut delta_state = DeltaStateMode::Bf16;
+    let mut delta_state = DeltaStateMode::Wy;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1034,7 +1034,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                 println!(
                     "qwc serve [--model PATH] [--bind 127.0.0.1:8000] \
 [--context 32768] [--max-seqs 32] [--kv-cache fp8|bf16] [--kv-cache-gb 5] \
-[--memory-limit-gb 28] [--prefill-chunk N] [--delta-state bf16|fp32|wy] \
+[--memory-limit-gb 28] [--prefill-chunk N] [--delta-state wy|bf16|fp32] \
 [--served-model-name NAME]"
                 );
                 std::process::exit(0);
