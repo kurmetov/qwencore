@@ -507,25 +507,40 @@ __global__ __launch_bounds__(kWyChunk) void wy_factor_kernel(
 
     // Строки за длиной чанка остаются единичными: правая часть там занулена,
     // так что нули доходят до конца сами, без масок в следующих фазах.
-    // Четыре частичные суммы вместо одной: строка подстановки — цепочка
-    // зависимых FMA, и на длине 64 она упирается не в пропускную
-    // способность, а в задержку.
-    for (int row = 0; row < kWyChunk; ++row) {
-        float sum[4] = {(row == column) ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
-        int previous = 0;
-        for (; previous + 4 <= row; previous += 4) {
+    //
+    // Подстановка идёт панелями по 16 строк. Наивная форма читала из shared
+    // дважды на каждую FMA — и множитель, и уже посчитанное значение, — и
+    // упиралась в это, а не в арифметику. В панельной форме значение
+    // предыдущей строки читается один раз на шестнадцать FMA, а внутри
+    // панели вообще живёт в регистрах: обращений к shared вдвое меньше.
+    constexpr int kPanel = 16;
+    for (int panel = 0; panel < kWyChunk / kPanel; ++panel) {
+        const int base = panel * kPanel;
+        float accumulator[kPanel];
+        #pragma unroll
+        for (int index = 0; index < kPanel; ++index) {
+            accumulator[index] = (base + index == column) ? 1.0f : 0.0f;
+        }
+        for (int previous = 0; previous < base; ++previous) {
+            const float value = t[previous][column];
             #pragma unroll
-            for (int index = 0; index < 4; ++index) {
-                sum[index] -= m[row][previous + index] * t[previous + index][column];
+            for (int index = 0; index < kPanel; ++index) {
+                accumulator[index] -= m[base + index][previous] * value;
             }
         }
-        for (; previous < row; ++previous) {
-            sum[0] -= m[row][previous] * t[previous][column];
+        float solved[kPanel];
+        #pragma unroll
+        for (int index = 0; index < kPanel; ++index) {
+            float value = accumulator[index];
+            #pragma unroll
+            for (int inner = 0; inner < index; ++inner) {
+                value -= m[base + index][base + inner] * solved[inner];
+            }
+            solved[index] = value;
+            t[base + index][column] = value;
+            inverse[head_base + (size_t)(base + index) * kWyChunk + column] =
+                __float2bfloat16(value);
         }
-        const float value = (sum[0] + sum[1]) + (sum[2] + sum[3]);
-        t[row][column] = value;
-        inverse[head_base + (size_t)row * kWyChunk + column] =
-            __float2bfloat16(value);
     }
 }
 
@@ -558,7 +573,6 @@ constexpr int kKeyPad = kDk + 8;
 
 struct WyFusedShared {
     __nv_bfloat16 key[kWyChunk * kKeyPad];
-    __nv_bfloat16 query[kWyChunk * kKeyPad];
     float gamma[kWyChunk];
     float weight[kWyChunk];   // gamma_C / gamma_t — вес чанковой границы
     float decay[kWyChunk];    // beta_t * gamma_t — вклад входного состояния
@@ -655,8 +669,6 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
         __syncthreads();
         wy_stage_rows<kDk, kKeyPad>(
             key_tile + qk_base, shared.key, kWyChunk, threadIdx.x, kFusedThreads);
-        wy_stage_rows<kDk, kKeyPad>(
-            query_tile + qk_base, shared.query, kWyChunk, threadIdx.x, kFusedThreads);
         for (int token = threadIdx.x; token < kWyChunk; token += kFusedThreads) {
             const float cumulative = chunk_decay[token];
             const float value = __expf(cumulative);
@@ -754,10 +766,13 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
         for (int group = 0; group < kDk / 16; ++group) {
             #pragma unroll
             for (int mt = 0; mt < kOutRowTiles; ++mt) {
-                const __nv_bfloat16* row =
-                    shared.query + (size_t)(mt * 16 + grp) * kKeyPad + group * 16;
-                const __nv_bfloat16* row8 =
-                    shared.query + (size_t)(mt * 16 + grp + 8) * kKeyPad + group * 16;
+                // Q читается фрагментами прямо из глобальной памяти: все
+                // варпы CTA берут одни и те же элементы, их держит L1, а
+                // освободившиеся 17 КБ shared дороже этих обращений.
+                const __nv_bfloat16* row = query_tile + qk_base
+                    + (size_t)(mt * 16 + grp) * kDk + group * 16;
+                const __nv_bfloat16* row8 = query_tile + qk_base
+                    + (size_t)(mt * 16 + grp + 8) * kDk + group * 16;
                 const uint32_t a[4] = {
                     wy_pack_shared(row + pos * 2),
                     wy_pack_shared(row8 + pos * 2),
