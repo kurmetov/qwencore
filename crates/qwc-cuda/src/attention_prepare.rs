@@ -82,7 +82,7 @@ impl AttentionPreprocessor {
         cache_dtype: KvCacheDtype,
         stream: &Stream,
     ) -> Result<()> {
-        assert!((1..=1024).contains(&batch));
+        assert!((1..=crate::MAX_STEP_ROWS).contains(&batch));
         assert!(query_gate_projection.len() >= batch * NUM_ATTN_HEADS * ATTN_HEAD_DIM * 2);
         assert!(key_projection.len() >= batch * NUM_KV_HEADS * ATTN_HEAD_DIM);
         assert!(value_projection.len() >= batch * NUM_KV_HEADS * ATTN_HEAD_DIM);

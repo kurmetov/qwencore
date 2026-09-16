@@ -43,6 +43,7 @@ struct Args {
     bind: SocketAddr,
     max_context: usize,
     max_seqs: usize,
+    prefill_chunk: usize,
     memory_limit: usize,
     kv_cache_bytes: usize,
     kv_cache_dtype: KvCacheDtype,
@@ -52,6 +53,7 @@ struct WorkerConfig {
     model_path: PathBuf,
     max_context: usize,
     max_seqs: usize,
+    prefill_chunk: usize,
     memory_limit: usize,
     kv_pool_blocks: usize,
     kv_cache_dtype: KvCacheDtype,
@@ -203,6 +205,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model_path: args.model_path.clone(),
         max_context: args.max_context,
         max_seqs: args.max_seqs,
+        prefill_chunk: args.prefill_chunk,
         memory_limit: args.memory_limit,
         kv_pool_blocks,
         kv_cache_dtype: args.kv_cache_dtype,
@@ -625,7 +628,7 @@ fn initialize_worker(config: &WorkerConfig) -> Result<(Executor, ModelWeights, S
     .map_err(|error| error.to_string())?;
     let cache = CacheManager::new(config.max_seqs, config.kv_pool_blocks, PAGE_SIZE);
     let scheduler = Scheduler::new(
-        SchedulerConfig::new(config.max_seqs, PREFILL_CHUNK_SIZE),
+        SchedulerConfig::new(config.max_seqs, config.prefill_chunk),
         cache,
     );
     Ok((executor, weights, scheduler))
@@ -979,6 +982,10 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut bind = "127.0.0.1:8000".parse()?;
     let mut max_context = 32 * 1024usize;
     let mut max_seqs = 32usize;
+    // Бюджет токенов на шаг. Больше — быстрее префилл, но decode-строки ждут
+    // весь чанк: на 4096-токенных промптах 512 -> 2048 дало +22% префилла и
+    // ITL p50 66 -> 205 мс. Потолок — ёмкость арены.
+    let mut prefill_chunk = PREFILL_CHUNK_SIZE;
     let mut memory_limit = 28_000_000_000usize;
     let mut kv_cache_bytes = 5_000_000_000usize;
     let mut kv_cache_dtype = KvCacheDtype::Fp8;
@@ -990,6 +997,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--bind" => bind = args.next().ok_or("--bind")?.parse()?,
             "--context" => max_context = args.next().ok_or("--context")?.parse()?,
             "--max-seqs" => max_seqs = args.next().ok_or("--max-seqs")?.parse()?,
+            "--prefill-chunk" => {
+                prefill_chunk = args.next().ok_or("--prefill-chunk")?.parse()?
+            }
             "--memory-limit-gb" => {
                 let gb: f64 = args.next().ok_or("--memory-limit-gb")?.parse()?;
                 memory_limit = (gb * 1e9) as usize;
@@ -1020,6 +1030,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     if !(1..=qwc_engine::executor::MAX_BATCH).contains(&max_seqs) {
         return Err(format!("--max-seqs must be 1..={}", qwc_engine::executor::MAX_BATCH).into());
     }
+    if !(1..=PREFILL_CHUNK_SIZE).contains(&prefill_chunk) {
+        return Err(format!("--prefill-chunk must be 1..={PREFILL_CHUNK_SIZE}").into());
+    }
     if memory_limit == 0 || kv_cache_bytes == 0 {
         return Err("memory limits must be positive".into());
     }
@@ -1036,6 +1049,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         bind,
         max_context,
         max_seqs,
+        prefill_chunk,
         memory_limit,
         kv_cache_bytes,
         kv_cache_dtype,

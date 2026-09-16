@@ -7,6 +7,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "limits.cuh"
 
 namespace {
 
@@ -132,7 +133,7 @@ extern "C" cudaError_t qwc_nvfp4_quantize_bf16(
     float global_scale,
     cudaStream_t stream) {
   if (input == nullptr || packed == nullptr || scales == nullptr || batch <= 0 ||
-      batch > 1024 || in_features <= 0 || in_features % 256 != 0 ||
+      batch > qwc::kMaxStepRows || in_features <= 0 || in_features % 256 != 0 ||
       !isfinite(global_scale) || global_scale <= 0.0f) {
     return cudaErrorInvalidValue;
   }

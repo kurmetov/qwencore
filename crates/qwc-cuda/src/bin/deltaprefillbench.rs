@@ -8,15 +8,20 @@
 
 use qwc_core::arch::NUM_LINEAR_LAYERS;
 use qwc_cuda::delta_net::{
-    self, DeltaInputs, DeltaStateMode, GATE_ELEMS, KQ_ELEMS, QK_ELEMS, STATE_ELEMS, V_ELEMS,
+    self, DeltaInputs, DeltaPrefillWorkspace, DeltaStateMode, GATE_ELEMS, KQ_ELEMS,
+    QK_ELEMS, STATE_ELEMS, V_ELEMS,
 };
 use qwc_cuda::{Device, DeviceBuffer, Event, Stream, bf16};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     Device::init(0)?;
     let stream = Stream::new()?;
+    let wy = std::env::args().skip(1).any(|argument| argument == "--wy");
 
-    println!("Gated DeltaNet, chunk-скан prefill (одна последовательность, слот 0)\n");
+    println!(
+        "Gated DeltaNet, {} prefill (одна последовательность, слот 0)\n",
+        if wy { "WY-скан" } else { "рекуррентный скан" },
+    );
     println!(
         "  {:>6} | {:>10} | {:>11} | {:>10} | {:>9}",
         "токенов", "на слой", "48 слоёв", "на токен", "токен/с"
@@ -51,13 +56,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             beta: &beta,
             kq: &kq,
         };
+        let mut workspace = DeltaPrefillWorkspace::new()?;
 
         let mut scan = |states: &mut Vec<DeviceBuffer<u16>>| -> Result<(), Box<dyn std::error::Error>> {
             for s in states.iter_mut() {
-                delta_net::prefill_slot(
-                    s, &inputs, &mut out, 1, 0, tokens, 0,
-                    DeltaStateMode::Bf16, &stream,
-                )?;
+                if wy {
+                    delta_net::prefill_slot_wy(
+                        s, &inputs, &mut out, &mut workspace,
+                        1, 0, tokens, 0, &stream,
+                    )?;
+                } else {
+                    delta_net::prefill_slot(
+                        s, &inputs, &mut out, 1, 0, tokens, 0,
+                        DeltaStateMode::Fp32, &stream,
+                    )?;
+                }
             }
             Ok(())
         };

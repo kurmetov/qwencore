@@ -4,6 +4,14 @@
 //! сборки, а часть специализации: кернелы пишутся под 99 KB shared memory,
 //! 170 SM и block-scaled MMA для NVFP4, и на другом железе смысла не имеют.
 
+/// Потолок строк одного шага движка: ёмкость арены префилла.
+///
+/// Кернелы шага растут по строкам линейно, поэтому это не их предел, а
+/// договорённость о размере арены — та же, что `kMaxStepRows` в `limits.cuh`
+/// и `PREFILL_CHUNK_SIZE` в движке. Построчный decode считает свои строки
+/// отдельно: см. `paged_attention::MAX_DECODE_ROWS`.
+pub const MAX_STEP_ROWS: usize = 2048;
+
 pub mod attention_prepare;
 pub mod bandwidth;
 pub mod bf16;

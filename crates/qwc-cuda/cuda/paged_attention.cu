@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <stdint.h>
+#include "limits.cuh"
 
 namespace {
 
@@ -389,6 +390,352 @@ __global__ __launch_bounds__(kThreads) void paged_attention_prefill_kernel(
   }
 }
 
+// Causal prefill на тензорных ядрах.
+//
+// Построчные ядра — и decode-, и тайловое — считают QK^T и PV варповыми
+// редукциями: на пару (строка, токен) приходится шесть проходов по бабочке, и
+// фаза упирается в выдачу инструкций, а не в память. Здесь обе матрицы идут
+// через mma.m16n8k16, то есть одна инструкция на 16x8x16.
+//
+// CTA — четыре варпа, тайл из kMmaRows строк запроса одной головы группы.
+// KV-тайл кладётся в shared: K как [токен][dim], V транспонированно
+// [dim][токен]. Так у обоих операндов B соседние по k элементы лежат рядом и
+// фрагмент читается одним 32-битным словом.
+//
+// Тайл строк обязан принадлежать одной последовательности: таблица страниц
+// берётся у первой строки тайла. Для чанка префилла это так по построению.
+constexpr int kMmaWarps = 4;
+constexpr int kMmaThreads = kMmaWarps * 32;
+constexpr int kMmaRows = 16;                              // M
+constexpr int kMmaKeys = 32;                              // KV-тайл
+constexpr int kMmaDimPerWarp = kHeadDim / kMmaWarps;      // 64
+constexpr int kMmaTilesPerWarp = kMmaDimPerWarp / 8;      // 8 n-тайлов
+// Фрагмент читается дорожкой по адресу (grp * ряд + pos * 2): без набивки
+// grp уходит кратно 32 банкам и весь варп садится на четыре банка. Набивка
+// делает шаг ряда нечётным в банках и разводит дорожки по всем 32.
+constexpr int kRowPad = kHeadDim + 8;     // ряд q_tile, k_tile и v_tile
+constexpr int kProbPad = kMmaKeys + 8;    // ряд p_tile
+// Сколько элементов кладёт в shared один поток за раз. Поэлементная укладка
+// KV стоила больше инструкций, чем все MMA тайла вместе взятые.
+constexpr int kStageVector = 8;
+// Сколько голов группы обслуживает одна CTA на общем KV-тайле. kGroup = 6,
+// поэтому делители: 1, 2, 3, 6.
+constexpr int kMmaGroups = 1;
+// Блоков на SM, которые ptxas обязан уместить. Без этого числа он при
+// динамической shared считает, что блоков влезет много, и экономит регистры
+// в ущерб параллелизму инструкций.
+constexpr int kMmaBlocksPerSm = 2;
+
+// Раскладка shared одним типом: смещения полей — константы, и доступ
+// компилируется так же, как к статическим массивам.
+struct MmaShared {
+  __nv_bfloat16 query[kMmaGroups * kMmaRows * kRowPad];
+  __nv_bfloat16 key[kMmaKeys * kRowPad];
+  __nv_bfloat16 value[kMmaKeys * kRowPad];
+  __nv_bfloat16 probability[kMmaGroups * kMmaRows * kProbPad];
+  float score[kMmaGroups * kMmaRows * kMmaKeys];
+  float row_max[kMmaGroups * kMmaRows];
+  float row_sum[kMmaGroups * kMmaRows];
+  float row_scale[kMmaGroups * kMmaRows];
+  int row_context[kMmaRows];
+};
+
+constexpr size_t mma_shared_bytes() {
+  return sizeof(MmaShared);
+}
+
+__device__ __forceinline__ uint32_t pack_bf16(const __nv_bfloat16* source) {
+  return *reinterpret_cast<const uint32_t*>(source);
+}
+
+__device__ __forceinline__ uint32_t pack_pair(
+    __nv_bfloat16 low, __nv_bfloat16 high) {
+  return static_cast<uint32_t>(*reinterpret_cast<uint16_t*>(&low)) |
+         (static_cast<uint32_t>(*reinterpret_cast<uint16_t*>(&high)) << 16);
+}
+
+__device__ __forceinline__ void mma_m16n8k16(
+    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+template <bool Bf16Cache>
+// Второй аргумент обязателен: shared здесь динамическая, её размер ptxas на
+// этапе компиляции не видит, решает что блоков влезет много и экономит
+// регистры — теряя параллелизм инструкций. Блоков на SM всё равно не больше
+// двух-трёх, и бюджет регистров надо назвать явно.
+__global__ __launch_bounds__(kMmaThreads, kMmaBlocksPerSm) void paged_attention_prefill_mma_kernel(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ query_gate_projection,
+    const void* __restrict__ key_cache,
+    const void* __restrict__ value_cache,
+    const uint32_t* __restrict__ block_tables,
+    const uint32_t* __restrict__ context_lengths,
+    __nv_bfloat16* __restrict__ output,
+    int max_blocks,
+    int rows,
+    int row_base,
+    float softmax_scale) {
+  const int kv_head = blockIdx.x;
+  const int tile = blockIdx.y;
+  const int head_base = blockIdx.z * kMmaGroups;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  // Раскладка фрагментов m16n8k16: дорожка держит строки grp и grp+8, а по
+  // столбцам — пару, начинающуюся с pos*2.
+  const int grp = lane >> 2;
+  const int pos = lane & 3;
+
+  const int tile_first = tile * kMmaRows;
+  const int tile_rows = min(kMmaRows, rows - tile_first);
+  if (tile_rows <= 0) {
+    return;
+  }
+
+  // Shared динамическая: при kMmaGroups > 1 раскладка уже не влезает в
+  // статические 48 КБ на блок. Разложена структурой, а не указательной
+  // арифметикой: так смещения остаются константами времени компиляции, а
+  // выравнивание — видимым компилятору.
+  extern __shared__ __align__(16) char mma_shared[];
+  MmaShared& shared = *reinterpret_cast<MmaShared*>(mma_shared);
+  __nv_bfloat16* const q_tile = shared.query;
+  __nv_bfloat16* const k_tile = shared.key;
+  __nv_bfloat16* const v_tile = shared.value;
+  __nv_bfloat16* const p_tile = shared.probability;
+  float* const s_tile = shared.score;
+  float* const row_max = shared.row_max;
+  float* const row_sum = shared.row_sum;
+  float* const row_scale = shared.row_scale;
+  int* const row_context = shared.row_context;
+
+  for (int i = threadIdx.x; i < kMmaGroups * kMmaRows * kHeadDim;
+       i += kMmaThreads) {
+    const int dimension = i % kHeadDim;
+    const int slot = i / kHeadDim;
+    const int r = slot % kMmaRows;
+    const int g = slot / kMmaRows;
+    __nv_bfloat16 value = __float2bfloat16(0.0f);
+    if (r < tile_rows) {
+      const size_t base =
+          (static_cast<size_t>(row_base + tile_first + r) * kQueryHeads +
+           kv_head * kGroup + head_base + g) * kHeadDim;
+      value = query[base + dimension];
+    }
+    q_tile[slot * kRowPad + dimension] = value;
+  }
+  for (int i = threadIdx.x; i < kMmaGroups * kMmaRows; i += kMmaThreads) {
+    row_max[i] = -CUDART_INF_F;
+    row_sum[i] = 0.0f;
+  }
+  if (threadIdx.x < kMmaRows) {
+    const int r = threadIdx.x;
+    row_context[r] = r < tile_rows
+        ? static_cast<int>(context_lengths[row_base + tile_first + r])
+        : 0;
+  }
+  __syncthreads();
+
+  int max_context = 0;
+#pragma unroll
+  for (int r = 0; r < kMmaRows; ++r) {
+    max_context = max(max_context, row_context[r]);
+  }
+
+  // Таблица страниц общая на тайл: строки чанка принадлежат одной
+  // последовательности.
+  const uint32_t* table =
+      block_tables + static_cast<size_t>(row_base + tile_first) * max_blocks;
+
+  float accumulator[kMmaGroups][kMmaTilesPerWarp][4];
+#pragma unroll
+  for (int g = 0; g < kMmaGroups; ++g) {
+#pragma unroll
+    for (int t = 0; t < kMmaTilesPerWarp; ++t) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        accumulator[g][t][i] = 0.0f;
+      }
+    }
+  }
+
+  for (int key_base = 0; key_base < max_context; key_base += kMmaKeys) {
+    __syncthreads();
+    // Уложенный тайл обслуживает все kMmaGroups голов группы: раньше его
+    // грузила каждая из шести CTA по отдельности, и это и была основная
+    // статья расхода ядра.
+    for (int i = threadIdx.x * kStageVector; i < kMmaKeys * kHeadDim;
+         i += kMmaThreads * kStageVector) {
+      const int key = i / kHeadDim;
+      const int dimension = i - key * kHeadDim;
+      const int token = key_base + key;
+      if (token < max_context) {
+        const uint32_t block = table[token / kPageSize];
+        const size_t offset =
+            cache_offset(block, kv_head, token % kPageSize, dimension);
+#pragma unroll
+        for (int e = 0; e < kStageVector; ++e) {
+          k_tile[key * kRowPad + dimension + e] = __float2bfloat16(
+              cache_to_float<Bf16Cache>(key_cache, offset + e));
+          v_tile[key * kRowPad + dimension + e] = __float2bfloat16(
+              cache_to_float<Bf16Cache>(value_cache, offset + e));
+        }
+      } else {
+#pragma unroll
+        for (int e = 0; e < kStageVector; ++e) {
+          k_tile[key * kRowPad + dimension + e] = __float2bfloat16(0.0f);
+          v_tile[key * kRowPad + dimension + e] = __float2bfloat16(0.0f);
+        }
+      }
+    }
+    __syncthreads();
+
+    // QK^T: варп берёт свои восемь ключей тайла и проходит весь head_dim.
+    const int key_column = warp * 8;
+#pragma unroll
+    for (int g = 0; g < kMmaGroups; ++g) {
+      float scores[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      // Смещения в shared считаются 32-битными: size_t уводит адресацию в
+      // обобщённое пространство, а это уже не дешёвый shared-доступ.
+      const int q_base = g * kMmaRows * kRowPad;
+      for (int k0 = 0; k0 < kHeadDim; k0 += 16) {
+        uint32_t a[4];
+        uint32_t b[2];
+        a[0] = pack_bf16(&q_tile[q_base + grp * kRowPad + k0 + pos * 2]);
+        a[1] = pack_bf16(&q_tile[q_base + (grp + 8) * kRowPad + k0 + pos * 2]);
+        a[2] = pack_bf16(&q_tile[q_base + grp * kRowPad + k0 + pos * 2 + 8]);
+        a[3] = pack_bf16(&q_tile[q_base + (grp + 8) * kRowPad + k0 + pos * 2 + 8]);
+        b[0] = pack_bf16(&k_tile[(key_column + grp) * kRowPad + k0 + pos * 2]);
+        b[1] = pack_bf16(&k_tile[(key_column + grp) * kRowPad + k0 + pos * 2 + 8]);
+        mma_m16n8k16(scores, a, b);
+      }
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int r = grp + (i >= 2 ? 8 : 0);
+        const int column = key_column + pos * 2 + (i & 1);
+        const int token = key_base + column;
+        s_tile[(g * kMmaRows + r) * kMmaKeys + column] =
+            token < row_context[r] ? scores[i] * softmax_scale : -CUDART_INF_F;
+      }
+    }
+    __syncthreads();
+
+    // Строка достаётся восьми соседним дорожкам: максимум и сумма сходятся
+    // бабочкой внутри восьмёрки, а не последовательным проходом одного потока.
+    for (int slot = threadIdx.x >> 3; slot < kMmaGroups * kMmaRows;
+         slot += kMmaThreads / 8) {
+      const int part = threadIdx.x & 7;
+      const int score_base = slot * kMmaKeys;
+      float local_max = -CUDART_INF_F;
+#pragma unroll
+      for (int c = part; c < kMmaKeys; c += 8) {
+        local_max = fmaxf(local_max, s_tile[score_base + c]);
+      }
+#pragma unroll
+      for (int offset = 4; offset > 0; offset >>= 1) {
+        local_max =
+            fmaxf(local_max, __shfl_xor_sync(0xffffffffu, local_max, offset));
+      }
+      const float merged = fmaxf(row_max[slot], local_max);
+      // Строки внутри варпа расходятся по этому условию, поэтому ветка не
+      // должна содержать шаффл: маска 0xffffffff требует всех дорожек.
+      const bool empty = merged == -CUDART_INF_F;
+      float local_sum = 0.0f;
+#pragma unroll
+      for (int c = part; c < kMmaKeys; c += 8) {
+        float weight = 0.0f;
+        if (!empty) {
+          const float score = s_tile[score_base + c];
+          weight = score == -CUDART_INF_F ? 0.0f : __expf(score - merged);
+        }
+        p_tile[slot * kProbPad + c] = __float2bfloat16(weight);
+        local_sum += weight;
+      }
+#pragma unroll
+      for (int offset = 4; offset > 0; offset >>= 1) {
+        local_sum += __shfl_xor_sync(0xffffffffu, local_sum, offset);
+      }
+      if (part == 0) {
+        if (empty) {
+          row_scale[slot] = 1.0f;
+        } else {
+          const float correction = row_max[slot] == -CUDART_INF_F
+              ? 0.0f
+              : __expf(row_max[slot] - merged);
+          row_sum[slot] = row_sum[slot] * correction + local_sum;
+          row_max[slot] = merged;
+          row_scale[slot] = correction;
+        }
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int g = 0; g < kMmaGroups; ++g) {
+      // Перенос онлайн-softmax на накопитель: дорожка держит grp и grp+8.
+      const float scale_low = row_scale[g * kMmaRows + grp];
+      const float scale_high = row_scale[g * kMmaRows + grp + 8];
+#pragma unroll
+      for (int t = 0; t < kMmaTilesPerWarp; ++t) {
+        accumulator[g][t][0] *= scale_low;
+        accumulator[g][t][1] *= scale_low;
+        accumulator[g][t][2] *= scale_high;
+        accumulator[g][t][3] *= scale_high;
+      }
+      // PV: варп владеет своей четвертью head_dim.
+      const int p_base = g * kMmaRows * kProbPad;
+#pragma unroll
+      for (int t = 0; t < kMmaTilesPerWarp; ++t) {
+        const int dimension_column = warp * kMmaDimPerWarp + t * 8;
+        for (int k0 = 0; k0 < kMmaKeys; k0 += 16) {
+          uint32_t a[4];
+          uint32_t b[2];
+          a[0] = pack_bf16(&p_tile[p_base + grp * kProbPad + k0 + pos * 2]);
+          a[1] = pack_bf16(&p_tile[p_base + (grp + 8) * kProbPad + k0 + pos * 2]);
+          a[2] = pack_bf16(&p_tile[p_base + grp * kProbPad + k0 + pos * 2 + 8]);
+          a[3] = pack_bf16(&p_tile[p_base + (grp + 8) * kProbPad + k0 + pos * 2 + 8]);
+          const int dimension = dimension_column + grp;
+          b[0] = pack_pair(v_tile[(k0 + pos * 2) * kRowPad + dimension],
+                           v_tile[(k0 + pos * 2 + 1) * kRowPad + dimension]);
+          b[1] = pack_pair(v_tile[(k0 + pos * 2 + 8) * kRowPad + dimension],
+                           v_tile[(k0 + pos * 2 + 9) * kRowPad + dimension]);
+          mma_m16n8k16(accumulator[g][t], a, b);
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int g = 0; g < kMmaGroups; ++g) {
+    const int query_head = kv_head * kGroup + head_base + g;
+#pragma unroll
+    for (int t = 0; t < kMmaTilesPerWarp; ++t) {
+      const int dimension_base = warp * kMmaDimPerWarp + t * 8 + pos * 2;
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int r = grp + (i >= 2 ? 8 : 0);
+        if (r >= tile_rows) {
+          continue;
+        }
+        const int dimension = dimension_base + (i & 1);
+        const int batch_row = row_base + tile_first + r;
+        const float denominator = row_sum[g * kMmaRows + r];
+        const float value =
+            denominator > 0.0f ? accumulator[g][t][i] / denominator : 0.0f;
+        const size_t offset =
+            (static_cast<size_t>(batch_row) * kQueryHeads + query_head) *
+                kHeadDim + dimension;
+        output[offset] = __float2bfloat16(
+            value * output_gate(
+                        query_gate_projection, batch_row, query_head, dimension));
+      }
+    }
+  }
+}
+
 // Higher-occupancy alternative: one CTA per query head. It rereads the KV
 // head for every member of a GQA group, but uses far fewer registers and only
 // ~9 KiB shared memory. This wins for shapes where parallelism is scarcer than
@@ -599,7 +946,7 @@ cudaError_t validate(
     float softmax_scale) {
   if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
       block_tables == nullptr || context_lengths == nullptr || output == nullptr ||
-      batch <= 0 || batch > 1024 || max_blocks <= 0 || partitions <= 0 ||
+      batch <= 0 || batch > qwc::kMaxDecodeRows || max_blocks <= 0 || partitions <= 0 ||
       !isfinite(softmax_scale) || softmax_scale <= 0.0f) {
     return cudaErrorInvalidValue;
   }
@@ -747,7 +1094,94 @@ cudaError_t launch_prefill_attention(
   return cudaGetLastError();
 }
 
+template <bool Bf16Cache>
+cudaError_t launch_prefill_attention_mma(
+    const void* query,
+    const void* query_gate_projection,
+    const void* key_cache,
+    const void* value_cache,
+    const void* block_tables,
+    const void* context_lengths,
+    void* output,
+    int rows,
+    int row_base,
+    int max_blocks,
+    float softmax_scale,
+    cudaStream_t stream) {
+  if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
+      block_tables == nullptr || context_lengths == nullptr ||
+      output == nullptr || rows <= 0 || row_base < 0 || max_blocks <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  static_assert(kGroup % kMmaGroups == 0, "головы группы делятся между CTA");
+  const size_t shared = mma_shared_bytes();
+  if (shared > 48u * 1024u) {
+    // Динамическая shared сверх 48 КБ доступна только по явному запросу.
+    const cudaError_t opted = cudaFuncSetAttribute(
+        paged_attention_prefill_mma_kernel<Bf16Cache>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shared));
+    if (opted != cudaSuccess) {
+      return opted;
+    }
+  }
+  const dim3 grid(
+      kKvHeads, (rows + kMmaRows - 1) / kMmaRows, kGroup / kMmaGroups);
+  paged_attention_prefill_mma_kernel<Bf16Cache>
+      <<<grid, kMmaThreads, shared, stream>>>(
+          static_cast<const __nv_bfloat16*>(query),
+          static_cast<const __nv_bfloat16*>(query_gate_projection),
+          key_cache,
+          value_cache,
+          static_cast<const uint32_t*>(block_tables),
+          static_cast<const uint32_t*>(context_lengths),
+          static_cast<__nv_bfloat16*>(output),
+          max_blocks,
+          rows,
+          row_base,
+          softmax_scale);
+  return cudaGetLastError();
+}
+
 }  // namespace
+
+extern "C" cudaError_t qwc_paged_attention_prefill_mma_bf16(
+    const void* query,
+    const void* query_gate_projection,
+    const void* key_cache,
+    const void* value_cache,
+    const void* block_tables,
+    const void* context_lengths,
+    void* output,
+    int rows,
+    int row_base,
+    int max_blocks,
+    float softmax_scale,
+    cudaStream_t stream) {
+  return launch_prefill_attention_mma<true>(
+      query, query_gate_projection, key_cache, value_cache, block_tables,
+      context_lengths, output, rows, row_base, max_blocks, softmax_scale,
+      stream);
+}
+
+extern "C" cudaError_t qwc_paged_attention_prefill_mma_fp8(
+    const void* query,
+    const void* query_gate_projection,
+    const void* key_cache,
+    const void* value_cache,
+    const void* block_tables,
+    const void* context_lengths,
+    void* output,
+    int rows,
+    int row_base,
+    int max_blocks,
+    float softmax_scale,
+    cudaStream_t stream) {
+  return launch_prefill_attention_mma<false>(
+      query, query_gate_projection, key_cache, value_cache, block_tables,
+      context_lengths, output, rows, row_base, max_blocks, softmax_scale,
+      stream);
+}
 
 extern "C" cudaError_t qwc_paged_attention_prefill_bf16(
     const void* query,

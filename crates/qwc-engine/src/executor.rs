@@ -12,7 +12,8 @@ use crate::weights::{
 };
 use qwc_core::arch::*;
 use qwc_cuda::delta_net::{
-    self, CONV_STATE_ELEMS, DeltaStateMode, PreparedDelta, RowView, STATE_ELEMS, V_ELEMS,
+    self, CONV_STATE_ELEMS, DeltaStateMode, PreparedDelta, RowView,
+    STATE_ELEMS, V_ELEMS,
 };
 use qwc_cuda::graph::CudaGraph;
 use qwc_cuda::nvfp4::{self, QuantizedActivation, W4A4Workspace};
@@ -27,12 +28,25 @@ use qwc_runtime::BatchLayout;
 /// DeltaNet state plus KV cache at ctx 2048, so 64 slots need ~9.5 GB on top
 /// of the 16.25 GB of weights. The decode kernels themselves accept 128.
 pub const MAX_BATCH: usize = 96;
-/// Fixed tensor-core M dimension used by chunked prefill.
+/// Fixed tensor-core M dimension used by chunked prefill. Это ёмкость арены:
+/// планировщику можно выдать бюджет меньше, но не больше.
 ///
 /// Every engine step reads all 16.25 GB of weights regardless of how many
 /// tokens it carries, so a small chunk makes prefill pay that read over and
-/// over. 512 quarters the number of prefill steps against the previous 128.
-pub const PREFILL_CHUNK_SIZE: usize = 512;
+/// over. Но упирается всё не в вес чтения, а в форму: W4A4 на M=511 идёт на
+/// 1097 TFLOP/s, на M=2048 — на 1350, а внимание на большом тайле реже
+/// перечитывает KV. Замер на формах модели (`prefillgemmbench`,
+/// `prefillattnbench`, промпт 4096):
+///
+/// | чанк | проекции | внимание |
+/// |---|---:|---:|
+/// | 512 | 44.1 мкс/токен | 23.3 мкс/токен |
+/// | 1024 | 38.8 | 19.7 |
+/// | 2048 | 35.8 | 17.2 |
+///
+/// Плата — гранулярность шага: decode-строка ждёт весь чанк, поэтому 2048 это
+/// потолок, а не обязательный бюджет.
+pub const PREFILL_CHUNK_SIZE: usize = qwc_cuda::MAX_STEP_ROWS;
 
 /// One sequence's slice of a fused step.
 ///
@@ -236,7 +250,13 @@ impl PrefillBuffers {
             block_offsets: DeviceBuffer::zeroed(rows)?,
             block_tables: DeviceBuffer::from_slice(&tables)?,
             context_lengths: DeviceBuffer::zeroed(rows)?,
-            attention_workspace: PagedAttentionWorkspace::new(rows, max_context)?,
+            // Workspace обслуживает только строки decode, а их в шаге не
+            // больше, чем последовательностей: разметка партиций рассчитана
+            // на MAX_DECODE_ROWS.
+            attention_workspace: PagedAttentionWorkspace::new(
+                rows.min(paged_attention::MAX_DECODE_ROWS),
+                max_context,
+            )?,
             tokens: DeviceBuffer::zeroed(rows)?,
             last_rows: DeviceBuffer::zeroed(MAX_BATCH)?,
             last_hidden: DeviceBuffer::zeroed(MAX_BATCH * HIDDEN_SIZE)?,
@@ -1085,23 +1105,47 @@ impl Executor {
                         self.kv_cache_dtype,
                         &self.stream,
                     )?;
-                    mark!("attn.decode");
-                    paged_attention::decode_gated(
-                        &prefill.query,
-                        &prefill.query_gate,
-                        &self.key_caches[full_layer],
-                        &self.value_caches[full_layer],
-                        blocks,
-                        &prefill.block_tables,
-                        &prefill.context_lengths,
-                        self.max_blocks,
-                        &mut prefill.attention_out,
-                        &mut prefill.attention_workspace,
-                        live,
-                        max_context,
-                        self.kv_cache_dtype,
-                        &self.stream,
-                    )?;
+                    // Строки decode идут построчным ядром, чанки префилла —
+                    // ядром на тензорных ядрах. Чанк вызывается отдельно:
+                    // тайл запросов не имеет права пересекать границу
+                    // последовательности, у него одна таблица страниц на тайл.
+                    if decode_rows > 0 {
+                        mark!("attn.decode");
+                        paged_attention::decode_gated(
+                            &prefill.query,
+                            &prefill.query_gate,
+                            &self.key_caches[full_layer],
+                            &self.value_caches[full_layer],
+                            blocks,
+                            &prefill.block_tables,
+                            &prefill.context_lengths,
+                            self.max_blocks,
+                            &mut prefill.attention_out,
+                            &mut prefill.attention_workspace,
+                            decode_rows,
+                            max_context,
+                            self.kv_cache_dtype,
+                            &self.stream,
+                        )?;
+                    }
+                    mark!("attn.prefill");
+                    for segment in &segments[decode_rows..] {
+                        paged_attention::prefill_gated_mma(
+                            &prefill.query,
+                            &prefill.query_gate,
+                            &self.key_caches[full_layer],
+                            &self.value_caches[full_layer],
+                            blocks,
+                            &prefill.block_tables,
+                            &prefill.context_lengths,
+                            self.max_blocks,
+                            &mut prefill.attention_out,
+                            segment.tokens,
+                            segment.row_begin,
+                            self.kv_cache_dtype,
+                            &self.stream,
+                        )?;
+                    }
                     mark!("gemm.attn_out");
                     project_w4a4(
                         &mixer.o,

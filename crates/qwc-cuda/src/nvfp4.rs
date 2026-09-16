@@ -10,7 +10,9 @@ use crate::{DeviceBuffer, Stream, bf16, ffi};
 pub const GROUP_SIZE: usize = 16;
 pub const MAX_W4A16_BATCH: usize = 4;
 pub const MAX_W4A4_BATCH: usize = 128;
-pub const MAX_W4A4_ROWS: usize = 1024;
+/// Потолок строк одного W4A4-вызова: ёмкость арены префилла
+/// (`PREFILL_CHUNK_SIZE`). Ограничение не кернела, а разметки буферов.
+pub const MAX_W4A4_ROWS: usize = crate::MAX_STEP_ROWS;
 const K_ALIGNMENT: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,6 +7,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "limits.cuh"
 
 namespace {
 
@@ -331,7 +332,7 @@ extern "C" cudaError_t qwc_delta_prepare_prefill(
       conv_state == nullptr || query == nullptr || key == nullptr || value == nullptr ||
       alpha == nullptr || beta == nullptr || kq == nullptr ||
       state_capacity <= 0 || state_slot < 0 ||
-      state_slot >= state_capacity || tokens <= 0 || tokens > 1024 ||
+      state_slot >= state_capacity || tokens <= 0 || tokens > qwc::kMaxStepRows ||
       row_offset < 0 || mixed_stride < kChannels || gate_stride < kVHeads) {
     return cudaErrorInvalidValue;
   }

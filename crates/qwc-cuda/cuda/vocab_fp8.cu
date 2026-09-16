@@ -354,6 +354,108 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_kernel(
   }
 }
 
+constexpr int kMmaK = 32;
+constexpr int kMmaRows = 128;
+constexpr int kMmaWarps = kThreads / kWarpSize;
+
+__device__ __forceinline__ uint32_t pack_bf16_pair(
+    const __nv_bfloat16* source) {
+  return *reinterpret_cast<const uint32_t*>(source);
+}
+
+__device__ __forceinline__ void mma_m16n8k16(
+    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+        "r"(b[0]), "r"(b[1]));
+}
+
+// Tensor-core path for the wide decode batch.  The checkpoint keeps weights
+// in row-scaled E4M3 while activations are BF16, so each 128x32 weight tile is
+// converted to BF16 in shared memory and then reused by all batch columns.
+// One warp owns 16 vocabulary rows; every MMA covers another eight requests.
+template <int BATCH_TILE>
+__global__ __launch_bounds__(kThreads) void lm_head_batched_mma_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ row_scales,
+    const __nv_bfloat16* __restrict__ hidden,
+    float* __restrict__ logits,
+    int hidden_size,
+    int vocab,
+    int batch) {
+  static_assert(BATCH_TILE % 8 == 0);
+  constexpr int kBatchTiles = BATCH_TILE / 8;
+  __shared__ __nv_bfloat16 weight_tile[kMmaRows][kMmaK];
+  __shared__ __nv_bfloat16 hidden_tile[BATCH_TILE][kMmaK];
+
+  const int row_block = blockIdx.x * kMmaRows;
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  const int group = lane / 4;
+  const int position = lane % 4;
+  const int warp_row = warp * 16;
+  float accumulator[kBatchTiles][4] = {};
+
+  for (int base = 0; base < hidden_size; base += kMmaK) {
+    const int width = min(kMmaK, hidden_size - base);
+    for (int index = threadIdx.x; index < kMmaRows * kMmaK;
+         index += kThreads) {
+      const int row = index / kMmaK;
+      const int column = index % kMmaK;
+      float value = 0.0f;
+      if (row_block + row < vocab && column < width) {
+        value = fp8_to_float(weights[
+            static_cast<size_t>(row_block + row) * hidden_size + base + column]);
+      }
+      weight_tile[row][column] = __float2bfloat16(value);
+    }
+    for (int index = threadIdx.x; index < BATCH_TILE * kMmaK;
+         index += kThreads) {
+      const int column_batch = index / kMmaK;
+      const int column = index % kMmaK;
+      __nv_bfloat16 value = __float2bfloat16(0.0f);
+      if (column_batch < batch && column < width) {
+        value = hidden[static_cast<size_t>(column_batch) * hidden_size + base + column];
+      }
+      hidden_tile[column_batch][column] = value;
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int k0 = 0; k0 < kMmaK; k0 += 16) {
+      uint32_t af[4];
+      af[0] = pack_bf16_pair(&weight_tile[warp_row + group][k0 + position * 2]);
+      af[1] = pack_bf16_pair(&weight_tile[warp_row + group + 8][k0 + position * 2]);
+      af[2] = pack_bf16_pair(&weight_tile[warp_row + group][k0 + position * 2 + 8]);
+      af[3] = pack_bf16_pair(&weight_tile[warp_row + group + 8][k0 + position * 2 + 8]);
+#pragma unroll
+      for (int tile = 0; tile < kBatchTiles; ++tile) {
+        uint32_t bf[2];
+        bf[0] = pack_bf16_pair(&hidden_tile[tile * 8 + group][k0 + position * 2]);
+        bf[1] = pack_bf16_pair(&hidden_tile[tile * 8 + group][k0 + position * 2 + 8]);
+        mma_m16n8k16(accumulator[tile], af, bf);
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int tile = 0; tile < kBatchTiles; ++tile) {
+#pragma unroll
+    for (int index = 0; index < 4; ++index) {
+      const int row = row_block + warp_row + group + (index >= 2 ? 8 : 0);
+      const int column_batch = tile * 8 + position * 2 + (index & 1);
+      if (row < vocab && column_batch < batch) {
+        logits[static_cast<size_t>(column_batch) * vocab + row] =
+            accumulator[tile][index] * row_scales[row];
+      }
+    }
+  }
+}
+
 // Diagnostic path over the checkpoint's original BF16 lm_head. It deliberately
 // mirrors the FP8 launch geometry so an A/B run changes weight storage and
 // dequantization, not the surrounding executor.
@@ -578,7 +680,7 @@ extern "C" cudaError_t qwc_fp8_lm_head_batched(
   switch ((batch + kBatchTileStep - 1) / kBatchTileStep) {
 #define QWC_LM_HEAD_TILE(n)                                                  \
   case (n) / kBatchTileStep:                                                 \
-    lm_head_batched_kernel<n><<<blocks, kThreads, 0, stream>>>(              \
+    lm_head_batched_mma_kernel<n><<<blocks, kThreads, 0, stream>>>(          \
         w, s, h, out, hidden_size, vocab, batch);                            \
     break;
     QWC_LM_HEAD_TILE(16)

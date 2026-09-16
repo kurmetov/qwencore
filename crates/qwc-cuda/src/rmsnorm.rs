@@ -90,7 +90,7 @@ impl RmsNorm {
     }
 
     fn assert_io(&self, input: &DeviceBuffer<u16>, output_len: usize, batch: usize) {
-        assert!((1..=1024).contains(&batch));
+        assert!((1..=crate::MAX_STEP_ROWS).contains(&batch));
         assert!(input.len() >= batch * self.hidden);
         assert!(output_len >= batch * self.hidden);
     }

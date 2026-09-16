@@ -23,6 +23,7 @@ struct Args {
     prompt_tokens: usize,
     max_new: usize,
     context: usize,
+    prefill_chunk: usize,
     memory_limit: usize,
     kv_cache_bytes: usize,
     kv_cache: KvCacheDtype,
@@ -64,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         qwc_cuda::paged_attention::PAGE_SIZE,
     );
     let mut scheduler = Scheduler::new(
-        SchedulerConfig::new(args.concurrency, PREFILL_CHUNK_SIZE),
+        SchedulerConfig::new(args.concurrency, args.prefill_chunk),
         cache,
     );
 
@@ -187,6 +188,8 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     let mut prompt_tokens = 256usize;
     let mut max_new = 128usize;
     let mut context = 2048usize;
+    // Бюджет токенов на шаг; потолок — ёмкость арены префилла.
+    let mut prefill_chunk = PREFILL_CHUNK_SIZE;
     let mut memory_limit = 28_000_000_000usize;
     // Physical pages are shared. Five GB is enough for four full 32K
     // sequences or many short requests without reserving 32K for each slot.
@@ -201,6 +204,9 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--prompt-tokens" => prompt_tokens = args.next().ok_or("--prompt-tokens")?.parse()?,
             "--max-new" => max_new = args.next().ok_or("--max-new")?.parse()?,
             "--context" => context = args.next().ok_or("--context")?.parse()?,
+            "--prefill-chunk" => {
+                prefill_chunk = args.next().ok_or("--prefill-chunk")?.parse()?
+            }
             "--kv-cache" => {
                 kv_cache = match args.next().ok_or("--kv-cache needs fp8 or bf16")?.as_str() {
                     "fp8" => KvCacheDtype::Fp8,
@@ -232,6 +238,9 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     if requests < concurrency {
         return Err("--requests must be at least --concurrency".into());
     }
+    if !(1..=PREFILL_CHUNK_SIZE).contains(&prefill_chunk) {
+        return Err(format!("--prefill-chunk must be 1..={PREFILL_CHUNK_SIZE}").into());
+    }
     if prompt_tokens == 0 || prompt_tokens + max_new > context {
         return Err("prompt + generation must fit in --context".into());
     }
@@ -245,6 +254,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         prompt_tokens,
         max_new,
         context,
+        prefill_chunk,
         memory_limit,
         kv_cache_bytes,
         kv_cache,

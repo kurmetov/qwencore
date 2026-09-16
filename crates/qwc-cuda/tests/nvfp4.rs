@@ -244,3 +244,89 @@ fn bf16_quantizer_and_w4a4_gemm_match_dequantized_oracle() {
         );
     }
 }
+
+/// Строки за старым потолком в 1024. Разметка block-scale укладывает строки
+/// тайлами по 128, и до сегодняшнего чанка в 2048 ни один тест не предъявлял
+/// кернелам M больше 1024 — проверяется и квантователь, и сам GEMM.
+#[test]
+fn quantizer_and_w4a4_match_oracle_past_the_old_row_cap() {
+    const OUT: usize = 128;
+    const IN: usize = 256;
+    let mut rng = Rng(0x2048_5090);
+    let packed_weight: Vec<u8> = (0..OUT * IN / 2).map(|_| rng.next_u8()).collect();
+    let scale_values = [0x30u8, 0x34, 0x38, 0x3c];
+    let weight_scales: Vec<u8> = (0..OUT * IN / 16)
+        .map(|i| scale_values[(i * 7 + i / 13) % scale_values.len()])
+        .collect();
+    let weight_global_scale = 32.0;
+    let linear =
+        Linear::from_host(&packed_weight, &weight_scales, weight_global_scale, OUT, IN).unwrap();
+    let stream = Stream::new().unwrap();
+
+    // 1025 — первая строка следующего тайла, 2048 — потолок арены префилла.
+    for rows in [1025usize, 2048] {
+        let input: Vec<u16> = (0..rows * IN)
+            .map(|i| bf16::from_f32(rng.next_f32() * (0.25 + (i % 29) as f32 / 12.0)))
+            .collect();
+        let input_global_scale = 128.0;
+        let device_input = DeviceBuffer::from_slice(&input).unwrap();
+        let mut quantized = QuantizedActivation::zeroed(input_global_scale, rows, IN).unwrap();
+        quantized
+            .quantize_bf16_rows(&device_input, input_global_scale, rows, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let (packed_input, input_scales) = quantized.to_host_logical().unwrap();
+
+        // Квантование построчно независимо, поэтому достаточно граничных строк:
+        // первой, последней и первой строки последнего тайла.
+        for row in [0usize, rows - 128, rows - 1] {
+            for group in 0..IN / 16 {
+                let scale =
+                    nvfp4::reference::e4m3(input_scales[row * (IN / 16) + group]) / input_global_scale;
+                let mut maximum = 0.0f32;
+                let mut max_error = 0.0f32;
+                for j in 0..16 {
+                    let k = group * 16 + j;
+                    let value = bf16::to_f32(input[row * IN + k]);
+                    let byte = packed_input[row * (IN / 2) + k / 2];
+                    let nibble = if k & 1 == 0 { byte & 0x0f } else { byte >> 4 };
+                    let reconstructed = nvfp4::reference::e2m1(nibble) * scale;
+                    maximum = maximum.max(value.abs());
+                    max_error = max_error.max((value - reconstructed).abs());
+                }
+                assert!(
+                    max_error <= maximum * 0.19 + 0.002,
+                    "rows={rows}, row={row}, group={group}: max={maximum}, error={max_error}"
+                );
+            }
+        }
+
+        let mut expected = vec![0.0f32; rows * OUT];
+        nvfp4::reference::gemm_w4a4(
+            &packed_input,
+            &input_scales,
+            input_global_scale,
+            &packed_weight,
+            &weight_scales,
+            weight_global_scale,
+            &mut expected,
+            rows,
+            OUT,
+            IN,
+        );
+        let mut output = DeviceBuffer::<u16>::zeroed(rows * OUT).unwrap();
+        let mut workspace = W4A4Workspace::new(rows, OUT, IN).unwrap();
+        linear
+            .forward_w4a4_quantized(&quantized, &mut output, &mut workspace, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        for (index, (&got, &want)) in output.to_vec().unwrap().iter().zip(&expected).enumerate() {
+            let got = bf16::to_f32(got);
+            let tolerance = 0.02 + want.abs() * 0.012;
+            assert!(
+                (got - want).abs() <= tolerance,
+                "rows={rows}, index={index}: GPU={got}, CPU={want}, допуск={tolerance}"
+            );
+        }
+    }
+}

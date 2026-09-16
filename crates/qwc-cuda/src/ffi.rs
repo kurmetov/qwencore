@@ -157,6 +157,35 @@ unsafe extern "C" {
     ) -> c_int;
 
     #[allow(clippy::too_many_arguments)]
+    pub fn qwc_delta_prefill_wy(
+        state: *mut c_void,
+        q: *const f32,
+        k: *const f32,
+        v: *const f32,
+        alpha: *const f32,
+        beta: *const f32,
+        out: *mut f32,
+        state_fp32: *mut c_void,
+        state_bf16: *mut c_void,
+        query_tile: *mut c_void,
+        key_tile: *mut c_void,
+        key_transposed: *mut c_void,
+        gram_kk: *mut c_void,
+        gram_qk: *mut c_void,
+        triangular: *mut c_void,
+        output_factor: *mut c_void,
+        coefficients: *mut c_void,
+        coefficients_transposed: *mut c_void,
+        weighted_coefficients_transposed: *mut c_void,
+        gamma: *mut c_void,
+        state_capacity: c_int,
+        state_slot: c_int,
+        tokens: c_int,
+        row_offset: c_int,
+        stream: Stream,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
     pub fn qwc_delta_prepare_decode(
         mixed_qkv: *const c_void,
         a_projection: *const c_void,
@@ -354,6 +383,38 @@ unsafe extern "C" {
         max_blocks: c_int,
         partitions: c_int,
         share_kv: c_int,
+        softmax_scale: f32,
+        stream: Stream,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwc_paged_attention_prefill_mma_bf16(
+        query: *const c_void,
+        query_gate_projection: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        block_tables: *const c_void,
+        context_lengths: *const c_void,
+        output: *mut c_void,
+        rows: c_int,
+        row_base: c_int,
+        max_blocks: c_int,
+        softmax_scale: f32,
+        stream: Stream,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwc_paged_attention_prefill_mma_fp8(
+        query: *const c_void,
+        query_gate_projection: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        block_tables: *const c_void,
+        context_lengths: *const c_void,
+        output: *mut c_void,
+        rows: c_int,
+        row_base: c_int,
+        max_blocks: c_int,
         softmax_scale: f32,
         stream: Stream,
     ) -> c_int;

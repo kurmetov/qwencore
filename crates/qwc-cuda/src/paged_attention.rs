@@ -32,6 +32,11 @@ impl KvCacheDtype {
     }
 }
 
+/// Построчный путь обслуживает по строке на последовательность, поэтому его
+/// разметка партиций рассчитана на число слотов, а не на размер чанка
+/// префилла: чанк идёт отдельным ядром и workspace не трогает.
+pub const MAX_DECODE_ROWS: usize = 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeKernel {
     QueryHead,
@@ -43,7 +48,7 @@ pub enum DecodeKernel {
 /// explicit sharing pays off only where its lower traffic outweighs the
 /// 52 KiB/CTA footprint and reduced occupancy.
 pub fn select_decode_kernel(batch: usize, max_context: usize) -> DecodeKernel {
-    assert!((1..=1024).contains(&batch));
+    assert!((1..=MAX_DECODE_ROWS).contains(&batch));
     assert!(max_context > 0);
     if (batch == 1 && max_context >= 16_384) || ((8..=16).contains(&batch) && max_context >= 4_096)
     {
@@ -54,7 +59,7 @@ pub fn select_decode_kernel(batch: usize, max_context: usize) -> DecodeKernel {
 }
 
 pub fn partition_count(kernel: DecodeKernel, batch: usize, max_context: usize) -> usize {
-    assert!((1..=1024).contains(&batch));
+    assert!((1..=MAX_DECODE_ROWS).contains(&batch));
     assert!(max_context > 0);
     let (target, heads) = match kernel {
         DecodeKernel::QueryHead => (QUERY_HEAD_TARGET_CTAS, NUM_ATTN_HEADS),
@@ -90,7 +95,7 @@ impl PagedAttentionWorkspace {
         max_context: usize,
         partitions: usize,
     ) -> Result<Self> {
-        assert!((1..=1024).contains(&batch));
+        assert!((1..=MAX_DECODE_ROWS).contains(&batch));
         assert!(max_context > 0);
         assert!((1..=max_context).contains(&partitions));
         let floats = if partitions == 1 {
@@ -290,6 +295,9 @@ fn decode_impl(
 /// Строки должны идти подряд и принадлежать одной последовательности: тайл
 /// делит между собой таблицу блоков, а маска остаётся причинной за счёт того,
 /// что у каждой строки свой `context_lengths`.
+///
+/// Редукции здесь варповые. Ядро оставлено как эталон: тесты сверяют с ним
+/// ядро на тензорных ядрах.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_gated(
     query: &DeviceBuffer<u16>,
@@ -321,6 +329,61 @@ pub fn prefill_gated(
     let launch = match cache_dtype {
         KvCacheDtype::Fp8 => ffi::qwc_paged_attention_prefill_fp8,
         KvCacheDtype::Bf16 => ffi::qwc_paged_attention_prefill_bf16,
+    };
+    check(unsafe {
+        launch(
+            query.as_ptr(),
+            query_gate_projection.as_ptr(),
+            key_cache.as_ptr(),
+            value_cache.as_ptr(),
+            block_tables.as_ptr(),
+            context_lengths.as_ptr(),
+            output.as_mut_ptr(),
+            rows as i32,
+            row_base as i32,
+            max_blocks_per_sequence as i32,
+            1.0 / (ATTN_HEAD_DIM as f32).sqrt(),
+            stream.raw(),
+        )
+    })
+}
+
+/// То же самое на тензорных ядрах: QK^T и PV идут через mma.m16n8k16, а не
+/// через варповые редукции.
+///
+/// Тайл строк должен лежать в одной последовательности — таблица страниц
+/// берётся у первой строки тайла. Чанк префилла это условие выполняет.
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_gated_mma(
+    query: &DeviceBuffer<u16>,
+    query_gate_projection: &DeviceBuffer<u16>,
+    key_cache: &DeviceBuffer<u8>,
+    value_cache: &DeviceBuffer<u8>,
+    num_blocks: usize,
+    block_tables: &DeviceBuffer<u32>,
+    context_lengths: &DeviceBuffer<u32>,
+    max_blocks_per_sequence: usize,
+    output: &mut DeviceBuffer<u16>,
+    rows: usize,
+    row_base: usize,
+    cache_dtype: KvCacheDtype,
+    stream: &Stream,
+) -> Result<()> {
+    assert!(rows > 0);
+    let end = row_base + rows;
+    assert!(query.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM);
+    assert!(query_gate_projection.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM * 2);
+    assert!(output.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM);
+    assert!(context_lengths.len() >= end);
+    assert!(block_tables.len() >= end * max_blocks_per_sequence);
+    let cache_elements = num_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
+    let cache_bytes = cache_elements * cache_dtype.bytes_per_element();
+    assert_eq!(key_cache.len(), cache_bytes);
+    assert_eq!(value_cache.len(), cache_bytes);
+
+    let launch = match cache_dtype {
+        KvCacheDtype::Fp8 => ffi::qwc_paged_attention_prefill_mma_fp8,
+        KvCacheDtype::Bf16 => ffi::qwc_paged_attention_prefill_mma_bf16,
     };
     check(unsafe {
         launch(

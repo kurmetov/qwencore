@@ -205,14 +205,108 @@ fn prefill_tile_matches_rowwise_decode() {
     // Строк больше, чем варпов в блоке, чтобы проверить и неполный хвостовой
     // тайл, и границу страницы внутри одного тайла.
     for rows in [19usize, 127, 200] {
-        prefill_case(rows);
+        prefill_case(rows, PrefillKernel::Tiled, 0);
     }
 }
 
-fn prefill_case(rows: usize) {
+/// То же для ядра на тензорных ядрах: причинность, порядок страниц, неполный
+/// хвостовой тайл и граница страницы внутри тайла.
+#[test]
+fn prefill_mma_matches_rowwise_decode() {
+    // 601 строк — это 19 KV-тайлов и контекст длиннее чанка префилла: ровно
+    // та форма, на которой сквозной eval разошёлся.
+    for rows in [19usize, 127, 200, 601] {
+        prefill_case(rows, PrefillKernel::Mma, 0);
+    }
+}
+
+/// Чанк во всю арену: 2048 строк — это 128 тайлов запроса и контекст вдвое
+/// длиннее всего, что проверяют случаи выше. CPU-эталон на такой форме считался
+/// бы минутами, поэтому арбитром здесь работает тайловое ядро: оно сверено с
+/// CPU на малых формах, а тут проверяется только счёт строк.
+#[test]
+fn prefill_mma_matches_the_tiled_kernel_on_a_full_arena_chunk() {
+    const ROWS: usize = 2048;
+    let contexts: Vec<u32> = (0..ROWS).map(|row| (1 + row) as u32).collect();
+    let max_context = *contexts.iter().max().unwrap() as usize;
+    let max_blocks = max_context.div_ceil(PAGE_SIZE).max(1);
+    let num_blocks = max_blocks;
+    let cache_elements = num_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
+    let key_codes = [0x18u8, 0x98, 0x20, 0xa0, 0x28, 0xa8, 0x00];
+    let value_codes = [0x30u8, 0xb0, 0x28, 0xa8, 0x20, 0xa0, 0x00];
+    let key_cache: Vec<u8> = (0..cache_elements)
+        .map(|index| key_codes[(index * 5 + index / ATTN_HEAD_DIM) % key_codes.len()])
+        .collect();
+    let value_cache: Vec<u8> = (0..cache_elements)
+        .map(|index| value_codes[(index * 3 + index / 17) % value_codes.len()])
+        .collect();
+    let one_table: Vec<u32> = (0..max_blocks as u32).rev().collect();
+    let block_tables: Vec<u32> = (0..ROWS).flat_map(|_| one_table.clone()).collect();
+    let query: Vec<u16> = (0..ROWS * NUM_ATTN_HEADS * ATTN_HEAD_DIM)
+        .map(|index| bf16::from_f32(((index * 13 % 29) as f32 - 14.0) / 28.0))
+        .collect();
+    let gate = vec![0u16; query.len() * 2];
+
+    let stream = Stream::new().unwrap();
+    let device_query = DeviceBuffer::from_slice(&query).unwrap();
+    let device_gate = DeviceBuffer::from_slice(&gate).unwrap();
+    let device_key = DeviceBuffer::from_slice(&key_cache).unwrap();
+    let device_value = DeviceBuffer::from_slice(&value_cache).unwrap();
+    let device_tables = DeviceBuffer::from_slice(&block_tables).unwrap();
+    let device_lengths = DeviceBuffer::from_slice(&contexts).unwrap();
+
+    let mut mma = DeviceBuffer::<u16>::zeroed(query.len()).unwrap();
+    paged_attention::prefill_gated_mma(
+        &device_query, &device_gate, &device_key, &device_value, num_blocks,
+        &device_tables, &device_lengths, max_blocks, &mut mma, ROWS, 0,
+        KvCacheDtype::Fp8, &stream,
+    )
+    .unwrap();
+    let mut tiled = DeviceBuffer::<u16>::zeroed(query.len()).unwrap();
+    paged_attention::prefill_gated(
+        &device_query, &device_gate, &device_key, &device_value, num_blocks,
+        &device_tables, &device_lengths, max_blocks, &mut tiled, ROWS, 0,
+        KvCacheDtype::Fp8, &stream,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+
+    for (index, (&a, &b)) in mma
+        .to_vec()
+        .unwrap()
+        .iter()
+        .zip(&tiled.to_vec().unwrap())
+        .enumerate()
+    {
+        let (a, b) = (bf16::to_f32(a), bf16::to_f32(b));
+        assert!(
+            (a - b).abs() <= 0.004 + b.abs() * 0.02,
+            "строка {}, индекс {index}: MMA={a}, тайловое={b}",
+            index / (NUM_ATTN_HEADS * ATTN_HEAD_DIM)
+        );
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PrefillKernel {
+    Tiled,
+    Mma,
+}
+
+/// Второй и последующие чанки промпта: строки те же, а причинный префикс у
+/// них начинается не с единицы. В движке эта форма встречается на любом
+/// промпте длиннее чанка, и ни один тест её раньше не покрывал.
+#[test]
+fn prefill_mma_matches_rowwise_decode_on_a_later_chunk() {
+    for (rows, start) in [(89usize, 512usize), (16, 512), (200, 1024)] {
+        prefill_case(rows, PrefillKernel::Mma, start);
+    }
+}
+
+fn prefill_case(rows: usize, kernel: PrefillKernel, context_start: usize) {
     #[allow(non_snake_case)]
     let ROWS = rows;
-    let first_context = 1usize;
+    let first_context = context_start + 1;
     let contexts: Vec<u32> = (0..ROWS).map(|row| (first_context + row) as u32).collect();
     let max_context = *contexts.iter().max().unwrap() as usize;
     let max_blocks = max_context.div_ceil(PAGE_SIZE);
@@ -268,7 +362,11 @@ fn prefill_case(rows: usize) {
     let device_lengths = DeviceBuffer::from_slice(&contexts).unwrap();
     let mut output = DeviceBuffer::<u16>::zeroed(query.len()).unwrap();
 
-    paged_attention::prefill_gated(
+    let launch = match kernel {
+        PrefillKernel::Tiled => paged_attention::prefill_gated,
+        PrefillKernel::Mma => paged_attention::prefill_gated_mma,
+    };
+    launch(
         &device_query,
         &device_gate,
         &device_key,
@@ -468,6 +566,80 @@ fn agreement_case(bf16_cache: bool) {
 /// Кто ближе к эталону на форме, где движок показал расхождение: мало строк,
 /// короткий контекст, а workspace создан под сконфигурированный максимум,
 /// поэтому старый путь дробит контекст на партиции и сливает их.
+/// Точность ядра на тензорных ядрах против построчного decode на общем
+/// fp32-эталоне. P округляется до bf16 перед PV, поэтому важно не «совпадает
+/// ли», а «не хуже ли» — и на длинном контексте тоже.
+#[test]
+fn prefill_mma_is_not_less_accurate_than_rowwise_decode() {
+    for rows in [63usize, 200, 601] {
+        let contexts: Vec<u32> = (0..rows).map(|row| (1 + row) as u32).collect();
+        let max_context = *contexts.iter().max().unwrap() as usize;
+        let max_blocks = max_context.div_ceil(PAGE_SIZE).max(1);
+        let num_blocks = max_blocks;
+        let cache_elements = num_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
+        let key_codes = [0x18u8, 0x98, 0x20, 0xa0, 0x28, 0xa8, 0x00];
+        let value_codes = [0x30u8, 0xb0, 0x28, 0xa8, 0x20, 0xa0, 0x00];
+        let key_cache: Vec<u8> = (0..cache_elements)
+            .map(|index| key_codes[(index * 5 + index / ATTN_HEAD_DIM) % key_codes.len()])
+            .collect();
+        let value_cache: Vec<u8> = (0..cache_elements)
+            .map(|index| value_codes[(index * 3 + index / 17) % value_codes.len()])
+            .collect();
+        let one_table: Vec<u32> = (0..max_blocks as u32).rev().collect();
+        let block_tables: Vec<u32> = (0..rows).flat_map(|_| one_table.clone()).collect();
+        let query: Vec<u16> = (0..rows * NUM_ATTN_HEADS * ATTN_HEAD_DIM)
+            .map(|index| bf16::from_f32(((index * 13 % 29) as f32 - 14.0) / 28.0))
+            .collect();
+
+        let mut expected = vec![0.0f32; query.len()];
+        paged_attention::reference::decode_fp8(
+            &query, &key_cache, &value_cache, &block_tables, &contexts,
+            max_blocks, &mut expected, rows,
+        );
+
+        let stream = Stream::new().unwrap();
+        let device_query = DeviceBuffer::from_slice(&query).unwrap();
+        let device_key = DeviceBuffer::from_slice(&key_cache).unwrap();
+        let device_value = DeviceBuffer::from_slice(&value_cache).unwrap();
+        let device_tables = DeviceBuffer::from_slice(&block_tables).unwrap();
+        let device_lengths = DeviceBuffer::from_slice(&contexts).unwrap();
+        let gate = vec![0u16; rows * NUM_ATTN_HEADS * ATTN_HEAD_DIM * 2];
+        let device_gate = DeviceBuffer::from_slice(&gate).unwrap();
+
+        let mut mma = DeviceBuffer::<u16>::zeroed(query.len()).unwrap();
+        paged_attention::prefill_gated_mma(
+            &device_query, &device_gate, &device_key, &device_value, num_blocks,
+            &device_tables, &device_lengths, max_blocks, &mut mma, rows, 0,
+            KvCacheDtype::Fp8, &stream,
+        )
+        .unwrap();
+
+        let mut rowwise = DeviceBuffer::<u16>::zeroed(query.len()).unwrap();
+        let mut workspace = PagedAttentionWorkspace::new(rows, 4096).unwrap();
+        paged_attention::decode_fp8_gated(
+            &device_query, &device_gate, &device_key, &device_value, num_blocks,
+            &device_tables, &device_lengths, max_blocks, &mut rowwise, &mut workspace,
+            rows, max_context, &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        let (a, b) = (mma.to_vec().unwrap(), rowwise.to_vec().unwrap());
+        let mut mma_error = 0.0f32;
+        let mut row_error = 0.0f32;
+        for index in 0..a.len() {
+            let (x, y) = (bf16::to_f32(a[index]), bf16::to_f32(b[index]));
+            mma_error = mma_error.max((x - expected[index]).abs());
+            row_error = row_error.max((y - expected[index]).abs());
+        }
+        println!("строк {rows:3}: ошибка MMA {mma_error:.3e}, построчного {row_error:.3e}");
+        assert!(
+            mma_error <= row_error * 4.0 + 1e-3,
+            "строк {rows}: MMA {mma_error:.3e} против построчного {row_error:.3e}"
+        );
+    }
+}
+
 #[test]
 fn prefill_tile_is_not_less_accurate_than_rowwise_decode() {
     for rows in [5usize, 14, 63] {

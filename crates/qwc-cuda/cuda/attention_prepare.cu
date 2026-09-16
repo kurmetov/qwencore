@@ -8,6 +8,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "limits.cuh"
 
 namespace {
 
@@ -162,7 +163,7 @@ cudaError_t prepare_attention(
       value_projection == nullptr || query_norm_weight == nullptr ||
       key_norm_weight == nullptr || cosine == nullptr || sine == nullptr ||
       physical_blocks == nullptr || block_offsets == nullptr || query == nullptr ||
-      key_cache == nullptr || value_cache == nullptr || batch <= 0 || batch > 1024 ||
+      key_cache == nullptr || value_cache == nullptr || batch <= 0 || batch > qwc::kMaxStepRows ||
       !isfinite(epsilon) || epsilon <= 0.0f) {
     return cudaErrorInvalidValue;
   }

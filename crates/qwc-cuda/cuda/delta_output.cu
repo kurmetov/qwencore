@@ -2,6 +2,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include "limits.cuh"
 
 namespace {
 
@@ -74,7 +75,7 @@ extern "C" cudaError_t qwc_delta_gated_rmsnorm(
     int gate_stride,
     cudaStream_t stream) {
   if (input == nullptr || gate == nullptr || weight == nullptr || output == nullptr ||
-      batch <= 0 || batch > 1024 || !isfinite(epsilon) || epsilon <= 0.0f ||
+      batch <= 0 || batch > qwc::kMaxStepRows || !isfinite(epsilon) || epsilon <= 0.0f ||
       gate_stride < kHeads * kHeadDim) {
     return cudaErrorInvalidValue;
   }

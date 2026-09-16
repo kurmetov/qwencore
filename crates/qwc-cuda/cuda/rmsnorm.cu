@@ -8,6 +8,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "limits.cuh"
 
 namespace {
 
@@ -207,7 +208,7 @@ cudaError_t validate(
     int hidden,
     float epsilon) {
   if (input == nullptr || weight == nullptr || output == nullptr || batch <= 0 ||
-      batch > 1024 || hidden <= 0 || hidden % 256 != 0 || !isfinite(epsilon) ||
+      batch > qwc::kMaxStepRows || hidden <= 0 || hidden % 256 != 0 || !isfinite(epsilon) ||
       epsilon <= 0.0f) {
     return cudaErrorInvalidValue;
   }

@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "limits.cuh"
 
 namespace {
 
@@ -35,7 +36,7 @@ extern "C" cudaError_t qwc_gather_rows_bf16(
     int cols,
     cudaStream_t stream) {
   if (source == nullptr || row_indices == nullptr || destination == nullptr ||
-      rows <= 0 || rows > 1024 || cols <= 0 || cols % 8 != 0) {
+      rows <= 0 || rows > qwc::kMaxStepRows || cols <= 0 || cols % 8 != 0) {
     return cudaErrorInvalidValue;
   }
   constexpr int threads = 256;

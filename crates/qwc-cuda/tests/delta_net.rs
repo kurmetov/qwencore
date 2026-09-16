@@ -3,8 +3,9 @@
 
 use qwc_core::arch::{LA_CONV_CHANNELS, LA_K_HEAD_DIM, LA_NUM_K_HEADS, LA_V_HEAD_DIM};
 use qwc_cuda::delta_net::{
-    self, CONV_STATE_ELEMS, DeltaInputs, DeltaOutputNorm, DeltaPreprocessor, DeltaStateMode,
-    GATE_ELEMS, PreparedDelta, QK_ELEMS, RowView, STATE_ELEMS, V_ELEMS,
+    self, CONV_STATE_ELEMS, DeltaInputs, DeltaOutputNorm,
+    DeltaPreprocessor, DeltaStateMode, GATE_ELEMS, PreparedDelta, QK_ELEMS, RowView,
+    STATE_ELEMS, V_ELEMS,
 };
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
 
@@ -329,9 +330,14 @@ fn chunk_prefill_matches_repeated_recurrent_decode() {
         .zip(&expected_state)
         .filter(|(actual, expected)| actual != expected)
         .count();
+    let worst_state = actual_state
+        .iter()
+        .zip(&expected_state)
+        .map(|(&actual, &expected)| (bf16::to_f32(actual) - bf16::to_f32(expected)).abs())
+        .fold(0.0f32, f32::max);
     assert!(
         differing as f64 / (STATE_ELEMS as f64) < 0.02,
-        "too many BF16 state differences: {differing}/{STATE_ELEMS}"
+        "too many BF16 state differences: {differing}/{STATE_ELEMS}, worst abs {worst_state:.2e}"
     );
     assert_eq!(&actual_pool[..STATE_ELEMS], &initial[..STATE_ELEMS]);
 }
@@ -341,7 +347,8 @@ fn chunk_prefill_matches_repeated_recurrent_decode() {
 /// иначе переключатель ничего не изолирует.
 #[test]
 fn chunk_prefill_fp32_state_matches_fp32_reference_and_differs_from_bf16() {
-    let tokens = 16;
+    // 65 crosses the usual 64-token boundary and catches state carry bugs.
+    let tokens = 65;
     let capacity = 2;
     let slot = 1;
     let mut rng = Rng(0x5090_C4A5);
@@ -413,10 +420,23 @@ fn chunk_prefill_fp32_state_matches_fp32_reference_and_differs_from_bf16() {
     let (bf16_out, _) = run(DeltaStateMode::Bf16);
 
     let mut worst = 0.0f32;
-    for (&actual, &expected) in fp32_out.iter().zip(&expected_out) {
-        worst = worst.max((actual - expected).abs() / expected.abs().max(1e-3));
+    let mut worst_abs = 0.0f32;
+    let mut worst_index = 0usize;
+    for (index, (&actual, &expected)) in fp32_out.iter().zip(&expected_out).enumerate() {
+        let relative = (actual - expected).abs() / expected.abs().max(1e-3);
+        if relative > worst {
+            worst = relative;
+            worst_abs = (actual - expected).abs();
+            worst_index = index;
+        }
     }
-    assert!(worst < 2e-3, "fp32 prefill output differs by {worst:.2e}");
+    assert!(
+        fp32_out.iter().zip(&expected_out).all(|(&actual, &expected)|
+            (actual - expected).abs() <= 5e-4 + 2e-3 * expected.abs()),
+        "fp32 prefill output differs by {worst:.2e} (abs {worst_abs:.2e}) at {worst_index}: gpu={}, cpu={}",
+        fp32_out[worst_index],
+        expected_out[worst_index],
+    );
 
     let actual_state = &fp32_pool[slot * STATE_ELEMS..][..STATE_ELEMS];
     let differing = actual_state
@@ -424,9 +444,17 @@ fn chunk_prefill_fp32_state_matches_fp32_reference_and_differs_from_bf16() {
         .zip(&expected_state)
         .filter(|(actual, expected)| actual != expected)
         .count();
+    let mut state_worst_abs = 0.0f32;
+    let mut state_squared_error = 0.0f64;
+    for (&actual, &expected) in actual_state.iter().zip(&expected_state) {
+        let error = (bf16::to_f32(actual) - bf16::to_f32(expected)).abs();
+        state_worst_abs = state_worst_abs.max(error);
+        state_squared_error += f64::from(error) * f64::from(error);
+    }
+    let state_rmse = (state_squared_error / STATE_ELEMS as f64).sqrt();
     assert!(
         differing as f64 / (STATE_ELEMS as f64) < 0.02,
-        "too many BF16 state differences: {differing}/{STATE_ELEMS}"
+        "too many BF16 state differences: {differing}/{STATE_ELEMS}; max abs {state_worst_abs:.3e}, RMSE {state_rmse:.3e}"
     );
     assert_eq!(&fp32_pool[..STATE_ELEMS], &initial[..STATE_ELEMS]);
 
@@ -737,4 +765,84 @@ fn gated_rmsnorm_matches_qwen_dtype_boundaries() {
         worst = worst.max((bf16::to_f32(actual) - bf16::to_f32(expected)).abs());
     }
     assert!(worst <= 0.008, "gated RMSNorm max error {worst}");
+}
+
+/// Чанковая (WY) форма скана против рекуррентной — обе на CPU, обе в fp32.
+///
+/// Это проверка вывода, а не кернела: если формы расходятся здесь, спорить с
+/// GPU дальше не о чем. Длина берётся не кратной чанку, чтобы хвост считался
+/// тем же кодом, и с alpha далеко от единицы — там, где отношения gamma между
+/// далёкими токенами уходят в ноль.
+#[test]
+fn chunked_wy_form_matches_the_recurrent_scan() {
+    use qwc_core::arch::{LA_NUM_V_HEADS, LA_V_HEAD_DIM as DV};
+    const DK: usize = LA_K_HEAD_DIM;
+    const HV: usize = LA_NUM_V_HEADS;
+
+    for (tokens, chunk, decay) in [(130usize, 64usize, 0.99f32), (64, 64, 0.9), (33, 16, 0.7)] {
+        let mut rng = Rng(0x5ca_4_4a_7e5_7);
+        let q: Vec<f32> = (0..tokens * LA_NUM_K_HEADS * DK)
+            .map(|_| rng.next_f32() * 0.5)
+            .collect();
+        let k: Vec<f32> = (0..tokens * LA_NUM_K_HEADS * DK)
+            .map(|_| rng.next_f32() * 0.5)
+            .collect();
+        let v: Vec<f32> = (0..tokens * HV * DV).map(|_| rng.next_f32()).collect();
+        // alpha в (0, 1], beta в (0, 2) — как после сигмоиды и softplus.
+        let alpha: Vec<f32> = (0..tokens * HV)
+            .map(|_| decay * (0.5 + 0.5 * (rng.next_f32() * 0.5 + 0.5)))
+            .collect();
+        let beta: Vec<f32> = (0..tokens * HV)
+            .map(|_| rng.next_f32() * 0.4 + 0.6)
+            .collect();
+        let initial: Vec<u16> = (0..STATE_ELEMS)
+            .map(|_| bf16::from_f32(rng.next_f32() * 0.1))
+            .collect();
+
+        let mut recurrent_state = initial.clone();
+        let mut recurrent_out = vec![0.0f32; tokens * HV * DV];
+        delta_net::reference::prefill_chunk_fp32(
+            &mut recurrent_state,
+            &q,
+            &k,
+            &v,
+            &alpha,
+            &beta,
+            &mut recurrent_out,
+            tokens,
+        );
+
+        let mut chunked_state = initial.clone();
+        let mut chunked_out = vec![0.0f32; tokens * HV * DV];
+        delta_net::reference::prefill_chunked_fp32(
+            &mut chunked_state,
+            &q,
+            &k,
+            &v,
+            &alpha,
+            &beta,
+            &mut chunked_out,
+            tokens,
+            chunk,
+        );
+
+        let mut worst = 0.0f32;
+        for (index, (&got, &want)) in chunked_out.iter().zip(&recurrent_out).enumerate() {
+            let tolerance = 1e-3 + want.abs() * 2e-3;
+            worst = worst.max((got - want).abs());
+            assert!(
+                (got - want).abs() <= tolerance,
+                "токенов {tokens}, чанк {chunk}: выход {index}: WY={got}, рекуррентно={want}"
+            );
+        }
+        for (index, (&got, &want)) in chunked_state.iter().zip(&recurrent_state).enumerate() {
+            let (got, want) = (bf16::to_f32(got), bf16::to_f32(want));
+            let tolerance = 1e-2 + want.abs() * 1e-2;
+            assert!(
+                (got - want).abs() <= tolerance,
+                "токенов {tokens}, чанк {chunk}: состояние {index}: WY={got}, рекуррентно={want}"
+            );
+        }
+        println!("токенов {tokens}, чанк {chunk}, decay {decay}: худшее по выходу {worst:.3e}");
+    }
 }

@@ -15,10 +15,10 @@
 //! ```
 
 use qwc_core::arch::VOCAB_SIZE;
-use qwc_cuda::delta_net;
+use qwc_cuda::delta_net::{self, DeltaStateMode};
 use qwc_cuda::paged_attention::{KvCacheDtype, PAGE_SIZE};
 use qwc_engine::executor::PREFILL_CHUNK_SIZE;
-use qwc_engine::weights::Mixer;
+use qwc_engine::weights::{DecodeLinearMode, Mixer};
 use qwc_engine::{Executor, ExecutorConfig, ModelWeights};
 use qwc_model::Checkpoint;
 use qwc_runtime::BatchLayout;
@@ -30,11 +30,13 @@ struct Args {
     concurrency: usize,
     prompt_tokens: usize,
     prefill_tokens: usize,
+    prefill_start: usize,
     steps: usize,
     warmup: usize,
     context: usize,
     memory_limit: usize,
     kv_cache: KvCacheDtype,
+    delta_state: DeltaStateMode,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,12 +48,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weights = ModelWeights::load(&checkpoint)?;
     let load_seconds = load_started.elapsed().as_secs_f64();
 
-    let mut executor = Executor::new_with_kv_cache(
+    let mut executor = Executor::new_with_options(
         ExecutorConfig {
             max_batch: args.concurrency,
             max_context: args.context,
         },
         args.kv_cache,
+        DecodeLinearMode::Auto,
+        args.delta_state,
     )?;
     let cache_gb = executor.cache_bytes() as f64 / 1e9;
     let usage = qwc_cuda::memory_usage();
@@ -126,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "шаг {} на concurrency {} (decode-строк {decode_rows}{}), контекст {}, KV {}",
+        "шаг {} на concurrency {} (decode-строк {decode_rows}{}), контекст {}, KV {}, DeltaNet {}",
         if mixed { "смешанный" } else { "чистый decode" },
         args.concurrency,
         if mixed {
@@ -136,6 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         position,
         args.kv_cache.as_str(),
+        args.delta_state.as_str(),
     );
     println!(
         "{:<24} {:>9} {:>7} {:>10} {:>10}",
@@ -240,7 +245,7 @@ fn mixed_layout(
     for row in 0..decode_rows {
         push(row, position, 1);
     }
-    push(decode_rows, 0, args.prefill_tokens);
+    push(decode_rows, args.prefill_start, args.prefill_tokens);
     Ok(layout)
 }
 
@@ -325,11 +330,15 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     let mut concurrency = 64usize;
     let mut prompt_tokens = 256usize;
     let mut prefill_tokens = 0usize;
+    // Чанк не в нуле, а на своей позиции в промпте: внимание на префилле
+    // читает весь контекст слева, и в нуле его цена не видна.
+    let mut prefill_start = 0usize;
     let mut steps = 21usize;
     let mut warmup = 3usize;
     let mut context = 2048usize;
     let mut memory_limit = 30_000_000_000usize;
     let mut kv_cache = KvCacheDtype::Fp8;
+    let mut delta_state = DeltaStateMode::Bf16;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -337,6 +346,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--concurrency" => concurrency = args.next().ok_or("--concurrency")?.parse()?,
             "--prompt-tokens" => prompt_tokens = args.next().ok_or("--prompt-tokens")?.parse()?,
             "--prefill-tokens" => prefill_tokens = args.next().ok_or("--prefill-tokens")?.parse()?,
+            "--prefill-start" => prefill_start = args.next().ok_or("--prefill-start")?.parse()?,
             "--steps" => steps = args.next().ok_or("--steps")?.parse()?,
             "--warmup" => warmup = args.next().ok_or("--warmup")?.parse()?,
             "--context" => context = args.next().ok_or("--context")?.parse()?,
@@ -345,6 +355,13 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
                     "fp8" => KvCacheDtype::Fp8,
                     "bf16" => KvCacheDtype::Bf16,
                     other => return Err(format!("неизвестное значение --kv-cache: {other}").into()),
+                };
+            }
+            "--delta-state" => {
+                delta_state = match args.next().ok_or("--delta-state needs bf16 or fp32")?.as_str() {
+                    "bf16" => DeltaStateMode::Bf16,
+                    "fp32" => DeltaStateMode::Fp32,
+                    other => return Err(format!("неизвестное значение --delta-state: {other}").into()),
                 };
             }
             "--memory-limit-gb" => {
@@ -375,7 +392,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         if live > PREFILL_CHUNK_SIZE {
             return Err(format!("шаг несёт {live} токенов, арена держит {PREFILL_CHUNK_SIZE}").into());
         }
-        if prefill_tokens > context {
+        if prefill_start + prefill_tokens > context {
             return Err("--prefill-tokens не помещается в контекст".into());
         }
     }
@@ -387,11 +404,13 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         concurrency,
         prompt_tokens,
         prefill_tokens,
+        prefill_start,
         steps,
         warmup,
         context,
         memory_limit,
         kv_cache,
+        delta_state,
     })
 }
 
