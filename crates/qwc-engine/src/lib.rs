@@ -6,6 +6,7 @@
 //! CPU-тестируемым, а qwc-model не тянет CUDA.
 
 pub mod executor;
+pub mod mtp;
 pub mod weights;
 
 pub use executor::{Executor, ExecutorConfig, PREFILL_CHUNK_SIZE};

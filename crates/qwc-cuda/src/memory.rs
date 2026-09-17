@@ -151,6 +151,38 @@ impl<T> DeviceBuffer<T> {
         })
     }
 
+    /// Копия диапазона элементов из другого буфера, не выходя на хост.
+    ///
+    /// Нужна там, где кернелу нужен отдельный буфер, а данные уже лежат
+    /// строкой внутри чужой арены: строка скрытых состояний под MTP-черновик,
+    /// снимок состояния DeltaNet под откат спекуляции.
+    pub fn copy_from_device_at(
+        &mut self,
+        offset: usize,
+        source: &Self,
+        source_offset: usize,
+        len: usize,
+        stream: &crate::Stream,
+    ) -> Result<()> {
+        assert!(offset + len <= self.len && source_offset + len <= source.len);
+        if len == 0 {
+            return Ok(());
+        }
+        let size = std::mem::size_of::<T>();
+        // SAFETY: оба диапазона проверены assertion выше.
+        let destination = unsafe { (self.ptr as *mut u8).add(offset * size).cast() };
+        let from = unsafe { (source.ptr as *const u8).add(source_offset * size).cast() };
+        check(unsafe {
+            ffi::cudaMemcpyAsync(
+                destination,
+                from,
+                len * size,
+                ffi::MEMCPY_DEVICE_TO_DEVICE,
+                stream.raw(),
+            )
+        })
+    }
+
     /// Zeroes an element range in place without a host-sized staging buffer.
     pub fn zero_range(&mut self, start: usize, len: usize) -> Result<()> {
         assert!(start <= self.len && len <= self.len - start);

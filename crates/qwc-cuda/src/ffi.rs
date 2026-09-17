@@ -9,6 +9,7 @@ pub type GraphExec = *mut c_void;
 
 pub const MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub const MEMCPY_DEVICE_TO_HOST: c_int = 2;
+pub const MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
 
 unsafe extern "C" {
     pub fn cudaGetErrorString(error: c_int) -> *const c_char;
@@ -21,6 +22,13 @@ unsafe extern "C" {
     pub fn cudaFree(ptr: *mut c_void) -> c_int;
     pub fn cudaMemset(ptr: *mut c_void, value: c_int, count: usize) -> c_int;
     pub fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: c_int) -> c_int;
+    pub fn cudaMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        count: usize,
+        kind: c_int,
+        stream: Stream,
+    ) -> c_int;
 
     pub fn cudaStreamCreate(stream: *mut Stream) -> c_int;
     pub fn cudaStreamDestroy(stream: Stream) -> c_int;
@@ -153,6 +161,33 @@ unsafe extern "C" {
         tokens: c_int,
         round_state_per_token: c_int,
         row_offset: c_int,
+        stream: Stream,
+    ) -> c_int;
+
+    pub fn qwc_bf16_linear(
+        weights: *const c_void,
+        input: *const c_void,
+        output: *mut c_void,
+        rows: c_int,
+        k: c_int,
+        n: c_int,
+        stream: Stream,
+    ) -> c_int;
+
+    pub fn qwc_bf16_swiglu(
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+        elements: c_int,
+        stream: Stream,
+    ) -> c_int;
+
+    pub fn qwc_bf16_concat(
+        left: *const c_void,
+        right: *const c_void,
+        out: *mut c_void,
+        rows: c_int,
+        width: c_int,
         stream: Stream,
     ) -> c_int;
 

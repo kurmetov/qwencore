@@ -21,6 +21,7 @@ pub mod error;
 pub(crate) mod ffi;
 pub mod graph;
 pub mod memory;
+pub mod mtp;
 pub mod nvfp4;
 pub mod paged_attention;
 pub mod rmsnorm;

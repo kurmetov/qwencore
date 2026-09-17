@@ -1628,6 +1628,26 @@ impl Executor {
     }
 
     /// Greedy sampling on the GPU; only the resulting token IDs cross PCIe.
+    /// Одна строка скрытых состояний в отдельный буфер, не покидая карту.
+    /// Черновой шаг MTP принимает её как вход; копия ряда в 10 КБ на фоне
+    /// шага в 12 мс ничего не стоит, а вид на чужой буфер стоил бы времени
+    /// жизни.
+    pub fn copy_decode_hidden_row(
+        &self,
+        row: usize,
+        destination: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        copy_hidden_row(&self.normed, row, destination, &self.stream)
+    }
+
+    pub fn copy_prefill_hidden_row(
+        &self,
+        row: usize,
+        destination: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        copy_hidden_row(&self.prefill.normed, row, destination, &self.stream)
+    }
+
     /// Скрытые состояния после финальной нормы — ровно тот тензор, который
     /// уходит в `lm_head`, и ровно тот, который MTP-голова ждёт на входе.
     ///
@@ -1650,6 +1670,17 @@ impl Executor {
         self.sampler.sample(&self.logits, batch, &self.stream)?;
         self.sampler.to_host(batch)
     }
+}
+
+fn copy_hidden_row(
+    source: &DeviceBuffer<u16>,
+    row: usize,
+    destination: &mut DeviceBuffer<u16>,
+    stream: &Stream,
+) -> Result<()> {
+    assert!((row + 1) * HIDDEN_SIZE <= source.len());
+    assert!(destination.len() >= HIDDEN_SIZE);
+    destination.copy_from_device_at(0, source, row * HIDDEN_SIZE, HIDDEN_SIZE, stream)
 }
 
 fn project_decode(

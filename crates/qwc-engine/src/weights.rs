@@ -682,6 +682,36 @@ fn load_bf16_vocab(
     Ok(table)
 }
 
+/// Помощники для MTP-головы: она грузится отдельно от основного стека, но из
+/// того же чекпоинта и теми же проверками форм.
+pub(crate) fn bf16_host_tensor(
+    checkpoint: &Checkpoint,
+    name: &str,
+    elems: usize,
+) -> Result<Vec<u16>, LoadError> {
+    bf16_tensor(checkpoint, name, elems)
+}
+
+pub(crate) fn bf16_device_tensor(
+    checkpoint: &Checkpoint,
+    name: &str,
+    elems: usize,
+) -> Result<DeviceBuffer<u16>, LoadError> {
+    let host = bf16_tensor(checkpoint, name, elems)?;
+    let buffer = DeviceBuffer::from_slice(&host)?;
+    checkpoint.evict_file_pages()?;
+    Ok(buffer)
+}
+
+pub(crate) fn load_norm_named(
+    checkpoint: &Checkpoint,
+    name: &str,
+    elems: usize,
+) -> Result<RmsNorm, LoadError> {
+    let weight = bf16_tensor(checkpoint, name, elems)?;
+    Ok(RmsNorm::from_host(&weight, RMS_NORM_EPS)?)
+}
+
 /// Копия BF16-тензора на хост. Срез mmap не выровнен под `u16`, поэтому
 /// байты собираются явно, а не приводятся указателем.
 fn bf16_tensor(checkpoint: &Checkpoint, name: &str, elems: usize) -> Result<Vec<u16>, LoadError> {
