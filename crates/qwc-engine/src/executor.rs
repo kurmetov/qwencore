@@ -1628,6 +1628,24 @@ impl Executor {
     }
 
     /// Greedy sampling on the GPU; only the resulting token IDs cross PCIe.
+    /// Скрытые состояния после финальной нормы — ровно тот тензор, который
+    /// уходит в `lm_head`, и ровно тот, который MTP-голова ждёт на входе.
+    ///
+    /// Нужны замеру acceptance draft-головы: её вход — это (h_t, эмбеддинг
+    /// токена t+1). Копия на хост, поэтому путь диагностический, не горячий.
+    pub fn decode_hidden_to_host(&self, batch: usize) -> Result<Vec<u16>> {
+        assert!(batch > 0 && batch <= self.max_batch);
+        let all = self.normed.to_vec()?;
+        Ok(all[..batch * HIDDEN_SIZE].to_vec())
+    }
+
+    /// То же для строк последнего prefill-шага: `rows` строк с начала арены.
+    pub fn prefill_hidden_to_host(&self, rows: usize) -> Result<Vec<u16>> {
+        assert!(rows * HIDDEN_SIZE <= self.prefill.normed.len());
+        let all = self.prefill.normed.to_vec()?;
+        Ok(all[..rows * HIDDEN_SIZE].to_vec())
+    }
+
     pub fn argmax_to_host(&mut self, batch: usize) -> Result<Vec<u32>> {
         self.sampler.sample(&self.logits, batch, &self.stream)?;
         self.sampler.to_host(batch)
