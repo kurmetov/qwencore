@@ -28,6 +28,15 @@ use qwc_runtime::BatchLayout;
 /// DeltaNet state plus KV cache at ctx 2048, so 64 slots need ~9.5 GB on top
 /// of the 16.25 GB of weights. The decode kernels themselves accept 128.
 pub const MAX_BATCH: usize = 96;
+
+/// Максимум строк в одном шаге проверки черновиков: принятый токен плюс до
+/// семи спекулятивных. Потолок задан bf16-линейкой MTP-головы.
+pub const MAX_SPECULATION_ROWS: usize = 8;
+
+/// С какой длины отрезка prefill-скан идёт чанковой (WY) формой.
+/// Ниже этого рекуррентный проход быстрее: см. `deltanet-wy-2026-09-16.md`,
+/// на 128 токенах формы сравниваются, на 256 WY уже вдвое лучше.
+const MIN_WY_TOKENS: usize = 192;
 /// Fixed tensor-core M dimension used by chunked prefill. Это ёмкость арены:
 /// планировщику можно выдать бюджет меньше, но не больше.
 ///
@@ -118,6 +127,13 @@ pub struct Executor {
     /// бы этот путь. Заводится только в режиме `Wy` — он стоит десятки
     /// мегабайт, которые остальным режимам не нужны.
     delta_prefill: Option<DeltaPrefillWorkspace>,
+    /// Входы миксера всех линейных слоёв за шаг проверки черновиков.
+    ///
+    /// Проверка идёт по черновому слоту состояния, а принятые токены потом
+    /// доигрываются на настоящем — для этого и нужны сохранённые входы: они
+    /// позволяют повторить conv и скан, не перечитывая веса второй раз.
+    speculation_mixer: Vec<DeviceBuffer<u16>>,
+    speculation_rows: usize,
 
     // Full attention.
     query_gate: DeviceBuffer<u16>,
@@ -381,6 +397,8 @@ impl Executor {
         }
         let slots: Vec<u32> = (0..batch as u32).collect();
 
+        let speculation_mixer = Vec::new();
+        let speculation_rows = 0;
         let delta_prefill = match delta_state_mode {
             DeltaStateMode::Wy => Some(DeltaPrefillWorkspace::new()?),
             _ => None,
@@ -388,8 +406,12 @@ impl Executor {
         let mut state_pools = Vec::with_capacity(NUM_LINEAR_LAYERS);
         let mut conv_pools = Vec::with_capacity(NUM_LINEAR_LAYERS);
         for _ in 0..NUM_LINEAR_LAYERS {
-            state_pools.push(DeviceBuffer::zeroed(batch * STATE_ELEMS)?);
-            conv_pools.push(DeviceBuffer::zeroed(batch * CONV_STATE_ELEMS)?);
+            // Слотов на один больше, чем последовательностей: последний —
+            // черновой. Проверка спекуляции гоняет состояние по нему, а
+            // настоящее остаётся нетронутым, пока не станет ясно, сколько
+            // токенов принято.
+            state_pools.push(DeviceBuffer::zeroed((batch + 1) * STATE_ELEMS)?);
+            conv_pools.push(DeviceBuffer::zeroed((batch + 1) * CONV_STATE_ELEMS)?);
         }
         let mut key_caches = Vec::with_capacity(NUM_FULL_LAYERS);
         let mut value_caches = Vec::with_capacity(NUM_FULL_LAYERS);
@@ -438,6 +460,8 @@ impl Executor {
             state_pools,
             conv_pools,
             delta_prefill,
+            speculation_mixer,
+            speculation_rows,
             query_gate: DeviceBuffer::zeroed(decode_rows * 2 * Q_PROJ_DIM)?,
             key_projection: DeviceBuffer::zeroed(decode_rows * KV_PROJ_DIM)?,
             value_projection: DeviceBuffer::zeroed(decode_rows * KV_PROJ_DIM)?,
@@ -453,8 +477,10 @@ impl Executor {
             value_caches,
             workspace: PagedAttentionWorkspace::new(batch, config.max_context)?,
             tokens: DeviceBuffer::zeroed(batch)?,
-            logits: DeviceBuffer::zeroed(batch * VOCAB_SIZE)?,
-            sampler: Argmax::new(batch, VOCAB_SIZE)?,
+            // Проверка черновиков просит логиты сразу на k+1 строк, даже
+            // когда последовательность одна.
+            logits: DeviceBuffer::zeroed(batch.max(MAX_SPECULATION_ROWS) * VOCAB_SIZE)?,
+            sampler: Argmax::new(batch.max(MAX_SPECULATION_ROWS), VOCAB_SIZE)?,
             decode_graphs: (0..batch).map(|_| None).collect(),
             captured_weights: None,
             profile: None,
@@ -531,6 +557,165 @@ impl Executor {
             .as_ref()
             .map_or(0, DeltaPrefillWorkspace::bytes);
         state + conv + keys + values + scan
+    }
+
+    /// Прогон k+1 токенов по черновому слоту состояния: возвращает argmax
+    /// модели для каждой строки.
+    ///
+    /// Настоящее состояние последовательности не трогается — пока неизвестно,
+    /// сколько токенов принято, трогать его нельзя. KV-страницы пишутся сразу
+    /// всем строкам: отвергнутые позиции перезапишет следующий шаг.
+    pub fn verify_speculation(
+        &mut self,
+        weights: &ModelWeights,
+        tokens: &[u32],
+        start_position: usize,
+        sequence: usize,
+    ) -> Result<Vec<u32>> {
+        let rows = tokens.len();
+        assert!((1..=MAX_SPECULATION_ROWS).contains(&rows));
+        assert!(sequence < self.max_batch);
+        assert!(start_position + rows <= self.max_context);
+
+        if self.speculation_mixer.is_empty() {
+            for _ in 0..NUM_LINEAR_LAYERS {
+                self.speculation_mixer.push(DeviceBuffer::zeroed(
+                    MAX_SPECULATION_ROWS * MIXER_FUSED_WIDTH,
+                )?);
+            }
+        }
+        let scratch = self.speculation_slot();
+        for layer in 0..NUM_LINEAR_LAYERS {
+            let (state, conv) = (&mut self.state_pools[layer], &mut self.conv_pools[layer]);
+            state.copy_within(
+                scratch * STATE_ELEMS,
+                sequence * STATE_ELEMS,
+                STATE_ELEMS,
+                &self.stream,
+            )?;
+            conv.copy_within(
+                scratch * CONV_STATE_ELEMS,
+                sequence * CONV_STATE_ELEMS,
+                CONV_STATE_ELEMS,
+                &self.stream,
+            )?;
+        }
+
+        self.speculation_rows = rows;
+        let block_ids: Vec<u32> = (0..self.max_blocks)
+            .map(|block| (sequence * self.max_blocks + block) as u32)
+            .collect();
+        let segment = Segment {
+            state_slot: scratch,
+            position_start: start_position,
+            row_begin: 0,
+            tokens: rows,
+            logits_row: 0,
+        };
+        let result = self.forward_segments(
+            weights,
+            &[segment],
+            0,
+            tokens,
+            &block_ids,
+            &[0, block_ids.len()],
+        );
+        self.speculation_rows = 0;
+        result?;
+        self.stream.synchronize()?;
+        self.argmax_to_host(rows)
+    }
+
+    /// Принять первые `accepted` строк последнего шага проверки.
+    ///
+    /// Если приняты все, достаточно перенести черновое состояние в слот
+    /// последовательности. Если нет — conv и скан доигрываются по сохранённым
+    /// входам миксера, и второго прохода по весам это не стоит.
+    pub fn commit_speculation(
+        &mut self,
+        weights: &ModelWeights,
+        rows: usize,
+        accepted: usize,
+        sequence: usize,
+    ) -> Result<()> {
+        assert!(accepted > 0 && accepted <= rows && rows <= MAX_SPECULATION_ROWS);
+        let scratch = self.speculation_slot();
+        if accepted == rows {
+            for layer in 0..NUM_LINEAR_LAYERS {
+                self.state_pools[layer].copy_within(
+                    sequence * STATE_ELEMS,
+                    scratch * STATE_ELEMS,
+                    STATE_ELEMS,
+                    &self.stream,
+                )?;
+                self.conv_pools[layer].copy_within(
+                    sequence * CONV_STATE_ELEMS,
+                    scratch * CONV_STATE_ELEMS,
+                    CONV_STATE_ELEMS,
+                    &self.stream,
+                )?;
+            }
+            return self.stream.synchronize();
+        }
+
+        assert!(
+            !self.speculation_mixer.is_empty(),
+            "фиксация без предшествующей проверки"
+        );
+        let capacity = self.max_batch + 1;
+        let replay_mode = self.delta_state_mode_for_replay();
+        let mut linear_layer = 0;
+        for layer in weights.layers.iter() {
+            let Mixer::Linear(mixer) = &layer.mixer else {
+                continue;
+            };
+            let saved = &self.speculation_mixer[linear_layer];
+            mixer.prepare.prepare_prefill(
+                RowView::packed(saved, MIXER_FUSED_WIDTH),
+                RowView::strided(saved, MIXER_A_OFFSET, MIXER_FUSED_WIDTH),
+                RowView::strided(saved, MIXER_B_OFFSET, MIXER_FUSED_WIDTH),
+                &mut self.conv_pools[linear_layer],
+                &mut self.prefill.prepared,
+                capacity,
+                sequence,
+                accepted,
+                0,
+                &self.stream,
+            )?;
+            delta_net::prefill_slot(
+                &mut self.state_pools[linear_layer],
+                &self.prefill.prepared.inputs(),
+                &mut self.prefill.delta_out,
+                capacity,
+                sequence,
+                accepted,
+                0,
+                replay_mode,
+                &self.stream,
+            )?;
+            linear_layer += 1;
+        }
+        self.stream.synchronize()
+    }
+
+    /// Доигрывание идёт рекуррентным сканом: строк там единицы, а чанковая
+    /// форма на такой длине только теряет на подготовке.
+    fn delta_state_mode_for_replay(&self) -> DeltaStateMode {
+        match self.delta_state_mode {
+            DeltaStateMode::Wy => DeltaStateMode::Bf16,
+            other => other,
+        }
+    }
+
+    /// Слотов состояния: по одному на последовательность плюс черновой,
+    /// на котором проверяются спекулятивные токены.
+    pub fn state_capacity(&self) -> usize {
+        self.max_batch + 1
+    }
+
+    /// Индекс чернового слота.
+    pub fn speculation_slot(&self) -> usize {
+        self.max_batch
     }
 
     pub fn kv_pool_blocks(&self) -> usize {
@@ -958,6 +1143,14 @@ impl Executor {
         mark!("upload");
         self.upload_segments(segments, input_tokens, block_ids, block_bounds)?;
 
+        let state_capacity = self.max_batch + 1;
+        let speculation_rows = self.speculation_rows;
+        // Рекуррентная форма — это режим точности состояния; `Wy` в ней не
+        // выражается, поэтому короткий отрезок считается bf16-проходом.
+        let recurrent_mode = match self.delta_state_mode {
+            DeltaStateMode::Wy => DeltaStateMode::Bf16,
+            other => other,
+        };
         let prefill = &mut self.prefill;
         mark!("embed");
         weights
@@ -987,6 +1180,15 @@ impl Executor {
                         live,
                         &self.stream,
                     )?;
+                    if speculation_rows > 0 {
+                        self.speculation_mixer[linear_layer].copy_from_device_at(
+                            0,
+                            &prefill.mixer_in,
+                            0,
+                            live * MIXER_FUSED_WIDTH,
+                            &self.stream,
+                        )?;
+                    }
                     // The recurrence is per sequence, but the one-token rows
                     // are contiguous from row zero and share a single launch.
                     if decode_rows > 0 {
@@ -1006,7 +1208,7 @@ impl Executor {
                             &mut self.conv_pools[linear_layer],
                             &prefill.decode_slots,
                             &mut prefill.prepared,
-                            self.max_batch,
+                            state_capacity,
                             decode_rows,
                             &self.stream,
                         )?;
@@ -1016,7 +1218,7 @@ impl Executor {
                             &prefill.decode_slots,
                             &prefill.prepared.inputs(),
                             &mut prefill.delta_out,
-                            self.max_batch,
+                            state_capacity,
                             decode_rows,
                             &self.stream,
                         )?;
@@ -1037,20 +1239,26 @@ impl Executor {
                             ),
                             &mut self.conv_pools[linear_layer],
                             &mut prefill.prepared,
-                            self.max_batch,
+                            state_capacity,
                             segment.state_slot,
                             segment.tokens,
                             segment.row_begin,
                             &self.stream,
                         )?;
                         mark!("delta.scan_prefill");
-                        match &mut self.delta_prefill {
+                        // Чанковая форма окупается от пары сотен токенов: на
+                        // коротком отрезке её шесть подготовительных запусков
+                        // на слой дороже самого скана. Проверка спекуляции
+                        // несёт k+1 строку — это как раз тот случай.
+                        let wy = self.delta_prefill.is_some()
+                            && segment.tokens >= MIN_WY_TOKENS;
+                        match &mut self.delta_prefill.as_mut().filter(|_| wy) {
                             Some(workspace) => delta_net::prefill_slot_wy(
                                 &mut self.state_pools[linear_layer],
                                 &prefill.prepared.inputs(),
                                 &mut prefill.delta_out,
                                 workspace,
-                                self.max_batch,
+                                state_capacity,
                                 segment.state_slot,
                                 segment.tokens,
                                 segment.row_begin,
@@ -1060,11 +1268,11 @@ impl Executor {
                                 &mut self.state_pools[linear_layer],
                                 &prefill.prepared.inputs(),
                                 &mut prefill.delta_out,
-                                self.max_batch,
+                                state_capacity,
                                 segment.state_slot,
                                 segment.tokens,
                                 segment.row_begin,
-                                self.delta_state_mode,
+                                recurrent_mode,
                                 &self.stream,
                             )?,
                         }
@@ -1252,6 +1460,33 @@ impl Executor {
             )?;
         }
 
+        // Проверке черновиков нужен argmax каждой строки, а не только
+        // последней: именно по ним и решается, сколько токенов принято.
+        if speculation_rows > 0 {
+            for row in 0..speculation_rows {
+                prefill.host_last_rows[row] = row as u32;
+            }
+            prefill
+                .last_rows
+                .copy_from_slice_at(0, &prefill.host_last_rows[..speculation_rows])?;
+            mark!("gather_rows");
+            qwc_cuda::gather_rows_bf16(
+                &prefill.normed,
+                &prefill.last_rows,
+                &mut prefill.last_hidden,
+                speculation_rows,
+                HIDDEN_SIZE,
+                &self.stream,
+            )?;
+            mark!("lm_head");
+            return weights.lm_head.logits(
+                &prefill.last_hidden,
+                &mut self.logits,
+                speculation_rows,
+                &self.stream,
+            );
+        }
+
         // One vocabulary pass for the whole step. Running the projection per
         // sequence would re-read the whole 1.27 GB lm_head each time, so the
         // last row of every segment is gathered into a dense buffer first.
@@ -1310,6 +1545,7 @@ impl Executor {
             &self.stream,
         )?;
 
+        let state_capacity = self.state_capacity();
         self.mark("delta.prepare")?;
         mixer.prepare.prepare_decode(
             RowView::packed(&self.mixer_in, MIXER_FUSED_WIDTH),
@@ -1318,7 +1554,7 @@ impl Executor {
             &mut self.conv_pools[layer],
             &self.state_slots,
             &mut self.prepared,
-            self.max_batch,
+            state_capacity,
             batch,
             &self.stream,
         )?;
@@ -1328,7 +1564,7 @@ impl Executor {
             &self.state_slots,
             &self.prepared.inputs(),
             &mut self.delta_out,
-            self.max_batch,
+            state_capacity,
             batch,
             &self.stream,
         )?;
@@ -1720,6 +1956,13 @@ fn project_decode(
 /// `rows` is the live prefix of the arena. Quantizing and multiplying the dead
 /// padding rows as well costs real tensor-core time once the arena is large, so
 /// a fused step pays only for the tokens it carries. CUTLASS needs M >= 3.
+/// Проекция строк шага. На широком шаге это W4A4 на тензорных ядрах, на
+/// узком — тот же выбор, что в decode.
+///
+/// Узкий шаг бывает не только в decode: проверка спекулятивных токенов несёт
+/// k+1 строку одной последовательности, и на такой ширине W4A4 читает веса
+/// вдвое медленнее W4A16 (530 против 1379 ГБ/с по `nvfp4bench`). Пока выбор
+/// был прибит к W4A4, шаг проверки стоил дороже целого шага decode.
 fn project_w4a4(
     projection: &Projection,
     input: &DeviceBuffer<u16>,
@@ -1729,6 +1972,9 @@ fn project_w4a4(
     rows: usize,
     stream: &Stream,
 ) -> Result<()> {
+    if rows <= nvfp4::MAX_W4A4_BATCH {
+        return project_decode(projection, input, quantized, output, workspace, rows, stream);
+    }
     quantized.quantize_bf16_rows(input, projection.input_global_scale, rows.max(3), stream)?;
     projection
         .linear

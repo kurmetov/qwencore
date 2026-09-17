@@ -183,6 +183,34 @@ impl<T> DeviceBuffer<T> {
         })
     }
 
+    /// Копия диапазона внутри одного буфера: снимок слота состояния под
+    /// откат спекуляции и возврат принятого состояния на место.
+    pub fn copy_within(
+        &mut self,
+        destination_offset: usize,
+        source_offset: usize,
+        len: usize,
+        stream: &crate::Stream,
+    ) -> Result<()> {
+        assert!(destination_offset + len <= self.len && source_offset + len <= self.len);
+        if len == 0 {
+            return Ok(());
+        }
+        let size = std::mem::size_of::<T>();
+        // SAFETY: оба диапазона внутри аллокации, проверено выше.
+        let destination = unsafe { (self.ptr as *mut u8).add(destination_offset * size).cast() };
+        let from = unsafe { (self.ptr as *const u8).add(source_offset * size).cast() };
+        check(unsafe {
+            ffi::cudaMemcpyAsync(
+                destination,
+                from,
+                len * size,
+                ffi::MEMCPY_DEVICE_TO_DEVICE,
+                stream.raw(),
+            )
+        })
+    }
+
     /// Zeroes an element range in place without a host-sized staging buffer.
     pub fn zero_range(&mut self, start: usize, len: usize) -> Result<()> {
         assert!(start <= self.len && len <= self.len - start);

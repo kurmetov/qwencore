@@ -244,9 +244,13 @@ impl DeltaPreprocessor {
     ) -> Result<()> {
         assert!(tokens > 0 && row_offset + tokens <= output.batch);
         assert!(state_slot < state_capacity);
-        assert!(mixed_qkv.fits(output.batch, qwc_core::arch::LA_CONV_CHANNELS));
-        assert!(a_projection.fits(output.batch, GATE_ELEMS));
-        assert!(b_projection.fits(output.batch, GATE_ELEMS));
+        // Проверяются строки, которых кернел действительно касается, а не вся
+        // ёмкость арены: доигрывание принятых черновиков подаёт вход из
+        // маленького сохранённого буфера на несколько строк.
+        let used = row_offset + tokens;
+        assert!(mixed_qkv.fits(used, qwc_core::arch::LA_CONV_CHANNELS));
+        assert!(a_projection.fits(used, GATE_ELEMS));
+        assert!(b_projection.fits(used, GATE_ELEMS));
         assert_eq!(a_projection.stride(), b_projection.stride());
         assert_eq!(conv_state_pool.len(), state_capacity * CONV_STATE_ELEMS);
         check(unsafe {

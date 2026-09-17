@@ -29,6 +29,9 @@ pub enum DecodeKernel {
 /// перечитал бы веса несколько раз, поэтому всегда выбирается W4A4.
 pub fn select_decode_kernel(batch: usize, out_features: usize, in_features: usize) -> DecodeKernel {
     assert!((1..=MAX_W4A4_BATCH).contains(&batch));
+    // Замер (`nvfp4bench`): W4A16 держит 1513 ГБ/с на одной строке, но
+    // проседает до 840 на четырёх, тогда как W4A4 идёт ровно около 1000 при
+    // любом batch. Отсюда и граница.
     if batch <= 3 || (batch == 4 && out_features <= in_features) {
         DecodeKernel::W4A16
     } else {
