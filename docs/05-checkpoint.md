@@ -1,5 +1,9 @@
 # Раскладка чекпоинта QUASAR-NVFP4
 
+Источник — `QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4` на Hugging Face; качается
+`./scripts/fetch-checkpoint.sh` (переопределяется через `REPO` и `DEST`,
+докачка поддерживается). Разбор раскладки:
+
 `cargo run -p qwc-model --bin inspect`
 
 ## Формат квантизации

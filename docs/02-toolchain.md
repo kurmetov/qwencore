@@ -7,8 +7,40 @@ GPU        NVIDIA GeForce RTX 5090, sm_120, 170 SM
 драйвер    595.84 (рантайм CUDA 13.2)
 toolkit    CUDA 13.1.115 из репозиториев Ubuntu 26.04 (/usr/local/cuda-13.1)
 rustc      1.98.1
-CUTLASS    3.19 (third_party/cutlass, не в гите)
+CUTLASS    4.8.0 (third_party/cutlass, не в гите — см. ниже)
 ```
+
+## Что нужно достать самому
+
+Двух каталогов в `third_party/` нет в гите, и без них `qwc-cuda` не собирается
+(`crates/qwc-cuda/build.rs` требует оба):
+
+```bash
+git clone --depth 1 --branch v4.8.0 https://github.com/NVIDIA/cutlass third_party/cutlass
+```
+
+```bash
+./scripts/gen-cuda-shim.sh third_party/cuda-shim
+```
+
+Версия CUTLASS существенна: NVFP4-атом `SM120_16x8x64_TN_VS` и примеры `79b`,
+`91`, `93`, `112` появились в ветке 4.x. Проверить, что подтянулось именно
+4.8.0, можно по `third_party/cutlass/include/cutlass/version.h`.
+
+`nvcc` не лежит в `PATH` по умолчанию — его нужно добавить, иначе молча
+отваливаются и наша сборка, и FlashInfer у vLLM:
+
+```bash
+export PATH=/usr/local/cuda/bin:$PATH
+```
+
+Чекпоинт качается отдельным скриптом (докачка поддерживается, можно прерывать):
+
+```bash
+./scripts/fetch-checkpoint.sh
+```
+
+## Почему toolkit из репозиториев Ubuntu
 
 Toolkit взят из репозиториев Ubuntu, а не с сайта NVIDIA: версия 13.1 гарантированно
 попадает в поддержку драйвера 595.84 и не тянет за собой замену драйвера.
@@ -93,7 +125,7 @@ SM120 использует SM80-style `mma.sync` с блочными шкала�
 датацентрового Blackwell. Всё, что построено на tcgen05 (DeepGEMM, часть SM100-схем
 CUTLASS), на 5090 не соберётся.
 
-Нужная инструкция в CUTLASS 3.19 есть:
+Нужная инструкция в CUTLASS 4.8.0 есть:
 
 ```
 mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4
