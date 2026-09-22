@@ -24,6 +24,7 @@
 // обновляются независимо друг от друга — связывает их только скаляр k.q.
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include "limits.cuh"
@@ -90,6 +91,237 @@ constexpr int kPrefillBlock = 64;
 // 64x64 на голову с её обратной перестаёт помещаться в shared блока.
 constexpr int kWyChunk = 64;
 
+// Шаг рекуррентности для одной строки состояния. Вынесен из кернелов, потому
+// что строку decode читает из двух разных хранений (bf16 и int8), а
+// расходиться этой математике между ними нельзя.
+//
+// Возвращает вклад строки в выход; состояние `s` обновляется на месте.
+__device__ __forceinline__ float delta_row_step(
+    float (&s)[kPerThread], const float* sk, const float* sq,
+    int base, float a, float bt, float v_row, float kq_token) {
+    float u = 0.0f, w = 0.0f;
+    #pragma unroll
+    for (int t = 0; t < kPerThread; ++t) {
+        u += s[t] * sk[base + t];
+        w += s[t] * sq[base + t];
+    }
+    u = warp_sum(u);
+    w = warp_sum(w);
+    u = __shfl_sync(0xffffffff, u, 0);
+    w = __shfl_sync(0xffffffff, w, 0);
+
+    const float c = bt * (v_row - a * u);
+    #pragma unroll
+    for (int t = 0; t < kPerThread; ++t) {
+        s[t] = a * s[t] + c * sk[base + t];
+    }
+    return a * w + c * kq_token;
+}
+
+// ---------------------------------------------------------------------------
+// Восьмибитное хранение состояния
+// ---------------------------------------------------------------------------
+//
+// Строка состояния (128 элементов по dk) хранится как int8 плюс один
+// масштаб f32 на строку. Масштаб именно построчный: вдоль строки идут оба
+// скалярных произведения S k и S q, так что вся сумма делит один масштаб.
+//
+// int8, а не e4m3: строки плоские (пик близок к RMS), и четыре бита
+// экспоненты им не нужны — int8 отдаёт их мантиссе и вчетверо точнее при том
+// же байте (`bench/results/delta-state-8bit.md`).
+//
+// Варп владеет строкой, поэтому на поток приходится ровно kPerThread = 4
+// байта: 32 дорожки дают слитую 128-байтовую транзакцию, как и bf16-путь со
+// своими 256 байтами.
+
+__device__ __forceinline__ void state_load_int8(
+    const int8_t* __restrict__ row, float scale, int lane, float (&s)[kPerThread]) {
+    const char4 packed = *reinterpret_cast<const char4*>(row + lane * kPerThread);
+    s[0] = (float)packed.x * scale;
+    s[1] = (float)packed.y * scale;
+    s[2] = (float)packed.z * scale;
+    s[3] = (float)packed.w * scale;
+}
+
+// Пишет строку и возвращает её масштаб. Масштаб считается по максимуму строки,
+// поэтому перед записью нужна редукция по варпу — она же единственная цена
+// 8-битного хранения сверх самой упаковки.
+__device__ __forceinline__ float state_store_int8(
+    int8_t* __restrict__ row, int lane, const float (&s)[kPerThread]) {
+    float peak = 0.0f;
+    #pragma unroll
+    for (int t = 0; t < kPerThread; ++t) {
+        peak = fmaxf(peak, fabsf(s[t]));
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, off));
+    }
+
+    char4 packed;
+    if (peak == 0.0f) {
+        packed = make_char4(0, 0, 0, 0);
+    } else {
+        const float inverse = 127.0f / peak;
+        int8_t level[kPerThread];
+        #pragma unroll
+        for (int t = 0; t < kPerThread; ++t) {
+            level[t] = (int8_t)(int)fminf(fmaxf(rintf(s[t] * inverse), -127.0f), 127.0f);
+        }
+        packed = make_char4(level[0], level[1], level[2], level[3]);
+    }
+    *reinterpret_cast<char4*>(row + lane * kPerThread) = packed;
+    return peak * (1.0f / 127.0f);
+}
+
+__global__ __launch_bounds__(kBlock) void delta_decode_int8_kernel(
+    int8_t* __restrict__ state,          // [B, kHv, kDv, kDk]
+    float* __restrict__ state_scales,    // [B, kHv, kDv]
+    const uint32_t* __restrict__ state_slots,
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ alpha,
+    const float* __restrict__ beta,
+    const float* __restrict__ kq,
+    float* __restrict__ out)
+{
+    const int h = blockIdx.x;
+    const int b = blockIdx.y;
+    const int state_slot = state_slots == nullptr ? b : (int)state_slots[b];
+    const int hk = h / kRatio;
+
+    const int rows_per_block = kDv / gridDim.z;
+    const int row_begin = blockIdx.z * rows_per_block;
+    const int row_end = row_begin + rows_per_block;
+
+    __shared__ float sk[kDk];
+    __shared__ float sq[kDk];
+    // Масштабы блока проходят через shared, а не через глобальную память
+    // построчно. Запись четырёх байт одной дорожкой — это частичная
+    // транзакция на строку состояния, и она стоила 2.97 мс из 3.3 мс
+    // накладных 8-битного хранения при c=32: дороже всей квантизации и всего
+    // трафика самого состояния вместе взятых.
+    __shared__ float srow_scale[kDv];
+
+    const float* kp = k + (size_t)(b * kHk + hk) * kDk;
+    const float* qp = q + (size_t)(b * kHk + hk) * kDk;
+    for (int i = threadIdx.x; i < kDk; i += kBlock) {
+        sk[i] = kp[i];
+        sq[i] = qp[i];
+    }
+
+    const float a = alpha[b * kHv + h];
+    const float bt = beta[b * kHv + h];
+    const float kq_token = kq[b * kHk + hk];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    constexpr int kWarps = kBlock / 32;
+
+    int8_t* S = state + (size_t)(state_slot * kHv + h) * kDv * kDk;
+    float* scales = state_scales + (size_t)(state_slot * kHv + h) * kDv;
+    const float* vp = v + (size_t)(b * kHv + h) * kDv;
+    float* op = out + (size_t)(b * kHv + h) * kDv;
+
+    // Чтение масштабов — одним слитным обращением на блок, в той же
+    // загрузке, что k и q.
+    const int rows_here = row_end - row_begin;
+    for (int i = threadIdx.x; i < rows_here; i += kBlock) {
+        srow_scale[i] = scales[row_begin + i];
+    }
+    __syncthreads();
+
+    for (int row = row_begin + warp; row < row_end; row += kWarps) {
+        int8_t* srow = S + (size_t)row * kDk;
+        float s[kPerThread];
+        state_load_int8(srow, srow_scale[row - row_begin], lane, s);
+
+        const float contribution = delta_row_step(
+            s, sk, sq, lane * kPerThread, a, bt, vp[row], kq_token);
+        if (lane == 0) {
+            op[row] = contribution;
+        }
+
+        const float scale = state_store_int8(srow, lane, s);
+        if (lane == 0) {
+            srow_scale[row - row_begin] = scale;
+        }
+    }
+
+    __syncthreads();
+    for (int i = threadIdx.x; i < rows_here; i += kBlock) {
+        scales[row_begin + i] = srow_scale[i];
+    }
+}
+
+// Перекладка слота между хранениями. Префилл последовательности идёт по
+// расквантованной bf16-копии и квантуется один раз в конце промпта: если
+// его сегменты перезапускать с 8-битного состояния, весь остаток промпта
+// считается с испорченного S_0, и MAE подскакивает в 11 раз на границе
+// `PREFILL_CHUNK_SIZE` (`bench/results/delta-state-8bit.md`).
+__global__ __launch_bounds__(kBlock) void delta_state_pack_kernel(
+    const __nv_bfloat16* __restrict__ source,
+    int8_t* __restrict__ packed,
+    float* __restrict__ scales,
+    int source_slot, int packed_slot)
+{
+    const int h = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    constexpr int kWarps = kBlock / 32;
+
+    const __nv_bfloat16* S = source + (size_t)(source_slot * kHv + h) * kDv * kDk;
+    int8_t* D = packed + (size_t)(packed_slot * kHv + h) * kDv * kDk;
+    float* scale_row = scales + (size_t)(packed_slot * kHv + h) * kDv;
+
+    for (int row = blockIdx.z * (kDv / gridDim.z) + warp;
+         row < (blockIdx.z + 1) * (kDv / gridDim.z); row += kWarps) {
+        const float2 raw = reinterpret_cast<const float2*>(S + (size_t)row * kDk)[lane];
+        const __nv_bfloat162 p0 = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
+        const __nv_bfloat162 p1 = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
+        float s[kPerThread] = {
+            __bfloat162float(p0.x), __bfloat162float(p0.y),
+            __bfloat162float(p1.x), __bfloat162float(p1.y)};
+
+        const float scale = state_store_int8(D + (size_t)row * kDk, lane, s);
+        if (lane == 0) {
+            scale_row[row] = scale;
+        }
+    }
+}
+
+__global__ __launch_bounds__(kBlock) void delta_state_unpack_kernel(
+    const int8_t* __restrict__ packed,
+    const float* __restrict__ scales,
+    __nv_bfloat16* __restrict__ destination,
+    int packed_slot, int destination_slot)
+{
+    const int h = blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    constexpr int kWarps = kBlock / 32;
+
+    const int8_t* S = packed + (size_t)(packed_slot * kHv + h) * kDv * kDk;
+    const float* scale_row = scales + (size_t)(packed_slot * kHv + h) * kDv;
+    __nv_bfloat16* D = destination + (size_t)(destination_slot * kHv + h) * kDv * kDk;
+
+    for (int row = blockIdx.z * (kDv / gridDim.z) + warp;
+         row < (blockIdx.z + 1) * (kDv / gridDim.z); row += kWarps) {
+        float s[kPerThread];
+        state_load_int8(S + (size_t)row * kDk, scale_row[row], lane, s);
+
+        const __nv_bfloat162 p0 =
+            __nv_bfloat162(__float2bfloat16(s[0]), __float2bfloat16(s[1]));
+        const __nv_bfloat162 p1 =
+            __nv_bfloat162(__float2bfloat16(s[2]), __float2bfloat16(s[3]));
+        float2 raw;
+        raw.x = *reinterpret_cast<const float*>(&p0);
+        raw.y = *reinterpret_cast<const float*>(&p1);
+        reinterpret_cast<float2*>(D + (size_t)row * kDk)[lane] = raw;
+    }
+}
+
 __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
     __nv_bfloat16* __restrict__ state,   // [B, kHv, kDv, kDk]
     const uint32_t* __restrict__ state_slots,
@@ -150,31 +382,15 @@ __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
         s[2] = __bfloat162float(p1.x);
         s[3] = __bfloat162float(p1.y);
 
-        const int base = lane * kPerThread;
-
-        // Оба матвека за один проход, пока строка в регистрах.
-        float u = 0.0f, w = 0.0f;
-        #pragma unroll
-        for (int t = 0; t < kPerThread; ++t) {
-            u += s[t] * sk[base + t];
-            w += s[t] * sq[base + t];
-        }
-        u = warp_sum(u);
-        w = warp_sum(w);
-        u = __shfl_sync(0xffffffff, u, 0);
-        w = __shfl_sync(0xffffffff, w, 0);
-
-        const float c = bt * (vp[row] - a * u);
+        // Оба матвека за один проход, пока строка в регистрах, и обновление
+        // на месте: повторное чтение не нужно.
+        const float contribution = delta_row_step(
+            s, sk, sq, lane * kPerThread, a, bt, vp[row], kq_token);
 
         if (lane == 0) {
-            op[row] = a * w + c * kq_token;
+            op[row] = contribution;
         }
 
-        // Обновление на месте: строка уже в регистрах, повторное чтение не нужно.
-        #pragma unroll
-        for (int t = 0; t < kPerThread; ++t) {
-            s[t] = a * s[t] + c * sk[base + t];
-        }
         p0 = __nv_bfloat162(__float2bfloat16(s[0]), __float2bfloat16(s[1]));
         p1 = __nv_bfloat162(__float2bfloat16(s[2]), __float2bfloat16(s[3]));
         packed.x = *reinterpret_cast<float*>(&p0);
@@ -1001,6 +1217,62 @@ extern "C" cudaError_t qwc_delta_decode(
     return cudaGetLastError();
 }
 
+extern "C" cudaError_t qwc_delta_decode_int8(
+    void* state, float* state_scales, const uint32_t* state_slots,
+    const float* q, const float* k, const float* v,
+    const float* alpha, const float* beta, const float* kq, float* out,
+    int state_capacity, int batch, cudaStream_t stream)
+{
+    if (state == nullptr || state_scales == nullptr || q == nullptr ||
+        k == nullptr || v == nullptr || alpha == nullptr || beta == nullptr ||
+        kq == nullptr || out == nullptr ||
+        state_capacity < batch || batch <= 0 || batch > 128) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(kHv, batch, splits_for(batch));
+    delta_decode_int8_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<int8_t*>(state), state_scales, state_slots,
+        q, k, v, alpha, beta, kq, out);
+    return cudaGetLastError();
+}
+
+// Один слот bf16 -> один слот int8 и обратно. Оба конца адресуются слотами,
+// потому что bf16-копия у движка одна, а 8-битных слотов столько же, сколько
+// последовательностей.
+extern "C" cudaError_t qwc_delta_state_pack(
+    const void* source, void* packed, float* scales,
+    int source_capacity, int source_slot,
+    int packed_capacity, int packed_slot, cudaStream_t stream)
+{
+    if (source == nullptr || packed == nullptr || scales == nullptr ||
+        source_slot < 0 || source_slot >= source_capacity ||
+        packed_slot < 0 || packed_slot >= packed_capacity) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(kHv, 1, splits_for(1));
+    delta_state_pack_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(source), static_cast<int8_t*>(packed),
+        scales, source_slot, packed_slot);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t qwc_delta_state_unpack(
+    const void* packed, const float* scales, void* destination,
+    int packed_capacity, int packed_slot,
+    int destination_capacity, int destination_slot, cudaStream_t stream)
+{
+    if (packed == nullptr || scales == nullptr || destination == nullptr ||
+        packed_slot < 0 || packed_slot >= packed_capacity ||
+        destination_slot < 0 || destination_slot >= destination_capacity) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(kHv, 1, splits_for(1));
+    delta_state_unpack_kernel<<<grid, kBlock, 0, stream>>>(
+        static_cast<const int8_t*>(packed), scales,
+        static_cast<__nv_bfloat16*>(destination), packed_slot, destination_slot);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t qwc_delta_prefill(
     void* state,
     const float* q,
@@ -1149,5 +1421,126 @@ extern "C" cudaError_t qwc_delta_prefill_wy(
         wy_fused_shared_bytes(), stream>>>(
         key_tile, query_tile, inverse, output_factor, value_tile,
         log_decay, beta, selected_state, out, tokens, chunks);
+    return cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// Перекладка состояния на 8-битную сетку
+// ---------------------------------------------------------------------------
+//
+// Состояние остаётся в bf16: кернел только сажает значения на ту сетку, на
+// которой они оказались бы при 8-битном хранении, и возвращает обратно.
+// Биты теряются ровно те же, поэтому diff-eval даёт настоящий ответ по
+// точности, пока раскладка, пулы и бюджет ещё не тронуты.
+//
+// Масштаб — на строку состояния (128 элементов по dk): именно вдоль строки
+// идут оба скалярных произведения S k и S q, так что вся сумма делит один
+// масштаб. Строки плоские (пик близок к RMS), поэтому int8 с масштабом по
+// максимуму на строке бьёт e4m3 вчетверо при том же байте: e4m3 тратит
+// четыре бита на экспоненту, которая строке не нужна.
+//
+// Обратный ход пишет bf16, то есть добавляет собственное округление bf16
+// поверх 8-битного. Настоящее хранение деквантует в fp32-регистры и этой
+// добавки не имеет, так что замер через этот кернел — оценка сверху.
+
+namespace {
+
+constexpr int kRequantBlock = 256;
+
+// 1 — int8 с построчным масштабом, 2 — e4m3 с построчным масштабом.
+template <int kMode>
+__global__ __launch_bounds__(kRequantBlock) void delta_state_requantize_kernel(
+    __nv_bfloat16* __restrict__ state,
+    const uint32_t* __restrict__ state_slots,
+    int first_slot)
+{
+    const int h = blockIdx.x;
+    const int b = blockIdx.y;
+    const int slot = state_slots == nullptr ? first_slot + b : (int)state_slots[b];
+
+    const int rows_per_block = kDv / gridDim.z;
+    const int row_begin = blockIdx.z * rows_per_block;
+    const int row_end = row_begin + rows_per_block;
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    constexpr int kWarps = kRequantBlock / 32;
+
+    __nv_bfloat16* S = state + (size_t)(slot * kHv + h) * kDv * kDk;
+
+    for (int row = row_begin + warp; row < row_end; row += kWarps) {
+        float2* srow = reinterpret_cast<float2*>(S + (size_t)row * kDk);
+
+        float2 packed = srow[lane];
+        __nv_bfloat162 p0 = *reinterpret_cast<__nv_bfloat162*>(&packed.x);
+        __nv_bfloat162 p1 = *reinterpret_cast<__nv_bfloat162*>(&packed.y);
+
+        float s[kPerThread];
+        s[0] = __bfloat162float(p0.x);
+        s[1] = __bfloat162float(p0.y);
+        s[2] = __bfloat162float(p1.x);
+        s[3] = __bfloat162float(p1.y);
+
+        float peak = 0.0f;
+        #pragma unroll
+        for (int t = 0; t < kPerThread; ++t) {
+            peak = fmaxf(peak, fabsf(s[t]));
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            peak = fmaxf(peak, __shfl_xor_sync(0xffffffff, peak, off));
+        }
+        if (peak == 0.0f) {
+            continue;
+        }
+
+        if (kMode == 1) {
+            const float step = peak * (1.0f / 127.0f);
+            const float inverse = 1.0f / step;
+            #pragma unroll
+            for (int t = 0; t < kPerThread; ++t) {
+                const float level = fminf(fmaxf(rintf(s[t] * inverse), -127.0f), 127.0f);
+                s[t] = level * step;
+            }
+        } else {
+            const float scale = peak * (1.0f / 448.0f);
+            const float inverse = 1.0f / scale;
+            #pragma unroll
+            for (int t = 0; t < kPerThread; ++t) {
+                const __nv_fp8_e4m3 quantized = __nv_fp8_e4m3(s[t] * inverse);
+                s[t] = (float)quantized * scale;
+            }
+        }
+
+        p0 = __nv_bfloat162(__float2bfloat16(s[0]), __float2bfloat16(s[1]));
+        p1 = __nv_bfloat162(__float2bfloat16(s[2]), __float2bfloat16(s[3]));
+        packed.x = *reinterpret_cast<float*>(&p0);
+        packed.y = *reinterpret_cast<float*>(&p1);
+        srow[lane] = packed;
+    }
+}
+
+}  // namespace
+
+// `state_slots` задаёт слоты поимённо (decode); при nullptr берётся
+// `count` слотов подряд с `first_slot` (один сегмент prefill).
+extern "C" cudaError_t qwc_delta_state_requantize(
+    void* state, const uint32_t* state_slots,
+    int first_slot, int state_capacity, int count, int mode,
+    cudaStream_t stream)
+{
+    if (state == nullptr || count <= 0 || state_capacity <= 0 ||
+        first_slot < 0 || first_slot + count > state_capacity ||
+        (mode != 1 && mode != 2)) {
+        return cudaErrorInvalidValue;
+    }
+    dim3 grid(kHv, count, splits_for(count));
+    if (mode == 1) {
+        delta_state_requantize_kernel<1><<<grid, kRequantBlock, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(state), state_slots, first_slot);
+    } else {
+        delta_state_requantize_kernel<2><<<grid, kRequantBlock, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(state), state_slots, first_slot);
+    }
     return cudaGetLastError();
 }

@@ -8,7 +8,11 @@ use crate::error::{Result, check};
 use crate::{DeviceBuffer, Stream, bf16, ffi};
 
 pub const GROUP_SIZE: usize = 16;
-pub const MAX_W4A16_BATCH: usize = 4;
+pub const MAX_W4A16_BATCH: usize = 6;
+/// Сколько строк ядро вообще умеет: `kMaxBatch` в `cuda/nvfp4.cu`. Политика
+/// (`MAX_W4A16_BATCH`) стоит ниже — там, где замер шага перестал выигрывать.
+/// Свипу нужен именно этот потолок, чтобы видеть, что за границей.
+pub const MAX_W4A16_KERNEL_BATCH: usize = 8;
 pub const MAX_W4A4_BATCH: usize = 128;
 /// Потолок строк одного W4A4-вызова: ёмкость арены префилла
 /// (`PREFILL_CHUNK_SIZE`). Ограничение не кернела, а разметки буферов.
@@ -23,19 +27,56 @@ pub enum DecodeKernel {
 
 /// Измеренная на RTX 5090 граница для форм Qwen3.8.
 ///
-/// B<=3 остаётся на W4A16 ради latency и отсутствия activation-quantization.
-/// При B=4 tensor cores выигрывают на широких проекциях, но down_proj
-/// с N<K всё ещё быстрее в W4A16. Начиная с B=5 повторный W4A16-проход
-/// перечитал бы веса несколько раз, поэтому всегда выбирается W4A4.
+/// До batch 6 включительно берётся W4A16: он не квантует активации, и после
+/// амортизации shared-загрузок по двум строкам весов он уже не проигрывает
+/// тензорным ядрам даже на широких проекциях (`nvfp4bench`, batch 4:
+/// q+gate 958 против 953 ГБ/с у W4A4, gate/up 1156 против 980, down 1108
+/// против 1100).
+///
+/// Граница стояла на 4, пока ядро не было инстанцировано выше. Замер шага
+/// (`stepprofile`, чистый decode, мс на шаг) показал, что переход в W4A4
+/// обходится дороже самого ядра:
+///
+/// | concurrency | W4A16 | W4A4 |
+/// |---:|---:|---:|
+/// | 5 | **18.63** | 21.67 |
+/// | 6 | **20.48** | 21.80 |
+/// | 7 | 24.94 | **22.39** |
+/// | 8 | 30.52 | **22.27** |
+///
+/// До правки пятая последовательность **снижала** пропускную: 4 строки за
+/// 16.3 мс это 245 tok/s, а 5 за 21.7 — 231. Выше шести W4A16 упирается в
+/// регистры и shared, и выигрывают тензорные ядра.
+///
+/// Граница важна не только по скорости: W4A4 квантует активации, и строка 0
+/// спекулятивной проверки расходится с обычным decode на 0.64 по логитам
+/// против 0.11 у W4A16. На близких логитах это переворачивает argmax.
+/// Форма на границу влияет: у `down` длинный K и W4A4 обгоняет уже с пятой
+/// строки, а у `k`/`v` выход слишком узкий, чтобы занять тензорный тайл, и
+/// W4A4 проигрывает на любом batch. Таблица — в теле функции.
 pub fn select_decode_kernel(batch: usize, out_features: usize, in_features: usize) -> DecodeKernel {
     assert!((1..=MAX_W4A4_BATCH).contains(&batch));
-    // Замер (`nvfp4bench`): W4A16 держит 1513 ГБ/с на одной строке, но
-    // проседает до 840 на четырёх, тогда как W4A4 идёт ровно около 1000 при
-    // любом batch. Отсюда и граница.
-    if batch <= 3 || (batch == 4 && out_features <= in_features) {
-        DecodeKernel::W4A16
-    } else {
-        DecodeKernel::W4A4
+    // Узкий выход — k и v [1024, 5120]. Тензорным ядрам там нечем занять
+    // тайл 128x128, и W4A4 держит 157 ГБ/с на любом batch против 206..578 у
+    // W4A16. Граница здесь не в batch, а в том, что выход слишком узкий.
+    if out_features <= 2048 {
+        return match batch <= MAX_W4A16_KERNEL_BATCH {
+            true => DecodeKernel::W4A16,
+            false => DecodeKernel::W4A4,
+        };
+    }
+    // Длинный K — down [5120, 17408]. На нём W4A16 обгоняет только до
+    // четырёх строк (b=5: 976 против 1083 ГБ/с, b=6: 901 против 1098),
+    // потому что k-тайл приходится проходить втрое чаще остальных форм.
+    if in_features >= 3 * out_features {
+        return match batch <= 4 {
+            true => DecodeKernel::W4A16,
+            false => DecodeKernel::W4A4,
+        };
+    }
+    match batch <= MAX_W4A16_BATCH {
+        true => DecodeKernel::W4A16,
+        false => DecodeKernel::W4A4,
     }
 }
 
@@ -104,7 +145,9 @@ impl Linear {
         batch: usize,
         stream: &Stream,
     ) -> Result<()> {
-        assert!((1..=MAX_W4A16_BATCH).contains(&batch));
+        // Потолок здесь кернельный, а не политический: на узких формах
+        // `select_decode_kernel` выбирает W4A16 и выше `MAX_W4A16_BATCH`.
+        assert!((1..=MAX_W4A16_KERNEL_BATCH).contains(&batch));
         assert!(input.len() >= batch * self.in_features);
         assert!(output.len() >= batch * self.out_features);
         check(unsafe {
@@ -116,6 +159,42 @@ impl Linear {
                 self.out_features as i32,
                 self.in_features as i32,
                 batch as i32,
+                self.weight_global_scale,
+                stream.raw(),
+            )
+        })
+    }
+
+    /// Тот же W4A16, но с геометрией и раскладкой снаружи — для свипа форм.
+    /// Движок ходит через `forward_w4a16`, где всё выбирается по форме.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_w4a16_tuned(
+        &self,
+        input: &DeviceBuffer<u16>,
+        output: &mut DeviceBuffer<u16>,
+        batch: usize,
+        k_rows: usize,
+        k_threads: usize,
+        k_tile: usize,
+        rows_per_thread: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        assert!((1..=MAX_W4A16_KERNEL_BATCH).contains(&batch));
+        assert!(input.len() >= batch * self.in_features);
+        assert!(output.len() >= batch * self.out_features);
+        check(unsafe {
+            ffi::qwc_nvfp4_w4a16_tuned(
+                self.packed.as_ptr(),
+                self.cutlass_scales.as_ptr(),
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                self.out_features as i32,
+                self.in_features as i32,
+                batch as i32,
+                k_rows as i32,
+                k_threads as i32,
+                k_tile as i32,
+                rows_per_thread as i32,
                 self.weight_global_scale,
                 stream.raw(),
             )
@@ -664,15 +743,30 @@ mod tests {
         );
         assert_eq!(
             super::select_decode_kernel(4, 17_408, 5_120),
-            super::DecodeKernel::W4A4
+            super::DecodeKernel::W4A16
         );
         assert_eq!(
             super::select_decode_kernel(4, 5_120, 17_408),
             super::DecodeKernel::W4A16
         );
+        // down [5120, 17408]: длинный K, W4A4 обгоняет уже с пятой строки.
         assert_eq!(
             super::select_decode_kernel(5, 5_120, 17_408),
             super::DecodeKernel::W4A4
+        );
+        // la_out [5120, 6144]: общая граница — шесть строк.
+        assert_eq!(
+            super::select_decode_kernel(6, 5_120, 6_144),
+            super::DecodeKernel::W4A16
+        );
+        assert_eq!(
+            super::select_decode_kernel(7, 5_120, 6_144),
+            super::DecodeKernel::W4A4
+        );
+        // k и v [1024, 5120]: W4A4 проигрывает на любом batch.
+        assert_eq!(
+            super::select_decode_kernel(8, 1_024, 5_120),
+            super::DecodeKernel::W4A16
         );
     }
 }

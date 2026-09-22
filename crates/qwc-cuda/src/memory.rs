@@ -26,17 +26,47 @@ impl MemoryUsage {
     }
 }
 
+/// Запас на то, что наш учёт не видит: cudaMalloc округляет каждую аллокацию
+/// вверх, и на сотнях буферов разница набегает в сотни мегабайт.
+const FREE_MARGIN: usize = 512 * 1024 * 1024;
+
 /// Sets a hard ceiling for allocations owned by this engine process. Configure
 /// it after creating the CUDA context and before allocating any model buffer.
-pub fn set_memory_limit(bytes: usize) -> std::result::Result<(), &'static str> {
+///
+/// Потолок урезается по фактически свободной памяти карты: рядом живут чужие
+/// процессы, и запрошенный бюджет может просто не существовать. Без этого
+/// движок доходит до середины загрузки и падает на cudaMalloc, тогда как vLLM
+/// в той же точке профилирует свободную память и берёт меньше номинала.
+/// Возвращает лимит, который реально установлен.
+pub fn set_memory_limit(bytes: usize) -> std::result::Result<usize, &'static str> {
     if bytes == 0 {
         return Err("VRAM limit must be positive");
     }
     if MEMORY_USED.load(Ordering::Acquire) != 0 {
         return Err("VRAM limit must be configured before the first allocation");
     }
-    MEMORY_LIMIT.store(bytes, Ordering::Release);
-    Ok(())
+    let effective = match device_free_bytes() {
+        Some(free) => bytes.min(free.saturating_sub(FREE_MARGIN)),
+        None => bytes,
+    };
+    if effective == 0 {
+        return Err("на карте нет свободной памяти под запрошенный бюджет");
+    }
+    MEMORY_LIMIT.store(effective, Ordering::Release);
+    Ok(effective)
+}
+
+/// Свободно байт на устройстве, или `None`, если контекст ещё не создан и
+/// спрашивать некого — тогда лимит остаётся тем, что задал вызывающий.
+///
+/// Это единственная честная величина при делёжке карты: наш собственный учёт
+/// считает запрошенные байты, а не то, во что их округлил драйвер, и не видит
+/// ни контекст, ни графы, ни чужие процессы.
+pub fn device_free_bytes() -> Option<usize> {
+    let (mut free, mut total) = (0usize, 0usize);
+    // SAFETY: обе ссылки валидны; вызов не трогает наши буферы.
+    let status = unsafe { ffi::cudaMemGetInfo(&mut free, &mut total) };
+    (status == 0 && total > 0).then_some(free)
 }
 
 pub fn memory_usage() -> MemoryUsage {

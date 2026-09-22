@@ -213,3 +213,49 @@ fn bf16_embedding_gather_is_bit_exact() {
         );
     }
 }
+
+/// Шортлист обязан давать те же логиты, что полный проход, — иначе черновик
+/// врёт не из-за неполноты списка, а из-за арифметики.
+///
+/// Список специально не отсортирован и берёт строки из разных тайлов: кернел
+/// читает строку по индексу, и порядок не должен ни на что влиять.
+#[test]
+fn subset_logits_match_full_pass_rows() {
+    const ROWS: usize = 517;
+    const COLS: usize = 1280;
+    let host = table(ROWS, COLS);
+    let (vocab, stream) = upload(ROWS, COLS, &host, 64);
+
+    let mut rng = Rng(0x51_0715);
+    let hidden: Vec<u16> = (0..COLS).map(|_| bf16::from_f32(rng.next_f32())).collect();
+    let device_hidden = DeviceBuffer::from_slice(&hidden).expect("скрытое состояние");
+
+    let mut full = DeviceBuffer::<f32>::zeroed(ROWS).expect("полные логиты");
+    vocab
+        .logits(&device_hidden, &mut full, 1, &stream)
+        .expect("полный проход");
+
+    let ids: Vec<u32> = [516u32, 0, 300, 1, 255, 256, 7, 129, 511, 64]
+        .into_iter()
+        .cycle()
+        .take(70)
+        .collect();
+    let device_ids = DeviceBuffer::from_slice(&ids).expect("список строк");
+    let mut subset = DeviceBuffer::<f32>::zeroed(ids.len()).expect("логиты шортлиста");
+    vocab
+        .logits_subset(&device_hidden, &device_ids, &mut subset, ids.len(), &stream)
+        .expect("шортлист");
+    stream.synchronize().expect("синхронизация");
+
+    let full = full.to_vec().expect("копия");
+    let subset = subset.to_vec().expect("копия");
+    let magnitude = full.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+    for (slot, &row) in ids.iter().enumerate() {
+        let want = full[row as usize];
+        let got = subset[slot];
+        assert!(
+            (got - want).abs() <= magnitude * 2e-3,
+            "строка {row} в слоте {slot}: {got} против {want}"
+        );
+    }
+}

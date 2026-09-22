@@ -69,15 +69,11 @@ impl DeltaStateMode {
 /// сразу по всем, поэтому их буферы рассчитаны на полную арену.
 const WY_MAX_CHUNKS: usize = crate::MAX_STEP_ROWS / WY_CHUNK_SIZE;
 
-const WY_QK_TILE_ELEMS: usize =
-    WY_MAX_CHUNKS * LA_NUM_K_HEADS * WY_CHUNK_SIZE * LA_K_HEAD_DIM;
-const WY_GRAM_ELEMS: usize =
-    WY_MAX_CHUNKS * LA_NUM_K_HEADS * WY_CHUNK_SIZE * WY_CHUNK_SIZE;
-const WY_HEAD_MATRIX_ELEMS: usize =
-    WY_MAX_CHUNKS * GATE_ELEMS * WY_CHUNK_SIZE * WY_CHUNK_SIZE;
+const WY_QK_TILE_ELEMS: usize = WY_MAX_CHUNKS * LA_NUM_K_HEADS * WY_CHUNK_SIZE * LA_K_HEAD_DIM;
+const WY_GRAM_ELEMS: usize = WY_MAX_CHUNKS * LA_NUM_K_HEADS * WY_CHUNK_SIZE * WY_CHUNK_SIZE;
+const WY_HEAD_MATRIX_ELEMS: usize = WY_MAX_CHUNKS * GATE_ELEMS * WY_CHUNK_SIZE * WY_CHUNK_SIZE;
 const WY_DECAY_ELEMS: usize = WY_MAX_CHUNKS * GATE_ELEMS * WY_CHUNK_SIZE;
-const WY_VALUE_TILE_ELEMS: usize =
-    WY_MAX_CHUNKS * GATE_ELEMS * WY_CHUNK_SIZE * LA_V_HEAD_DIM;
+const WY_VALUE_TILE_ELEMS: usize = WY_MAX_CHUNKS * GATE_ELEMS * WY_CHUNK_SIZE * LA_V_HEAD_DIM;
 
 /// Resident scratch for the matrix (WY) prefill scan.
 ///
@@ -548,6 +544,260 @@ pub fn prefill_slot_wy(
     })
 }
 
+/// Масштабов на слот и слой: по одному на строку состояния.
+pub const STATE_SCALE_ELEMS: usize = LA_NUM_V_HEADS * LA_V_HEAD_DIM;
+
+/// Восьмибитное хранение состояния одного слоя: int8 плюс построчный масштаб.
+///
+/// Данные и масштабы лежат вместе не ради удобства: строка без своего
+/// масштаба — мусор, и два параллельных `DeviceBuffer` в исполнителе рано или
+/// поздно разъехались бы по ёмкости.
+///
+/// Префилл сюда не пишет. Промпт считается по расквантованной bf16-копии и
+/// упаковывается один раз в конце: перезапуск сегмента префилла с 8-битного
+/// состояния портит весь остаток промпта
+/// (`bench/results/delta-state-8bit.md`).
+pub struct PackedStatePool {
+    data: DeviceBuffer<u8>,
+    scales: DeviceBuffer<f32>,
+    capacity: usize,
+}
+
+impl PackedStatePool {
+    pub fn zeroed(capacity: usize) -> Result<Self> {
+        assert!(capacity > 0);
+        Ok(Self {
+            data: DeviceBuffer::zeroed(capacity * STATE_ELEMS)?,
+            scales: DeviceBuffer::zeroed(capacity * STATE_SCALE_ELEMS)?,
+            capacity,
+        })
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.data.bytes() + self.scales.bytes()
+    }
+
+    /// Обнуляет слот. Нулевая строка представима при любом масштабе, поэтому
+    /// масштабы обнуляются вместе с данными, а не выставляются в единицу.
+    pub fn reset_slot(&mut self, slot: usize) -> Result<()> {
+        assert!(slot < self.capacity);
+        self.data.zero_range(slot * STATE_ELEMS, STATE_ELEMS)?;
+        self.scales
+            .zero_range(slot * STATE_SCALE_ELEMS, STATE_SCALE_ELEMS)
+    }
+
+    /// Обнуляет весь пул.
+    pub fn reset(&mut self) -> Result<()> {
+        for slot in 0..self.capacity {
+            self.reset_slot(slot)?;
+        }
+        Ok(())
+    }
+
+    /// Копирует слот целиком — и данные, и масштабы. Порядок аргументов
+    /// здесь «откуда, куда», а у `copy_within` — наоборот, приёмник первым.
+    pub fn copy_slot(&mut self, from: usize, to: usize, stream: &Stream) -> Result<()> {
+        assert!(from < self.capacity && to < self.capacity);
+        self.data
+            .copy_within(to * STATE_ELEMS, from * STATE_ELEMS, STATE_ELEMS, stream)?;
+        self.scales.copy_within(
+            to * STATE_SCALE_ELEMS,
+            from * STATE_SCALE_ELEMS,
+            STATE_SCALE_ELEMS,
+            stream,
+        )
+    }
+}
+
+/// Один шаг decode по 8-битному состоянию.
+pub fn decode_slots_packed(
+    pool: &mut PackedStatePool,
+    state_slots: &DeviceBuffer<u32>,
+    inputs: &DeltaInputs<'_>,
+    out: &mut DeviceBuffer<f32>,
+    batch: usize,
+    stream: &Stream,
+) -> Result<()> {
+    assert!(state_slots.len() >= batch);
+    debug_assert!(inputs.q.len() >= batch * QK_ELEMS);
+    debug_assert!(inputs.k.len() >= batch * QK_ELEMS);
+    debug_assert!(inputs.v.len() >= batch * V_ELEMS);
+    debug_assert!(inputs.alpha.len() >= batch * GATE_ELEMS);
+    debug_assert!(inputs.beta.len() >= batch * GATE_ELEMS);
+    debug_assert!(out.len() >= batch * V_ELEMS);
+    let capacity = pool.capacity;
+    check(unsafe {
+        ffi::qwc_delta_decode_int8(
+            pool.data.as_mut_ptr().cast(),
+            pool.scales.as_mut_ptr().cast(),
+            state_slots.as_ptr().cast(),
+            inputs.q.as_ptr().cast(),
+            inputs.k.as_ptr().cast(),
+            inputs.v.as_ptr().cast(),
+            inputs.alpha.as_ptr().cast(),
+            inputs.beta.as_ptr().cast(),
+            inputs.kq.as_ptr().cast(),
+            out.as_mut_ptr().cast(),
+            capacity as i32,
+            batch as i32,
+            stream.raw(),
+        )
+    })
+}
+
+/// bf16-копия -> 8-битный слот.
+pub fn pack_state_slot(
+    source: &DeviceBuffer<u16>,
+    source_capacity: usize,
+    source_slot: usize,
+    pool: &mut PackedStatePool,
+    packed_slot: usize,
+    stream: &Stream,
+) -> Result<()> {
+    assert_eq!(source.len(), source_capacity * STATE_ELEMS);
+    assert!(source_slot < source_capacity);
+    assert!(packed_slot < pool.capacity);
+    let capacity = pool.capacity;
+    check(unsafe {
+        ffi::qwc_delta_state_pack(
+            source.as_ptr(),
+            pool.data.as_mut_ptr().cast(),
+            pool.scales.as_mut_ptr().cast(),
+            source_capacity as i32,
+            source_slot as i32,
+            capacity as i32,
+            packed_slot as i32,
+            stream.raw(),
+        )
+    })
+}
+
+/// 8-битный слот -> bf16-копия.
+pub fn unpack_state_slot(
+    pool: &PackedStatePool,
+    packed_slot: usize,
+    destination: &mut DeviceBuffer<u16>,
+    destination_capacity: usize,
+    destination_slot: usize,
+    stream: &Stream,
+) -> Result<()> {
+    assert_eq!(destination.len(), destination_capacity * STATE_ELEMS);
+    assert!(packed_slot < pool.capacity);
+    assert!(destination_slot < destination_capacity);
+    check(unsafe {
+        ffi::qwc_delta_state_unpack(
+            pool.data.as_ptr(),
+            pool.scales.as_ptr().cast(),
+            destination.as_mut_ptr().cast(),
+            pool.capacity as i32,
+            packed_slot as i32,
+            destination_capacity as i32,
+            destination_slot as i32,
+            stream.raw(),
+        )
+    })
+}
+
+/// Разрядность хранения рекуррентного состояния — для измерения, а не для
+/// экономии: пул остаётся bf16, а значения сажаются на 8-битную сетку после
+/// каждого обновления. Так diff-eval отвечает на вопрос о точности раньше,
+/// чем переложены три кернела, пулы и бюджет.
+///
+/// `Int8` держит масштаб на строку состояния и бьёт `E4m3` вчетверо при том
+/// же байте: строки плоские, и четыре бита экспоненты им не нужны
+/// (`bench/results/delta-state-8bit.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum StateQuant {
+    #[default]
+    Off,
+    Int8,
+    E4m3,
+}
+
+impl StateQuant {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" | "bf16" => Some(Self::Off),
+            "int8" => Some(Self::Int8),
+            "e4m3" | "fp8" => Some(Self::E4m3),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Int8 => "int8",
+            Self::E4m3 => "e4m3",
+        }
+    }
+
+    fn mode(self) -> i32 {
+        match self {
+            Self::Off => 0,
+            Self::Int8 => 1,
+            Self::E4m3 => 2,
+        }
+    }
+}
+
+/// Сажает состояние перечисленных слотов на 8-битную сетку.
+pub fn requantize_state_slots(
+    state_pool: &mut DeviceBuffer<u16>,
+    state_slots: &DeviceBuffer<u32>,
+    quant: StateQuant,
+    state_capacity: usize,
+    batch: usize,
+    stream: &Stream,
+) -> Result<()> {
+    if quant == StateQuant::Off || batch == 0 {
+        return Ok(());
+    }
+    assert_eq!(state_pool.len(), state_capacity * STATE_ELEMS);
+    assert!(state_slots.len() >= batch);
+    check(unsafe {
+        ffi::qwc_delta_state_requantize(
+            state_pool.as_mut_ptr(),
+            state_slots.as_ptr().cast(),
+            0,
+            state_capacity as i32,
+            batch as i32,
+            quant.mode(),
+            stream.raw(),
+        )
+    })
+}
+
+/// То же для одного слота: у prefill сегмент всегда один.
+pub fn requantize_state_slot(
+    state_pool: &mut DeviceBuffer<u16>,
+    quant: StateQuant,
+    state_capacity: usize,
+    state_slot: usize,
+    stream: &Stream,
+) -> Result<()> {
+    if quant == StateQuant::Off {
+        return Ok(());
+    }
+    assert_eq!(state_pool.len(), state_capacity * STATE_ELEMS);
+    assert!(state_slot < state_capacity);
+    check(unsafe {
+        ffi::qwc_delta_state_requantize(
+            state_pool.as_mut_ptr(),
+            std::ptr::null(),
+            state_slot as i32,
+            state_capacity as i32,
+            1,
+            quant.mode(),
+            stream.raw(),
+        )
+    })
+}
+
 /// Трафик памяти одного вызова: состояние читается и переписывается целиком.
 pub fn traffic_bytes(batch: usize) -> u64 {
     2 * (batch * STATE_ELEMS * std::mem::size_of::<u16>()) as u64
@@ -680,13 +930,9 @@ pub mod reference {
                     let bt = beta[(start + t) * HV + h];
                     let kt = key(t);
                     for row in 0..DV {
-                        let sk: f32 = s[row * DK..][..DK]
-                            .iter()
-                            .zip(kt)
-                            .map(|(x, y)| x * y)
-                            .sum();
-                        c[t * DV + row] = bt
-                            * (v[((start + t) * HV + h) * DV + row] - gamma[t] * sk);
+                        let sk: f32 = s[row * DK..][..DK].iter().zip(kt).map(|(x, y)| x * y).sum();
+                        c[t * DV + row] =
+                            bt * (v[((start + t) * HV + h) * DV + row] - gamma[t] * sk);
                     }
                 }
                 // Прямая подстановка по треугольной системе: строка t видит
@@ -710,11 +956,7 @@ pub mod reference {
                 for t in 0..len {
                     let qt = query(t);
                     for row in 0..DV {
-                        let sq: f32 = s[row * DK..][..DK]
-                            .iter()
-                            .zip(qt)
-                            .map(|(x, y)| x * y)
-                            .sum();
+                        let sq: f32 = s[row * DK..][..DK].iter().zip(qt).map(|(x, y)| x * y).sum();
                         out[((start + t) * HV + h) * DV + row] = gamma[t] * sq;
                     }
                     for r in 0..=t {

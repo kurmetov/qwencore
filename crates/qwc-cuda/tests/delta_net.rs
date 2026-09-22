@@ -3,9 +3,8 @@
 
 use qwc_core::arch::{LA_CONV_CHANNELS, LA_K_HEAD_DIM, LA_NUM_K_HEADS, LA_V_HEAD_DIM};
 use qwc_cuda::delta_net::{
-    self, CONV_STATE_ELEMS, DeltaInputs, DeltaOutputNorm,
-    DeltaPreprocessor, DeltaStateMode, GATE_ELEMS, PreparedDelta, QK_ELEMS, RowView,
-    STATE_ELEMS, V_ELEMS,
+    self, CONV_STATE_ELEMS, DeltaInputs, DeltaOutputNorm, DeltaPreprocessor, DeltaStateMode,
+    GATE_ELEMS, PreparedDelta, QK_ELEMS, RowView, STATE_ELEMS, V_ELEMS,
 };
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
 
@@ -431,8 +430,10 @@ fn chunk_prefill_fp32_state_matches_fp32_reference_and_differs_from_bf16() {
         }
     }
     assert!(
-        fp32_out.iter().zip(&expected_out).all(|(&actual, &expected)|
-            (actual - expected).abs() <= 5e-4 + 2e-3 * expected.abs()),
+        fp32_out
+            .iter()
+            .zip(&expected_out)
+            .all(|(&actual, &expected)| (actual - expected).abs() <= 5e-4 + 2e-3 * expected.abs()),
         "fp32 prefill output differs by {worst:.2e} (abs {worst_abs:.2e}) at {worst_index}: gpu={}, cpu={}",
         fp32_out[worst_index],
         expected_out[worst_index],
@@ -757,7 +758,7 @@ fn gated_rmsnorm_matches_qwen_dtype_boundaries() {
         batch,
         &stream,
     )
-        .unwrap();
+    .unwrap();
     stream.synchronize().unwrap();
     let actual = output.to_vec().unwrap();
     let mut worst = 0.0f32;
@@ -1030,9 +1031,8 @@ fn wy_prefill_row_offset_reads_and_writes_only_its_slice() {
 
     // Тот же отрезок, поданный с нулевого смещения, — эталон для сдвинутого.
     let mut run = |row_offset: usize, rows: usize| {
-        let slice = |data: &[f32], width: usize| {
-            data[row_offset * width..][..rows * width].to_vec()
-        };
+        let slice =
+            |data: &[f32], width: usize| data[row_offset * width..][..rows * width].to_vec();
         let device_q = DeviceBuffer::from_slice(&slice(&q, QK_ELEMS)).unwrap();
         let device_k = DeviceBuffer::from_slice(&slice(&k, QK_ELEMS)).unwrap();
         let device_kq = DeviceBuffer::from_slice(&slice(&kq, KQ_ELEMS)).unwrap();
@@ -1050,8 +1050,15 @@ fn wy_prefill_row_offset_reads_and_writes_only_its_slice() {
         let mut state = DeviceBuffer::from_slice(&initial).unwrap();
         let mut output = DeviceBuffer::<f32>::zeroed(rows * V_ELEMS).unwrap();
         delta_net::prefill_slot_wy(
-            &mut state, &inputs, &mut output, &mut workspace,
-            1, 0, rows, 0, &stream,
+            &mut state,
+            &inputs,
+            &mut output,
+            &mut workspace,
+            1,
+            0,
+            rows,
+            0,
+            &stream,
         )
         .unwrap();
         stream.synchronize().unwrap();
@@ -1075,11 +1082,17 @@ fn wy_prefill_row_offset_reads_and_writes_only_its_slice() {
     };
     let sentinel = -7.5f32;
     let mut state = DeviceBuffer::from_slice(&initial).unwrap();
-    let mut output =
-        DeviceBuffer::from_slice(&vec![sentinel; arena * V_ELEMS]).unwrap();
+    let mut output = DeviceBuffer::from_slice(&vec![sentinel; arena * V_ELEMS]).unwrap();
     delta_net::prefill_slot_wy(
-        &mut state, &inputs, &mut output, &mut workspace,
-        1, 0, tokens, offset, &stream,
+        &mut state,
+        &inputs,
+        &mut output,
+        &mut workspace,
+        1,
+        0,
+        tokens,
+        offset,
+        &stream,
     )
     .unwrap();
     stream.synchronize().unwrap();
@@ -1106,4 +1119,274 @@ fn wy_prefill_row_offset_reads_and_writes_only_its_slice() {
         "скан записал строки после своего отрезка"
     );
     assert_eq!(state.to_vec().unwrap(), expected_state);
+}
+
+/// Построчный int8 должен совпадать с эталоном на CPU поэлементно и быть
+/// заметно точнее e4m3 при том же байте: строки состояния плоские, и четыре
+/// бита экспоненты им не нужны. Это свойство — единственная причина выбрать
+/// int8, поэтому оно проверяется, а не принимается на веру.
+#[test]
+fn state_requantize_matches_host_and_beats_e4m3() {
+    const SLOTS: usize = 2;
+    let mut rng = Rng(0x51ed_2701);
+    // Масштаб на строку разный: иначе поголовный и построчный масштаб
+    // неразличимы и тест не проверяет, что масштаб действительно построчный.
+    let mut original = vec![0.0f32; SLOTS * STATE_ELEMS];
+    for (row, chunk) in original.chunks_mut(LA_K_HEAD_DIM).enumerate() {
+        let scale = 2.0f32.powi((row % 7) as i32 - 3);
+        for x in chunk.iter_mut() {
+            *x = bf16::to_f32(bf16::from_f32(rng.next_f32() * scale));
+        }
+    }
+
+    let stream = Stream::new().unwrap();
+    let host: Vec<u16> = original.iter().map(|&x| bf16::from_f32(x)).collect();
+
+    let mut errors = Vec::new();
+    for quant in [delta_net::StateQuant::Int8, delta_net::StateQuant::E4m3] {
+        let mut state = DeviceBuffer::from_slice(&host).unwrap();
+        delta_net::requantize_state_slot(&mut state, quant, SLOTS, 1, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let got: Vec<f32> = state
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|&x| bf16::to_f32(x))
+            .collect();
+
+        // Слот 0 кернел не трогает.
+        assert_eq!(
+            &got[..STATE_ELEMS],
+            &original[..STATE_ELEMS],
+            "{} задел чужой слот",
+            quant.as_str()
+        );
+
+        let slot = &original[STATE_ELEMS..];
+        let after = &got[STATE_ELEMS..];
+        let mut worst = 0.0f32;
+        let mut numerator = 0.0f64;
+        let mut denominator = 0.0f64;
+        for (row, (before, now)) in slot
+            .chunks(LA_K_HEAD_DIM)
+            .zip(after.chunks(LA_K_HEAD_DIM))
+            .enumerate()
+        {
+            let peak = before.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            for (index, (&x, &y)) in before.iter().zip(now).enumerate() {
+                let expected = if quant == delta_net::StateQuant::Int8 {
+                    // Арифметика повторяет кернел по операциям: он умножает
+                    // на обратный шаг и округляет к чётному, и на полушаге
+                    // деление с округлением от нуля даёт другую ступень.
+                    let step = peak * (1.0 / 127.0);
+                    let inverse = 1.0 / step;
+                    let level = (x * inverse).round_ties_even().clamp(-127.0, 127.0);
+                    bf16::to_f32(bf16::from_f32(level * step))
+                } else {
+                    y // e4m3 сверяется по величине ошибки, а не поэлементно
+                };
+                assert!(
+                    (y - expected).abs() <= 1.0e-6 * peak.max(1.0e-6),
+                    "{} строка {row} элемент {index}: {y} против {expected}",
+                    quant.as_str()
+                );
+                worst = worst.max((y - x).abs() / peak.max(1.0e-9));
+                numerator += ((y - x) as f64).powi(2);
+                denominator += (x as f64).powi(2);
+            }
+        }
+        let relative = (numerator / denominator).sqrt() as f32;
+        // Шаг сетки — peak/127 у int8 и до peak/8 в старшей бинаде у e4m3.
+        // Сверху ложится округление обратной записи в bf16 (2^-9 от
+        // величины): настоящее хранение деквантует в fp32-регистры и этой
+        // надбавки не имеет, поэтому замер через кернел — оценка сверху.
+        const BF16_WRITEBACK: f32 = 1.0 / 512.0;
+        let ceiling = BF16_WRITEBACK
+            + if quant == delta_net::StateQuant::Int8 {
+                0.5 / 127.0
+            } else {
+                0.5 / 8.0
+            };
+        assert!(
+            worst <= ceiling * 1.01,
+            "{}: элемент уехал на {worst} долей пика при потолке {ceiling}",
+            quant.as_str()
+        );
+        errors.push(relative);
+    }
+
+    let (int8, e4m3) = (errors[0], errors[1]);
+    assert!(
+        e4m3 > int8 * 2.5,
+        "int8 должен быть заметно точнее e4m3: {int8:.3e} против {e4m3:.3e}"
+    );
+    eprintln!("состояние: int8 {int8:.3e}, e4m3 {e4m3:.3e} относительной ошибки");
+}
+
+/// Упаковка и распаковка слота должны быть согласованы: распакованное
+/// состояние — это ровно то, что прочитает 8-битный decode. Расхождение
+/// между этими двумя путями означало бы, что промпт и его продолжение видят
+/// разное состояние, а сверка выхода на одном шаге этого не ловит.
+#[test]
+fn packed_state_round_trip_matches_the_grid() {
+    const CAPACITY: usize = 2;
+    let mut rng = Rng(0x7f01_2ab4);
+    let mut original = vec![0.0f32; STATE_ELEMS];
+    for (row, chunk) in original.chunks_mut(LA_K_HEAD_DIM).enumerate() {
+        let scale = 2.0f32.powi((row % 5) as i32 - 2);
+        for x in chunk.iter_mut() {
+            *x = bf16::to_f32(bf16::from_f32(rng.next_f32() * scale));
+        }
+    }
+
+    let stream = Stream::new().unwrap();
+    let host: Vec<u16> = original.iter().map(|&x| bf16::from_f32(x)).collect();
+    let source = DeviceBuffer::from_slice(&host).unwrap();
+    let mut pool = delta_net::PackedStatePool::zeroed(CAPACITY).unwrap();
+    let mut restored = DeviceBuffer::<u16>::zeroed(STATE_ELEMS).unwrap();
+
+    delta_net::pack_state_slot(&source, 1, 0, &mut pool, 1, &stream).unwrap();
+    delta_net::unpack_state_slot(&pool, 1, &mut restored, 1, 0, &stream).unwrap();
+    stream.synchronize().unwrap();
+
+    let got: Vec<f32> = restored
+        .to_vec()
+        .unwrap()
+        .iter()
+        .map(|&x| bf16::to_f32(x))
+        .collect();
+
+    let mut worst = 0.0f32;
+    for (before, now) in original
+        .chunks(LA_K_HEAD_DIM)
+        .zip(got.chunks(LA_K_HEAD_DIM))
+    {
+        let peak = before.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        let step = peak * (1.0 / 127.0);
+        let inverse = 1.0 / step;
+        for (&x, &y) in before.iter().zip(now) {
+            let level = (x * inverse).round_ties_even().clamp(-127.0, 127.0);
+            let expected = bf16::to_f32(bf16::from_f32(level * step));
+            assert!(
+                (y - expected).abs() <= 1.0e-6 * peak.max(1.0e-6),
+                "распаковка {y} против ожидаемого {expected}"
+            );
+            worst = worst.max((y - x).abs() / peak.max(1.0e-9));
+        }
+    }
+    // Шаг сетки плюс округление распаковки в bf16.
+    assert!(
+        worst <= 0.5 / 127.0 + 1.0 / 512.0,
+        "элемент уехал на {worst}"
+    );
+
+    // Нулевой слот пула не тронут, и нули представимы без масштаба.
+    let mut zeroed = DeviceBuffer::<u16>::zeroed(STATE_ELEMS).unwrap();
+    delta_net::unpack_state_slot(&pool, 0, &mut zeroed, 1, 0, &stream).unwrap();
+    stream.synchronize().unwrap();
+    assert!(zeroed.to_vec().unwrap().iter().all(|&x| x == 0));
+}
+
+/// Восьмибитный decode должен совпадать с bf16-путём, у которого состояние
+/// посажено на ту же сетку: разойтись они могут только математикой шага, а
+/// она у обоих — одна и та же функция.
+#[test]
+fn packed_decode_matches_bf16_decode_on_the_same_grid() {
+    const CAPACITY: usize = 2;
+    const SLOT: usize = 1;
+    const STEPS: usize = 6;
+    let mut rng = Rng(0x2c8e_9917);
+
+    let mut initial = vec![0.0f32; STATE_ELEMS];
+    for (row, chunk) in initial.chunks_mut(LA_K_HEAD_DIM).enumerate() {
+        let scale = 2.0f32.powi((row % 5) as i32 - 2);
+        for x in chunk.iter_mut() {
+            *x = rng.next_f32() * scale;
+        }
+    }
+    let host: Vec<u16> = initial.iter().map(|&x| bf16::from_f32(x)).collect();
+
+    let stream = Stream::new().unwrap();
+    let slots = DeviceBuffer::from_slice(&[SLOT as u32]).unwrap();
+
+    let source = DeviceBuffer::from_slice(&host).unwrap();
+    let mut pool = delta_net::PackedStatePool::zeroed(CAPACITY).unwrap();
+    delta_net::pack_state_slot(&source, 1, 0, &mut pool, SLOT, &stream).unwrap();
+
+    // bf16-путь стартует с распакованного состояния, иначе первый же шаг
+    // разойдётся на самой упаковке, а не на математике.
+    let mut wide = DeviceBuffer::<u16>::zeroed(CAPACITY * STATE_ELEMS).unwrap();
+    delta_net::unpack_state_slot(&pool, SLOT, &mut wide, CAPACITY, SLOT, &stream).unwrap();
+
+    let mut prepared = PreparedDelta::zeroed(1).unwrap();
+    let mut packed_out = DeviceBuffer::<f32>::zeroed(V_ELEMS).unwrap();
+    let mut wide_out = DeviceBuffer::<f32>::zeroed(V_ELEMS).unwrap();
+
+    let mut worst = 0.0f32;
+    for step in 0..STEPS {
+        let mut q: Vec<f32> = (0..QK_ELEMS).map(|_| rng.next_f32()).collect();
+        let mut k: Vec<f32> = (0..QK_ELEMS).map(|_| rng.next_f32()).collect();
+        l2_normalize_heads(&mut q, LA_NUM_K_HEADS, LA_K_HEAD_DIM);
+        l2_normalize_heads(&mut k, LA_NUM_K_HEADS, LA_K_HEAD_DIM);
+        let v: Vec<f32> = (0..V_ELEMS).map(|_| rng.next_f32()).collect();
+        let alpha: Vec<f32> = (0..GATE_ELEMS)
+            .map(|_| 0.5 + 0.49 * rng.next_f32())
+            .collect();
+        let beta: Vec<f32> = (0..GATE_ELEMS)
+            .map(|_| 0.5 + 0.49 * rng.next_f32())
+            .collect();
+        let kq = kq_rows(&q, &k);
+
+        prepared.q.copy_from_slice(&q).unwrap();
+        prepared.k.copy_from_slice(&k).unwrap();
+        prepared.v.copy_from_slice(&v).unwrap();
+        prepared.alpha.copy_from_slice(&alpha).unwrap();
+        prepared.beta.copy_from_slice(&beta).unwrap();
+        prepared.kq.copy_from_slice(&kq).unwrap();
+
+        delta_net::decode_slots_packed(
+            &mut pool,
+            &slots,
+            &prepared.inputs(),
+            &mut packed_out,
+            1,
+            &stream,
+        )
+        .unwrap();
+        delta_net::decode_slots(
+            &mut wide,
+            &slots,
+            &prepared.inputs(),
+            &mut wide_out,
+            CAPACITY,
+            1,
+            &stream,
+        )
+        .unwrap();
+        // bf16-путь держит состояние в bf16, поэтому после каждого шага его
+        // надо вернуть на ту же 8-битную сетку — иначе сравниваются разные
+        // хранения, а не разные кернелы.
+        delta_net::requantize_state_slots(
+            &mut wide,
+            &slots,
+            delta_net::StateQuant::Int8,
+            CAPACITY,
+            1,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        let a = packed_out.to_vec().unwrap();
+        let b = wide_out.to_vec().unwrap();
+        let magnitude = b.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1.0e-6);
+        for (x, y) in a.iter().zip(&b) {
+            worst = worst.max((x - y).abs() / magnitude);
+        }
+        assert!(
+            worst < 5.0e-2,
+            "шаг {step}: 8-битный decode разошёлся с bf16 на {worst}"
+        );
+    }
+    eprintln!("8-битный decode против bf16 на той же сетке: {worst:.2e}");
 }

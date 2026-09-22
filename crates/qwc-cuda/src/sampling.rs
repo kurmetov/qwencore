@@ -48,6 +48,33 @@ impl Argmax {
         })
     }
 
+    /// Argmax по первым `count` значениям одной строки, сразу на хост.
+    ///
+    /// Нужен шортлисту черновой головы: его выход плотный и короче словаря,
+    /// поэтому возвращается место в списке, а не идентификатор токена.
+    pub fn sample_prefix(
+        &mut self,
+        logits: &DeviceBuffer<f32>,
+        count: usize,
+        stream: &Stream,
+    ) -> Result<usize> {
+        assert!(count > 0 && count <= self.vocab);
+        assert!(logits.len() >= count);
+        check(unsafe {
+            ffi::qwc_argmax(
+                logits.as_ptr().cast(),
+                self.partial_values.as_mut_ptr().cast(),
+                self.partial_indices.as_mut_ptr().cast(),
+                self.tokens.as_mut_ptr().cast(),
+                count as i32,
+                1,
+                PARTS as i32,
+                stream.raw(),
+            )
+        })?;
+        Ok(self.to_host(1)?[0] as usize)
+    }
+
     pub fn to_host(&self, batch: usize) -> Result<Vec<u32>> {
         assert!(batch > 0 && batch <= self.max_batch);
         let mut tokens = self.tokens.to_vec()?;

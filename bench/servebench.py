@@ -28,6 +28,35 @@ def prompt_ids(count: int, seed: int) -> list[int]:
     return [1000 + ((seed * 7919 + index) % 20000) for index in range(count)]
 
 
+def corpus_prompts(path: Path, count: int, prompt_tokens: int) -> list[list[int]]:
+    """Те же промпты, что читает `--corpus` у qwc: один и тот же файл, одна и
+    та же нарезка. Синтетический `prompt_ids` — прогрессия, и спекуляция на
+    ней угадывает почти всё; корпус нужен, чтобы acceptance был настоящим."""
+    prompts = []
+    with open(path) as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            ids = json.loads(line)["prompt_token_ids"]
+            if len(ids) < prompt_tokens:
+                raise SystemExit(f"{path}: промпт короче {prompt_tokens} токенов")
+            prompts.append(ids[:prompt_tokens])
+            if len(prompts) == count:
+                break
+    if len(prompts) < count:
+        raise SystemExit(f"{path}: {len(prompts)} промптов, а запрошено {count}")
+    return prompts
+
+
+def total_gpu_memory_gb() -> float:
+    """Ёмкость карты в тех же десятичных ГБ, в которых движок задаёт лимит."""
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True, check=True,
+    )
+    return int(out.stdout.split()[0]) * 1024 * 1024 / 1e9
+
+
 def run_qwc(args) -> dict:
     command = [
         "cargo", "run", "--release", "--quiet", "-p", "qwc-engine",
@@ -38,16 +67,21 @@ def run_qwc(args) -> dict:
         "--prompt-tokens", str(args.prompt_tokens),
         "--max-new", str(args.max_new),
         "--context", str(args.context),
-        "--kv-cache-gb", str(args.kv_cache_gb),
-        "--memory-limit-gb", str(args.memory_limit_gb),
+        # При общем бюджете KV берёт остаток, как у vLLM: 0 означает «авто».
+        "--kv-cache-gb", str(0 if args.engine_budget_gb else args.kv_cache_gb),
+        "--memory-limit-gb", str(args.engine_budget_gb or args.memory_limit_gb),
         "--kv-cache", args.kv_cache_dtype,
         "--delta-state", args.delta_state,
+        "--speculative", str(args.qwc_speculative),
+        "--shortlist", str(args.qwc_shortlist),
     ]
     # Ширина шага prefill — такой же свипаемый параметр, как
     # max_num_batched_tokens у vLLM: держать его фиксированным значит
     # занижать одну из сторон.
     if args.prefill_chunk:
         command.extend(("--prefill-chunk", str(args.prefill_chunk)))
+    if args.corpus:
+        command.extend(("--corpus", str(args.corpus)))
     result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
     if result.returncode:
         sys.stderr.write(result.stdout + result.stderr)
@@ -59,11 +93,20 @@ def run_vllm(args) -> dict:
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     from vllm import LLM, SamplingParams
 
+    # Один бюджет на оба движка: у нас он абсолютный, у vLLM — доля карты.
+    # Считаем долю здесь и кладём в артефакт, чтобы её можно было проверить.
+    total_gb = total_gpu_memory_gb()
+    utilization = (
+        args.engine_budget_gb / total_gb
+        if args.engine_budget_gb
+        else args.gpu_memory_utilization
+    )
+
     started = time.perf_counter()
     llm = LLM(
         model=str(args.model),
         max_model_len=args.context,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+        gpu_memory_utilization=utilization,
         enforce_eager=False,
         # v1 only fills RequestStateStats when stats are enabled, and without
         # them the record has no TTFT/ITL to compare against qwc's.
@@ -74,6 +117,20 @@ def run_vllm(args) -> dict:
         max_num_batched_tokens=args.max_batched_tokens or max(args.context, args.concurrency),
         # "bf16" is vLLM's unquantized KV, which it spells "auto".
         kv_cache_dtype="fp8" if args.kv_cache_dtype == "fp8" else "auto",
+        # Промпты и так уникальны, но фиксируем политику явно: результат не
+        # должен зависеть от значения default в конкретной версии vLLM.
+        enable_prefix_caching=False,
+        # Голова MTP лежит в том же чекпоинте, и vLLM умеет её грузить как
+        # qwen3_5_mtp. Мерить его без неё — мерить недонастроенного соперника.
+        speculative_config=(
+            {
+                "method": "qwen3_5_mtp",
+                "model": str(args.model),
+                "num_speculative_tokens": args.vllm_speculative,
+            }
+            if args.vllm_speculative
+            else None
+        ),
     )
     load_seconds = time.perf_counter() - started
 
@@ -87,10 +144,16 @@ def run_vllm(args) -> dict:
         ignore_eos=True,
         detokenize=False,
     )
-    requests = [
-        {"prompt_token_ids": prompt_ids(args.prompt_tokens, seed)}
-        for seed in range(1, args.requests + 1)
-    ]
+    if args.corpus:
+        requests = [
+            {"prompt_token_ids": ids}
+            for ids in corpus_prompts(args.corpus, args.requests, args.prompt_tokens)
+        ]
+    else:
+        requests = [
+            {"prompt_token_ids": prompt_ids(args.prompt_tokens, seed)}
+            for seed in range(1, args.requests + 1)
+        ]
 
     # Warm up CUDA graphs and the caches on a smaller saturated run. Its seeds
     # are disjoint from the measured ones so it cannot prime the prefix cache.
@@ -129,12 +192,19 @@ def run_vllm(args) -> dict:
     record = {
         "engine": "vllm",
         "version": vllm.__version__,
+        "speculative_tokens": args.vllm_speculative,
+        "engine_budget_gb": round(args.engine_budget_gb, 2) if args.engine_budget_gb else None,
+        "gpu_memory_utilization": round(utilization, 4),
+        "gpu_total_gb": round(total_gb, 2),
         "requests": args.requests,
         "concurrency": args.concurrency,
         "prompt_tokens": args.prompt_tokens,
         "max_new_tokens": args.max_new,
         "context": args.context,
         "kv_cache": args.kv_cache_dtype,
+        "cuda_graphs": True,
+        "prefix_caching": False,
+        "prompts": str(args.corpus) if args.corpus else "synthetic",
         "max_batched_tokens": args.max_batched_tokens or max(args.context, args.concurrency),
         "load_seconds": round(load_seconds, 3),
         "wall_seconds": round(elapsed, 4),
@@ -165,12 +235,42 @@ def main() -> int:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--kv-cache-dtype", choices=("fp8", "bf16"), default="fp8")
     # vLLM only: match qwc's 512-token prefill arena to isolate chunk width.
+    parser.add_argument(
+        "--engine-budget-gb",
+        type=float,
+        default=0.0,
+        help="общий потолок видеопамяти на движок; у vLLM пересчитывается в долю карты",
+    )
+    parser.add_argument(
+        "--vllm-speculative",
+        type=int,
+        default=0,
+        help="глубина MTP-спекуляции у vLLM (0 — выключена)",
+    )
+    parser.add_argument(
+        "--qwc-speculative",
+        type=int,
+        default=0,
+        help="глубина MTP-спекуляции QwenCore (0 — выключена)",
+    )
+    parser.add_argument(
+        "--qwc-shortlist",
+        type=int,
+        default=0,
+        help="частотная часть shortlist словаря QwenCore (0 — полный lm_head)",
+    )
     parser.add_argument("--max-batched-tokens", type=int, default=0)
     parser.add_argument("--prefill-chunk", type=int, default=0)
     parser.add_argument(
         "--delta-state", choices=("wy", "bf16", "fp32"), default="wy")
     parser.add_argument("--kv-cache-gb", type=float, default=5.0)
     parser.add_argument("--memory-limit-gb", type=float, default=28.0)
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        help="jsonl с prompt_token_ids (bench/make_corpus.py); "
+             "без него промпты синтетические",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 

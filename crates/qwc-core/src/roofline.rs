@@ -56,26 +56,30 @@ impl StepCost {
 }
 
 impl DecodeStep {
-    pub fn cost(&self, weights: u64, cache: &CacheConfig) -> StepCost {
+    pub fn cost(&self, streamed_weights: u64, cache: &CacheConfig) -> StepCost {
         // Состояние DeltaNet перезаписывается целиком: читаем и пишем.
         let state = 2 * cache.state_bytes_per_slot() * self.batch as u64;
         let kv = cache.kv_bytes_per_token() * self.context_len as u64 * self.batch as u64;
         StepCost {
-            weight_bytes: weights,
+            weight_bytes: streamed_weights,
             state_bytes: state,
             kv_bytes: kv,
         }
     }
 
     /// Совокупная скорость генерации, токенов в секунду.
-    pub fn tokens_per_sec(&self, weights: u64, cache: &CacheConfig) -> f64 {
-        let t = self.cost(weights, cache).seconds(self.bandwidth_efficiency);
+    pub fn tokens_per_sec(&self, streamed_weights: u64, cache: &CacheConfig) -> f64 {
+        let t = self
+            .cost(streamed_weights, cache)
+            .seconds(self.bandwidth_efficiency);
         self.batch as f64 / t
     }
 
     /// Межтокенная задержка, миллисекунды.
-    pub fn itl_ms(&self, weights: u64, cache: &CacheConfig) -> f64 {
-        self.cost(weights, cache).seconds(self.bandwidth_efficiency) * 1e3
+    pub fn itl_ms(&self, streamed_weights: u64, cache: &CacheConfig) -> f64 {
+        self.cost(streamed_weights, cache)
+            .seconds(self.bandwidth_efficiency)
+            * 1e3
     }
 }
 
@@ -102,7 +106,7 @@ mod tests {
 
     #[test]
     fn single_stream_decode_ceiling() {
-        let w = WeightPlan::default().bytes();
+        let w = WeightPlan::default().decode_weight_bytes(1);
         let cache = CacheConfig::default();
 
         // Идеальный кернел: вся полоса памяти.
@@ -113,7 +117,7 @@ mod tests {
         };
         let tps = ideal.tokens_per_sec(w, &cache);
         assert!(
-            (85.0..100.0).contains(&tps),
+            (100.0..112.0).contains(&tps),
             "потолок batch=1: {tps:.0} tok/s"
         );
 
@@ -127,8 +131,8 @@ mod tests {
     }
 
     #[test]
-    fn state_traffic_dominates_at_high_batch() {
-        let w = WeightPlan::default().bytes();
+    fn state_traffic_is_a_tenth_of_the_step_at_high_batch() {
+        let w = WeightPlan::default().decode_weight_bytes(32);
         let cache = CacheConfig::default();
         let step = DecodeStep {
             batch: 32,
@@ -137,21 +141,36 @@ mod tests {
         };
         let c = step.cost(w, &cache);
 
-        // При batch=32 состояние DeltaNet читается и пишется 32 раза:
-        // это сопоставимо с чтением KV-кэша и заметная доля всего шага.
+        // При batch=32 состояние DeltaNet читается и пишется 32 раза, и это
+        // всё ещё больше, чем чтение KV-кэша.
         assert!(
             c.state_bytes > c.kv_bytes,
             "состояние {} vs KV {}",
             c.state_bytes,
             c.kv_bytes
         );
+        // Раньше здесь была пятая часть шага. 8-битное хранение срезало долю
+        // вдвое: измеренный шаг при c=32 подтвердил это отдельно —
+        // `delta.scan` 1.963 -> 1.786 мс при вдвое меньшем трафике
+        // (`bench/results/delta-state-8bit.md`).
         let share = c.state_bytes as f64 / c.total() as f64;
-        assert!((0.15..0.35).contains(&share), "доля состояния {share:.2}");
+        assert!((0.08..0.20).contains(&share), "доля состояния {share:.2}");
+
+        let wide = CacheConfig {
+            state_dtype: Dtype::Bf16,
+            ..cache
+        };
+        let wide_share =
+            step.cost(w, &wide).state_bytes as f64 / step.cost(w, &wide).total() as f64;
+        assert!(
+            wide_share > share * 1.6,
+            "bf16 {wide_share:.2} против {share:.2}"
+        );
     }
 
     #[test]
     fn bf16_state_saves_real_time() {
-        let w = WeightPlan::default().bytes();
+        let w = WeightPlan::default().decode_weight_bytes(32);
         let step = DecodeStep {
             batch: 32,
             context_len: 2048,

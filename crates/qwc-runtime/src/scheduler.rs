@@ -282,9 +282,31 @@ impl Scheduler {
     /// Подтверждает успешно исполненный batch. `stopped` содержит decode-
     /// последовательности, для которых модель вернула EOS/stop condition.
     pub fn complete_batch(&mut self, stopped: &[SeqId]) -> Result<Vec<Completion>, SchedulerError> {
+        self.complete_batch_multi(stopped, &[])
+    }
+
+    /// То же, но decode-последовательность могла выдать больше одного токена.
+    ///
+    /// Спекуляция за шаг принимает от одного до k+1 токенов, и планировщик
+    /// обязан знать сколько: иначе `generated` разъедется с реальностью и
+    /// запрос закончится не на своей длине. Отсутствующие в `produced`
+    /// последовательности считаются выдавшими один токен.
+    pub fn complete_batch_multi(
+        &mut self,
+        stopped: &[SeqId],
+        produced: &[(SeqId, usize)],
+    ) -> Result<Vec<Completion>, SchedulerError> {
         let Some(in_flight) = self.in_flight.as_ref() else {
             return Err(SchedulerError::NoBatchInFlight);
         };
+        for &(id, tokens) in produced {
+            if tokens == 0 {
+                return Err(SchedulerError::Invariant(id));
+            }
+            if !in_flight.decode.contains(&id) {
+                return Err(SchedulerError::InvalidStopped(id));
+            }
+        }
 
         let mut stopped_set = HashSet::with_capacity(stopped.len());
         for &id in stopped {
@@ -324,11 +346,15 @@ impl Scheduler {
             if active.phase != Phase::DecodeInFlight {
                 return Err(SchedulerError::Invariant(id));
             }
-            active.generated += 1;
+            let tokens = produced
+                .iter()
+                .find(|&&(other, _)| other == id)
+                .map_or(1, |&(_, tokens)| tokens);
+            active.generated = (active.generated + tokens).min(active.request.max_new_tokens);
 
             let reason = if stopped_set.contains(&id) {
                 Some(FinishReason::Stopped)
-            } else if active.generated == active.request.max_new_tokens {
+            } else if active.generated >= active.request.max_new_tokens {
                 Some(FinishReason::Length)
             } else {
                 None
@@ -350,6 +376,33 @@ impl Scheduler {
             }
         }
         Ok(completed)
+    }
+
+    /// Резервирует в KV ещё `tokens` позиций для decode-последовательности
+    /// сверх той одной, что уже взял `next_batch`.
+    ///
+    /// Спекулятивная проверка пишет k+1 строк, а не одну, и страницы под них
+    /// нужны до прогона: узнать число принятых можно только после него.
+    /// Возвращает, сколько удалось зарезервировать — при исчерпании пула
+    /// глубина черновика просто уменьшается.
+    pub fn reserve_extra(&mut self, id: SeqId, tokens: usize) -> usize {
+        let mut reserved = 0;
+        while reserved < tokens {
+            match self.cache.append_token(id) {
+                Ok(()) => reserved += 1,
+                Err(_) => break,
+            }
+        }
+        reserved
+    }
+
+    /// Возвращает в пул позиции, которые спекуляция зарезервировала, но
+    /// проверка отвергла.
+    pub fn release_extra(&mut self, id: SeqId, tokens: usize) -> Result<(), SchedulerError> {
+        for _ in 0..tokens {
+            self.cache.rollback_token(id)?;
+        }
+        Ok(())
     }
 
     /// Откатывает ещё не исполненный batch и возвращает работу в начало
@@ -393,6 +446,15 @@ impl Scheduler {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Сколько токенов запросу ещё осталось выдать. Спекуляция обязана это
+    /// знать: шаг выдаёт от одного до k+1 токенов, и перескочить через
+    /// `max_new_tokens` значит посчитать лишнее и сделать лишнюю работу.
+    pub fn remaining_tokens(&self, id: SeqId) -> Option<usize> {
+        self.active
+            .get(&id)
+            .map(|active| active.request.max_new_tokens - active.generated)
     }
 
     pub fn waiting(&self) -> usize {

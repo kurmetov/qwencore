@@ -32,7 +32,7 @@ pub mod vocab;
 
 pub use device::Device;
 pub use error::{CudaError, Result};
-pub use memory::{DeviceBuffer, MemoryUsage, memory_usage, set_memory_limit};
+pub use memory::{DeviceBuffer, MemoryUsage, device_free_bytes, memory_usage, set_memory_limit};
 pub use stream::{Event, Stream};
 pub use timeline::Timeline;
 

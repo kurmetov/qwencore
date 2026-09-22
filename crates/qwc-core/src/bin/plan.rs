@@ -37,6 +37,10 @@ fn main() {
         "  наша загрузка (text-only, fp8 head/embed): {:>6.2} GB",
         gb(ours.bytes())
     );
+    println!(
+        "  читается обычным decode b=1:             {:>6.2} GB",
+        gb(ours.decode_weight_bytes(1))
+    );
     println!("  фора: {:>6.2} GB\n", gb(shipped.bytes() - ours.bytes()));
 
     let cfg = CacheConfig::default();
@@ -140,13 +144,14 @@ fn main() {
             bandwidth_efficiency: 0.53,
             ..ideal
         };
+        let decode_weights = ours.decode_weight_bytes(batch);
         println!(
             "  {:>6} | {:>7} | {:>9.2} ms | {:>9.2} ms | {:>9.0} t/s",
             batch,
             ctx,
-            ideal.itl_ms(ours.bytes(), &cfg),
-            real.itl_ms(ours.bytes(), &cfg),
-            ideal.tokens_per_sec(ours.bytes(), &cfg),
+            ideal.itl_ms(decode_weights, &cfg),
+            real.itl_ms(decode_weights, &cfg),
+            ideal.tokens_per_sec(decode_weights, &cfg),
         );
     }
 
@@ -156,7 +161,7 @@ fn main() {
         context_len: 2048,
         bandwidth_efficiency: 1.0,
     };
-    let c = step.cost(ours.bytes(), &cfg);
+    let c = step.cost(ours.decode_weight_bytes(step.batch), &cfg);
     for (name, bytes) in [
         ("веса", c.weight_bytes),
         ("состояние DeltaNet", c.state_bytes),

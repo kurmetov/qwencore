@@ -12,8 +12,8 @@ use crate::weights::{
 };
 use qwc_core::arch::*;
 use qwc_cuda::delta_net::{
-    self, CONV_STATE_ELEMS, DeltaPrefillWorkspace, DeltaStateMode, PreparedDelta, RowView,
-    STATE_ELEMS, V_ELEMS,
+    self, CONV_STATE_ELEMS, DeltaPrefillWorkspace, DeltaStateMode, PackedStatePool, PreparedDelta,
+    RowView, STATE_ELEMS, V_ELEMS,
 };
 use qwc_cuda::graph::CudaGraph;
 use qwc_cuda::nvfp4::{self, QuantizedActivation, W4A4Workspace};
@@ -120,7 +120,23 @@ pub struct Executor {
     delta_out: DeviceBuffer<f32>,
     delta_normed: DeviceBuffer<u16>,
     state_slots: DeviceBuffer<u32>,
-    state_pools: Vec<DeviceBuffer<u16>>,
+    /// Состояние покоящихся слотов: int8 плюс построчный масштаб. Decode
+    /// читает и пишет прямо сюда — в этом половина экономии трафика шага.
+    state_pools: Vec<PackedStatePool>,
+    /// Расквантованная копия состояния одной последовательности, по слоям.
+    /// Префилл идёт по ней, а не по 8-битному слоту: сегмент, стартующий с
+    /// квантованного состояния, портит весь остаток промпта — MAE
+    /// подскакивает в 11 раз на границе `PREFILL_CHUNK_SIZE`
+    /// (`bench/results/delta-state-8bit.md`).
+    ///
+    /// Копия одна на движок, потому что недопрефилленной в каждый момент
+    /// может быть ровно одна последовательность: чанк выходит частичным
+    /// только когда исчерпал token budget шага, а это обрывает набор
+    /// (`qwc-runtime/src/scheduler.rs`).
+    state_work: Vec<DeviceBuffer<u16>>,
+    /// Чей слот лежит в копии — по слою, потому что сегменты проходят все
+    /// слои по очереди и распаковка каждого слоя своя.
+    work_owner: Vec<Option<usize>>,
     conv_pools: Vec<DeviceBuffer<f32>>,
     /// Скретч WY-скана. Общий на все слои и все последовательности: скан
     /// вызывается до 48 раз за шаг, и аллокация внутри вызова сериализовала
@@ -404,13 +420,15 @@ impl Executor {
             _ => None,
         };
         let mut state_pools = Vec::with_capacity(NUM_LINEAR_LAYERS);
+        let mut state_work = Vec::with_capacity(NUM_LINEAR_LAYERS);
         let mut conv_pools = Vec::with_capacity(NUM_LINEAR_LAYERS);
         for _ in 0..NUM_LINEAR_LAYERS {
             // Слотов на один больше, чем последовательностей: последний —
             // черновой. Проверка спекуляции гоняет состояние по нему, а
             // настоящее остаётся нетронутым, пока не станет ясно, сколько
             // токенов принято.
-            state_pools.push(DeviceBuffer::zeroed((batch + 1) * STATE_ELEMS)?);
+            state_pools.push(PackedStatePool::zeroed(batch + 1)?);
+            state_work.push(DeviceBuffer::zeroed(STATE_ELEMS)?);
             conv_pools.push(DeviceBuffer::zeroed((batch + 1) * CONV_STATE_ELEMS)?);
         }
         let mut key_caches = Vec::with_capacity(NUM_FULL_LAYERS);
@@ -458,6 +476,8 @@ impl Executor {
             delta_normed: DeviceBuffer::zeroed(decode_rows * V_ELEMS)?,
             state_slots: DeviceBuffer::from_slice(&slots)?,
             state_pools,
+            state_work,
+            work_owner: vec![None; NUM_LINEAR_LAYERS],
             conv_pools,
             delta_prefill,
             speculation_mixer,
@@ -546,7 +566,8 @@ impl Executor {
 
     /// VRAM, занятая кэшем и состоянием: она соревнуется с весами за карту.
     pub fn cache_bytes(&self) -> usize {
-        let state: usize = self.state_pools.iter().map(DeviceBuffer::bytes).sum();
+        let state: usize = self.state_pools.iter().map(PackedStatePool::bytes).sum();
+        let work: usize = self.state_work.iter().map(DeviceBuffer::bytes).sum();
         let conv: usize = self.conv_pools.iter().map(DeviceBuffer::bytes).sum();
         let keys: usize = self.key_caches.iter().map(DeviceBuffer::bytes).sum();
         let values: usize = self.value_caches.iter().map(DeviceBuffer::bytes).sum();
@@ -556,7 +577,7 @@ impl Executor {
             .delta_prefill
             .as_ref()
             .map_or(0, DeltaPrefillWorkspace::bytes);
-        state + conv + keys + values + scan
+        state + work + conv + keys + values + scan
     }
 
     /// Прогон k+1 токенов по черновому слоту состояния: возвращает argmax
@@ -565,12 +586,17 @@ impl Executor {
     /// Настоящее состояние последовательности не трогается — пока неизвестно,
     /// сколько токенов принято, трогать его нельзя. KV-страницы пишутся сразу
     /// всем строкам: отвергнутые позиции перезапишет следующий шаг.
+    ///
+    /// `block_ids` — страницы KV той же последовательности. Раздаёт их
+    /// `CacheManager`, и номера у него произвольные, поэтому выводить таблицу
+    /// из индекса слота нельзя: в сервере это чужие страницы.
     pub fn verify_speculation(
         &mut self,
         weights: &ModelWeights,
         tokens: &[u32],
         start_position: usize,
         sequence: usize,
+        block_ids: &[u32],
     ) -> Result<Vec<u32>> {
         let rows = tokens.len();
         assert!((1..=MAX_SPECULATION_ROWS).contains(&rows));
@@ -587,12 +613,7 @@ impl Executor {
         let scratch = self.speculation_slot();
         for layer in 0..NUM_LINEAR_LAYERS {
             let (state, conv) = (&mut self.state_pools[layer], &mut self.conv_pools[layer]);
-            state.copy_within(
-                scratch * STATE_ELEMS,
-                sequence * STATE_ELEMS,
-                STATE_ELEMS,
-                &self.stream,
-            )?;
+            state.copy_slot(sequence, scratch, &self.stream)?;
             conv.copy_within(
                 scratch * CONV_STATE_ELEMS,
                 sequence * CONV_STATE_ELEMS,
@@ -602,9 +623,10 @@ impl Executor {
         }
 
         self.speculation_rows = rows;
-        let block_ids: Vec<u32> = (0..self.max_blocks)
-            .map(|block| (sequence * self.max_blocks + block) as u32)
-            .collect();
+        assert!(
+            block_ids.len() >= (start_position + rows).div_ceil(PAGE_SIZE),
+            "таблица блоков короче проверяемых позиций"
+        );
         let segment = Segment {
             state_slot: scratch,
             position_start: start_position,
@@ -617,7 +639,7 @@ impl Executor {
             &[segment],
             0,
             tokens,
-            &block_ids,
+            block_ids,
             &[0, block_ids.len()],
         );
         self.speculation_rows = 0;
@@ -642,12 +664,7 @@ impl Executor {
         let scratch = self.speculation_slot();
         if accepted == rows {
             for layer in 0..NUM_LINEAR_LAYERS {
-                self.state_pools[layer].copy_within(
-                    sequence * STATE_ELEMS,
-                    scratch * STATE_ELEMS,
-                    STATE_ELEMS,
-                    &self.stream,
-                )?;
+                self.state_pools[layer].copy_slot(scratch, sequence, &self.stream)?;
                 self.conv_pools[layer].copy_within(
                     sequence * CONV_STATE_ELEMS,
                     scratch * CONV_STATE_ELEMS,
@@ -682,15 +699,33 @@ impl Executor {
                 0,
                 &self.stream,
             )?;
+            // Доигрывание — тот же скан, поэтому и оно идёт по копии.
+            delta_net::unpack_state_slot(
+                &self.state_pools[linear_layer],
+                sequence,
+                &mut self.state_work[linear_layer],
+                1,
+                0,
+                &self.stream,
+            )?;
+            self.work_owner[linear_layer] = Some(sequence);
             delta_net::prefill_slot(
-                &mut self.state_pools[linear_layer],
+                &mut self.state_work[linear_layer],
                 &self.prefill.prepared.inputs(),
                 &mut self.prefill.delta_out,
-                capacity,
-                sequence,
+                1,
+                0,
                 accepted,
                 0,
                 replay_mode,
+                &self.stream,
+            )?;
+            delta_net::pack_state_slot(
+                &self.state_work[linear_layer],
+                1,
+                0,
+                &mut self.state_pools[linear_layer],
+                sequence,
                 &self.stream,
             )?;
             linear_layer += 1;
@@ -716,6 +751,11 @@ impl Executor {
     /// Индекс чернового слота.
     pub fn speculation_slot(&self) -> usize {
         self.max_batch
+    }
+
+    /// Сколько страниц KV покрывает контекст одной последовательности.
+    pub fn max_blocks(&self) -> usize {
+        self.max_blocks
     }
 
     pub fn kv_pool_blocks(&self) -> usize {
@@ -1213,12 +1253,11 @@ impl Executor {
                             &self.stream,
                         )?;
                         mark!("delta.scan");
-                        delta_net::decode_slots(
+                        delta_net::decode_slots_packed(
                             &mut self.state_pools[linear_layer],
                             &prefill.decode_slots,
                             &prefill.prepared.inputs(),
                             &mut prefill.delta_out,
-                            state_capacity,
                             decode_rows,
                             &self.stream,
                         )?;
@@ -1252,30 +1291,56 @@ impl Executor {
                         // несёт k+1 строку — это как раз тот случай.
                         let wy = self.delta_prefill.is_some()
                             && segment.tokens >= MIN_WY_TOKENS;
+                        // Скан идёт по расквантованной копии. Если копия уже
+                        // держит этот слот — распаковки нет, и продолжение
+                        // многосегментного промпта стартует с того же
+                        // состояния, каким его оставил прошлый сегмент.
+                        if self.work_owner[linear_layer] != Some(segment.state_slot) {
+                            delta_net::unpack_state_slot(
+                                &self.state_pools[linear_layer],
+                                segment.state_slot,
+                                &mut self.state_work[linear_layer],
+                                1,
+                                0,
+                                &self.stream,
+                            )?;
+                            self.work_owner[linear_layer] = Some(segment.state_slot);
+                        }
                         match &mut self.delta_prefill.as_mut().filter(|_| wy) {
                             Some(workspace) => delta_net::prefill_slot_wy(
-                                &mut self.state_pools[linear_layer],
+                                &mut self.state_work[linear_layer],
                                 &prefill.prepared.inputs(),
                                 &mut prefill.delta_out,
                                 workspace,
-                                state_capacity,
-                                segment.state_slot,
+                                1,
+                                0,
                                 segment.tokens,
                                 segment.row_begin,
                                 &self.stream,
                             )?,
                             None => delta_net::prefill_slot(
-                                &mut self.state_pools[linear_layer],
+                                &mut self.state_work[linear_layer],
                                 &prefill.prepared.inputs(),
                                 &mut prefill.delta_out,
-                                state_capacity,
-                                segment.state_slot,
+                                1,
+                                0,
                                 segment.tokens,
                                 segment.row_begin,
                                 recurrent_mode,
                                 &self.stream,
                             )?,
                         }
+                        // Упаковка после каждого сегмента, а не в конце
+                        // промпта: так 8-битный слот всегда актуален, и знать,
+                        // какой сегмент последний, не нужно.
+                        delta_net::pack_state_slot(
+                            &self.state_work[linear_layer],
+                            1,
+                            0,
+                            &mut self.state_pools[linear_layer],
+                            segment.state_slot,
+                            &self.stream,
+                        )?;
                     }
                     mark!("delta.norm");
                     mixer.output_norm.forward(
@@ -1559,12 +1624,11 @@ impl Executor {
             &self.stream,
         )?;
         self.mark("delta.scan")?;
-        delta_net::decode_slots(
+        delta_net::decode_slots_packed(
             &mut self.state_pools[layer],
             &self.state_slots,
             &self.prepared.inputs(),
             &mut self.delta_out,
-            state_capacity,
             batch,
             &self.stream,
         )?;
@@ -1837,8 +1901,9 @@ impl Executor {
     /// перестаёт быть виден через context_lengths.
     pub fn reset(&mut self) -> Result<()> {
         for pool in &mut self.state_pools {
-            pool.zero_range(0, pool.len())?;
+            pool.reset()?;
         }
+        self.work_owner.fill(None);
         for pool in &mut self.conv_pools {
             pool.zero_range(0, pool.len())?;
         }
@@ -1847,8 +1912,13 @@ impl Executor {
 
     pub fn reset_slot(&mut self, slot: usize) -> Result<()> {
         assert!(slot < self.max_batch);
-        for pool in &mut self.state_pools {
-            pool.zero_range(slot * STATE_ELEMS, STATE_ELEMS)?;
+        for (layer, pool) in self.state_pools.iter_mut().enumerate() {
+            pool.reset_slot(slot)?;
+            // Копия этого слота больше ничего не значит: слот получил новую
+            // последовательность.
+            if self.work_owner[layer] == Some(slot) {
+                self.work_owner[layer] = None;
+            }
         }
         for pool in &mut self.conv_pools {
             pool.zero_range(slot * CONV_STATE_ELEMS, CONV_STATE_ELEMS)?;

@@ -224,6 +224,24 @@ impl LmHead {
         }
     }
 
+    /// Логиты только по строкам из `row_ids`. Есть лишь у FP8-головы:
+    /// BF16-путь — диагностический, и шортлист там незачем.
+    pub fn logits_subset(
+        &self,
+        hidden: &DeviceBuffer<u16>,
+        row_ids: &DeviceBuffer<u32>,
+        logits: &mut DeviceBuffer<f32>,
+        count: usize,
+        stream: &Stream,
+    ) -> qwc_cuda::Result<bool> {
+        match self {
+            Self::Fp8(head) => head
+                .logits_subset(hidden, row_ids, logits, count, stream)
+                .map(|()| true),
+            Self::Bf16(_) => Ok(false),
+        }
+    }
+
     pub fn logits_row_to(
         &self,
         hidden: &DeviceBuffer<u16>,

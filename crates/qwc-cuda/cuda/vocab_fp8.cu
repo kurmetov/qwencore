@@ -514,7 +514,95 @@ __global__ void bf16_lm_head_kernel(
   }
 }
 
+// Логиты только по списку строк словаря.
+//
+// Черновой голове точный argmax по 248 320 строкам не нужен: её предложение
+// всё равно проверяет основная модель, и промах шортлиста стоит отвергнутого
+// черновика, а не неверного выхода. Список строк задаётся снаружи — частотный
+// префикс словаря плюс токены контекста.
+//
+// Варп владеет строкой: у строки 5120 байт, лента читается по четыре байта на
+// поток, активация лежит в shared и читается всеми варпами блока.
+__global__ __launch_bounds__(kThreads) void lm_head_subset_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ row_scales,
+    const __nv_bfloat16* __restrict__ hidden,
+    const uint32_t* __restrict__ row_ids,
+    float* __restrict__ logits,
+    int hidden_size,
+    int count,
+    int vocab) {
+  extern __shared__ float staged[];
+  for (int index = threadIdx.x; index < hidden_size; index += kThreads) {
+    staged[index] = __bfloat162float(hidden[index]);
+  }
+  __syncthreads();
+
+  constexpr int kWarpsPerBlock = kThreads / kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+  const int lane = threadIdx.x % kWarpSize;
+  const int slot = blockIdx.x * kWarpsPerBlock + warp;
+  if (slot >= count) {
+    return;
+  }
+  const int row = static_cast<int>(row_ids[slot]);
+  if (row < 0 || row >= vocab) {
+    if (lane == 0) {
+      logits[slot] = -INFINITY;
+    }
+    return;
+  }
+
+  const size_t base = static_cast<size_t>(row) * hidden_size;
+  float accumulator = 0.0f;
+  for (int column = lane * 4; column < hidden_size; column += kWarpSize * 4) {
+    const uint32_t packed =
+        *reinterpret_cast<const uint32_t*>(weights + base + column);
+#pragma unroll
+    for (int byte = 0; byte < 4; ++byte) {
+      accumulator = fmaf(
+          fp8_to_float(static_cast<uint8_t>(packed >> (8 * byte))),
+          staged[column + byte],
+          accumulator);
+    }
+  }
+  const float total = warp_sum(accumulator);
+  if (lane == 0) {
+    logits[slot] = total * row_scales[row];
+  }
+}
+
 }  // namespace
+
+extern "C" cudaError_t qwc_fp8_lm_head_subset(
+    const void* weights,
+    const void* row_scales,
+    const void* hidden,
+    const void* row_ids,
+    void* logits,
+    int count,
+    int hidden_size,
+    int vocab,
+    cudaStream_t stream) {
+  if (weights == nullptr || row_scales == nullptr || hidden == nullptr ||
+      row_ids == nullptr || logits == nullptr || count <= 0 || hidden_size <= 0 ||
+      hidden_size % 4 != 0 || vocab <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int kWarpsPerBlock = kThreads / kWarpSize;
+  const int blocks = (count + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  const size_t shared = static_cast<size_t>(hidden_size) * sizeof(float);
+  lm_head_subset_kernel<<<blocks, kThreads, shared, stream>>>(
+      static_cast<const uint8_t*>(weights),
+      static_cast<const float*>(row_scales),
+      static_cast<const __nv_bfloat16*>(hidden),
+      static_cast<const uint32_t*>(row_ids),
+      static_cast<float*>(logits),
+      hidden_size,
+      count,
+      vocab);
+  return cudaGetLastError();
+}
 
 extern "C" cudaError_t qwc_fp8_quantize_rows(
     const void* input,

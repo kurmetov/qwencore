@@ -4,7 +4,9 @@
 //! состоит из ДВУХ независимых частей.
 //!
 //!   1. Рекуррентное состояние DeltaNet (48 слоёв) — константа на слот,
-//!      не зависит от длины контекста: ~81 MB @ bf16, ~157 MB @ fp32.
+//!      не зависит от длины контекста: ~39 MB @ int8, ~81 MB @ bf16,
+//!      ~157 MB @ fp32. Сверх слотов лежит одна расквантованная копия на
+//!      движок, ~76 MB, по которой идёт префилл.
 //!   2. Paged KV-кэш (16 слоёв) — линейно растёт: 32 KB на токен @ fp8.
 //!
 //! Точка равенства — около 2.5K токенов. Ниже неё concurrency упирается
@@ -62,6 +64,9 @@ impl WeightPlan {
         }
     }
 
+    /// Полный resident footprint весов. Эта величина нужна для VRAM-бюджета,
+    /// но не является трафиком одного decode-шага: обычный шаг не читает MTP,
+    /// vision tower и всю таблицу embedding.
     pub fn bytes(&self) -> u64 {
         let mut total = self.body.bytes(QUANTIZED_PARAMS);
         total += self.lm_head.bytes(LM_HEAD_PARAMS);
@@ -74,6 +79,16 @@ impl WeightPlan {
         }
         total
     }
+
+    /// Байты весов, которые обычный decode-шаг действительно читает из
+    /// памяти. Тело модели и `lm_head` сканируются целиком, а embedding делает
+    /// lookup одной строки на последовательность. MTP и vision в обычном
+    /// decode не исполняются.
+    pub fn decode_weight_bytes(&self, batch: usize) -> u64 {
+        self.body.bytes(QUANTIZED_PARAMS)
+            + self.lm_head.bytes(LM_HEAD_PARAMS)
+            + self.embed.bytes(HIDDEN_SIZE * batch)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -84,8 +99,9 @@ impl WeightPlan {
 pub struct CacheConfig {
     /// Формат KV-кэша для 16 full-attention слоёв.
     pub kv_dtype: Dtype,
-    /// Формат рекуррентного состояния. Конфиг модели требует fp32;
-    /// bf16 — предмет отдельного ablation-эксперимента по точности.
+    /// Формат рекуррентного состояния покоящихся слотов. Конфиг модели
+    /// требует fp32; движок хранит int8 с масштабом на строку, а префилл
+    /// идёт по отдельной bf16-копии (см. `state_work_bytes`).
     pub state_dtype: Dtype,
     /// Размер блока paged KV-кэша в токенах.
     pub block_size: usize,
@@ -95,7 +111,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             kv_dtype: Dtype::Fp8E4m3,
-            state_dtype: Dtype::Bf16,
+            state_dtype: Dtype::Int8Row128,
             block_size: 64,
         }
     }
@@ -115,6 +131,13 @@ impl CacheConfig {
     /// Conv-состояние всегда fp32 — оно копеечное, экономить смысла нет.
     pub fn state_bytes_per_slot(&self) -> u64 {
         self.state_dtype.bytes(STATE_ELEMS_PER_SEQ) + Dtype::Fp32.bytes(CONV_ELEMS_PER_SEQ)
+    }
+
+    /// Расквантованная копия состояния одной последовательности. Она одна на
+    /// движок, а не на слот, поэтому в стоимость слота не входит — но в
+    /// бюджет карты входит, и на двух слотах она съедает всю экономию.
+    pub fn state_work_bytes(&self) -> u64 {
+        Dtype::Bf16.bytes(STATE_ELEMS_PER_SEQ)
     }
 
     /// Полная стоимость последовательности заданной длины.
@@ -209,14 +232,38 @@ mod tests {
 
         let saved = shipped - ours;
         assert!(saved > 3.0, "экономия всего {saved} GB, ожидали >3");
+
+        // Resident footprint включает MTP и полную embedding table, но
+        // обычный batch-1 decode их не стримит целиком.
+        let decode = WeightPlan::default().decode_weight_bytes(1) as f64 / 1e9;
+        assert!(
+            (14.5..15.5).contains(&decode),
+            "decode traffic: {decode} GB"
+        );
+        assert!(
+            decode < ours - 1.5,
+            "resident {ours} GB vs decode {decode} GB"
+        );
     }
 
     #[test]
     fn state_dominates_below_crossover() {
         let cfg = CacheConfig::default();
         let x = cfg.crossover_tokens();
-        // bf16-состояние равно KV-кэшу примерно на 2.5K токенов.
-        assert!((2000..3200).contains(&x), "точка пересечения: {x}");
+        // 8-битное состояние равно KV-кэшу примерно на 1.3K токенов: вдвое
+        // дешевле слот — вдвое ближе точка равенства, и диапазон, где
+        // concurrency упирается в слоты, а не в KV, соответственно сузился.
+        assert!((1000..1700).contains(&x), "точка пересечения: {x}");
+
+        let wide = CacheConfig {
+            state_dtype: Dtype::Bf16,
+            ..cfg
+        };
+        assert!(
+            wide.crossover_tokens() > x * 3 / 2,
+            "bf16 {} против int8 {x}",
+            wide.crossover_tokens()
+        );
 
         // Ниже неё состояние дороже KV.
         let short: usize = 512;

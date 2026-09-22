@@ -126,6 +126,14 @@ impl MtpScratch {
         self.key_cache.bytes() + self.value_cache.bytes()
     }
 
+    /// Обнуляет KV головы. Нужен при переходе на другую последовательность:
+    /// позиции те же, а ключи остались от прежней.
+    pub fn reset_cache(&mut self) -> qwc_cuda::Result<()> {
+        let bytes = self.key_cache.len();
+        self.key_cache.zero_range(0, bytes)?;
+        self.value_cache.zero_range(0, bytes)
+    }
+
     /// Позиционные таблицы и адрес страницы для строк [0, rows).
     fn upload(&mut self, tokens: &[u32], positions: &[u32]) -> qwc_cuda::Result<()> {
         let rows = tokens.len();
@@ -356,4 +364,221 @@ pub fn load(checkpoint: &qwc_model::Checkpoint) -> Result<MtpHead, crate::weight
         )?,
         bytes,
     })
+}
+
+/// Голова, её скретч и буферы для цепочки черновиков.
+///
+/// Скретч несёт собственный однослойный KV на всю длину контекста, поэтому
+/// один `Speculator` обслуживает одну последовательность. При переходе на
+/// другую KV надо обнулить: позиции у новой последовательности те же, а
+/// содержимое чужое. Черновики на корректность не влияют — их проверяет
+/// основная модель, — но чужой KV роняет acceptance.
+pub struct Speculator {
+    head: MtpHead,
+    scratch: MtpScratch,
+    hidden: DeviceBuffer<u16>,
+    draft_hidden: DeviceBuffer<u16>,
+    logits: DeviceBuffer<f32>,
+    argmax: qwc_cuda::sampling::Argmax,
+    stream: Stream,
+    owner: Option<u32>,
+    shortlist: Option<Shortlist>,
+}
+
+/// Список строк словаря, по которым черновая голова ищет свой argmax.
+///
+/// Полная проекция в словарь читает 1.27 ГБ и стоит 0.82 из 1.49 мс чернового
+/// прохода. Точный argmax по всем 248 320 строкам черновику не нужен: его
+/// предложение проверяет основная модель, и промах списка стоит отвергнутого
+/// черновика, а не неверного выхода.
+///
+/// Список — частотный префикс словаря плюс токены контекста. Замер покрытия
+/// на 25 600 реально сгенерированных токенах: один контекст даёт 0.814,
+/// `id < 32768` — 0.915, вместе — 0.958. Контекстная часть здесь главная:
+/// в коде и агентных промптах модель много повторяет уже сказанное.
+struct Shortlist {
+    ids: DeviceBuffer<u32>,
+    host: Vec<u32>,
+    present: std::collections::HashSet<u32>,
+    /// Сколько первых строк словаря входят в список всегда.
+    frequent: usize,
+    dirty: bool,
+}
+
+impl Shortlist {
+    fn new(frequent: usize, context_capacity: usize) -> qwc_cuda::Result<Self> {
+        let capacity = frequent + context_capacity;
+        Ok(Self {
+            ids: DeviceBuffer::zeroed(capacity)?,
+            host: Vec::with_capacity(capacity),
+            present: std::collections::HashSet::with_capacity(capacity),
+            frequent,
+            dirty: true,
+        })
+    }
+
+    /// Начать список заново под другую последовательность.
+    fn reset(&mut self, context: &[u32]) {
+        self.host.clear();
+        self.present.clear();
+        for &token in context {
+            self.push(token);
+        }
+        for row in 0..self.frequent as u32 {
+            self.push(row);
+        }
+        self.dirty = true;
+    }
+
+    fn push(&mut self, token: u32) {
+        if self.host.len() < self.host.capacity() && self.present.insert(token) {
+            self.host.push(token);
+            self.dirty = true;
+        }
+    }
+
+    fn upload(&mut self) -> qwc_cuda::Result<usize> {
+        if self.dirty {
+            self.ids.copy_from_slice(&self.host)?;
+            self.dirty = false;
+        }
+        Ok(self.host.len())
+    }
+}
+
+impl Speculator {
+    pub fn new(
+        checkpoint: &qwc_model::Checkpoint,
+        max_context: usize,
+        cache_dtype: KvCacheDtype,
+    ) -> Result<Self, crate::weights::LoadError> {
+        Ok(Self {
+            head: load(checkpoint)?,
+            scratch: MtpScratch::new(1, max_context, cache_dtype)?,
+            hidden: DeviceBuffer::zeroed(HIDDEN_SIZE)?,
+            draft_hidden: DeviceBuffer::zeroed(HIDDEN_SIZE)?,
+            logits: DeviceBuffer::zeroed(VOCAB_SIZE)?,
+            argmax: qwc_cuda::sampling::Argmax::new(1, VOCAB_SIZE)?,
+            stream: Stream::new()?,
+            owner: None,
+            shortlist: None,
+        })
+    }
+
+    /// Включает шортлист словаря для черновых логитов. `frequent` — сколько
+    /// первых строк словаря держать всегда, `context_capacity` — сколько
+    /// различных токенов последовательности список может вместить сверх них.
+    pub fn enable_shortlist(
+        &mut self,
+        frequent: usize,
+        context_capacity: usize,
+    ) -> Result<(), crate::weights::LoadError> {
+        assert!(frequent > 0 && frequent <= VOCAB_SIZE);
+        self.shortlist = Some(Shortlist::new(frequent, context_capacity)?);
+        Ok(())
+    }
+
+    /// Токены контекста для шортлиста: промпт последовательности и всё, что
+    /// она уже выдала. Без них покрытие падает с 0.958 до 0.915.
+    pub fn set_context(&mut self, context: &[u32]) {
+        if let Some(shortlist) = self.shortlist.as_mut() {
+            shortlist.reset(context);
+        }
+    }
+
+    /// Принятый токен продолжает контекст: следующий черновик должен уметь
+    /// его повторить.
+    pub fn observe(&mut self, token: u32) {
+        if let Some(shortlist) = self.shortlist.as_mut() {
+            shortlist.push(token);
+        }
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.head.resident_bytes() + self.scratch.resident_bytes()
+    }
+
+    /// Буфер под скрытое состояние основной модели: исполнитель копирует
+    /// в него строку перед вызовом `draft_chain`.
+    pub fn hidden_mut(&mut self) -> &mut DeviceBuffer<u16> {
+        &mut self.hidden
+    }
+
+    /// Переключает спекулятор на другую последовательность, если нужно.
+    /// Возвращает `true`, если KV головы был сброшен.
+    pub fn bind(&mut self, sequence: u32) -> qwc_cuda::Result<bool> {
+        if self.owner == Some(sequence) {
+            return Ok(false);
+        }
+        self.scratch.reset_cache()?;
+        self.owner = Some(sequence);
+        Ok(true)
+    }
+
+    /// Цепочка из `depth` черновиков: первый идёт по скрытому состоянию
+    /// основной модели, дальше голова продолжает по собственному выходу.
+    pub fn draft_chain(
+        &mut self,
+        weights: &ModelWeights,
+        token: u32,
+        position: usize,
+        depth: usize,
+    ) -> qwc_cuda::Result<Vec<u32>> {
+        let mut drafts = Vec::with_capacity(depth);
+        let mut input = token;
+        for step in 0..depth {
+            let source: *const DeviceBuffer<u16> = if step == 0 {
+                &self.hidden
+            } else {
+                &self.draft_hidden
+            };
+            // SAFETY: оба буфера живут в self и не пересекаются с выходом.
+            let source = unsafe { &*source };
+            draft(
+                &self.head,
+                weights,
+                &mut self.scratch,
+                source,
+                &[input],
+                &[(position + step) as u32],
+                &mut self.draft_hidden,
+                &self.stream,
+            )?;
+            let shortlisted = match self.shortlist.as_mut() {
+                Some(shortlist) => {
+                    let count = shortlist.upload()?;
+                    let used = weights.lm_head.logits_subset(
+                        &self.draft_hidden,
+                        &shortlist.ids,
+                        &mut self.logits,
+                        count,
+                        &self.stream,
+                    )?;
+                    // argmax идёт по плотному выходу, поэтому возвращает место
+                    // в списке, а не токен.
+                    match used {
+                        true => {
+                            let slot =
+                                self.argmax.sample_prefix(&self.logits, count, &self.stream)?;
+                            Some(shortlist.host[slot])
+                        }
+                        false => None,
+                    }
+                }
+                None => None,
+            };
+            input = match shortlisted {
+                Some(token) => token,
+                None => {
+                    weights
+                        .lm_head
+                        .logits(&self.draft_hidden, &mut self.logits, 1, &self.stream)?;
+                    self.argmax.sample(&self.logits, 1, &self.stream)?;
+                    self.argmax.to_host(1)?[0]
+                }
+            };
+            drafts.push(input);
+        }
+        Ok(drafts)
+    }
 }

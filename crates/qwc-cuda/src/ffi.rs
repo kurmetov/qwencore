@@ -102,6 +102,20 @@ unsafe extern "C" {
         stream: Stream,
     ) -> c_int;
 
+    /// Логиты только по списку строк словаря — для черновой головы.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwc_fp8_lm_head_subset(
+        weights: *const c_void,
+        row_scales: *const c_void,
+        hidden: *const c_void,
+        row_ids: *const c_void,
+        logits: *mut c_void,
+        count: c_int,
+        hidden_size: c_int,
+        vocab: c_int,
+        stream: Stream,
+    ) -> c_int;
+
     #[allow(clippy::too_many_arguments)]
     pub fn qwc_bf16_lm_head(
         weights: *const c_void,
@@ -143,6 +157,57 @@ unsafe extern "C" {
         out: *mut c_void,
         state_capacity: c_int,
         batch: c_int,
+        stream: Stream,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwc_delta_decode_int8(
+        state: *mut c_void,
+        state_scales: *mut f32,
+        state_slots: *const c_void,
+        q: *const c_void,
+        k: *const c_void,
+        v: *const c_void,
+        alpha: *const c_void,
+        beta: *const c_void,
+        kq: *const c_void,
+        out: *mut c_void,
+        state_capacity: c_int,
+        batch: c_int,
+        stream: Stream,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwc_delta_state_pack(
+        source: *const c_void,
+        packed: *mut c_void,
+        scales: *mut f32,
+        source_capacity: c_int,
+        source_slot: c_int,
+        packed_capacity: c_int,
+        packed_slot: c_int,
+        stream: Stream,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwc_delta_state_unpack(
+        packed: *const c_void,
+        scales: *const f32,
+        destination: *mut c_void,
+        packed_capacity: c_int,
+        packed_slot: c_int,
+        destination_capacity: c_int,
+        destination_slot: c_int,
+        stream: Stream,
+    ) -> c_int;
+
+    pub fn qwc_delta_state_requantize(
+        state: *mut c_void,
+        state_slots: *const c_void,
+        first_slot: c_int,
+        state_capacity: c_int,
+        count: c_int,
+        mode: c_int,
         stream: Stream,
     ) -> c_int;
 
@@ -292,6 +357,24 @@ unsafe extern "C" {
         out_features: c_int,
         in_features: c_int,
         batch: c_int,
+        weight_global_scale: f32,
+        stream: Stream,
+    ) -> c_int;
+
+    /// Свиповая точка входа: геометрия задаётся снаружи. Движок её не зовёт.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwc_nvfp4_w4a16_tuned(
+        packed: *const c_void,
+        scales: *const c_void,
+        input: *const c_void,
+        output: *mut c_void,
+        out_features: c_int,
+        in_features: c_int,
+        batch: c_int,
+        k_rows: c_int,
+        k_threads: c_int,
+        k_tile: c_int,
+        rows_per_thread: c_int,
         weight_global_scale: f32,
         stream: Stream,
     ) -> c_int;

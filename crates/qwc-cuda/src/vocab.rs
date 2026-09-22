@@ -302,6 +302,38 @@ impl Fp8Vocab {
         Ok(())
     }
 
+    /// Логиты одной строки скрытого состояния, но только по строкам словаря
+    /// из `row_ids`. Выход плотный: `logits[i]` соответствует `row_ids[i]`,
+    /// поэтому argmax по нему даёт индекс в списке, а не токен.
+    ///
+    /// Нужно черновой голове: её предложение проверяет основная модель, и
+    /// промах списка стоит отвергнутого черновика, а не неверного выхода.
+    pub fn logits_subset(
+        &self,
+        hidden: &DeviceBuffer<u16>,
+        row_ids: &DeviceBuffer<u32>,
+        logits: &mut DeviceBuffer<f32>,
+        count: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        assert!(count > 0 && count <= row_ids.len());
+        assert!(hidden.len() >= self.cols);
+        assert!(logits.len() >= count);
+        check(unsafe {
+            ffi::qwc_fp8_lm_head_subset(
+                self.data.as_ptr(),
+                self.row_scales.as_ptr(),
+                hidden.as_ptr(),
+                row_ids.as_ptr(),
+                logits.as_mut_ptr(),
+                count as i32,
+                self.cols as i32,
+                self.rows as i32,
+                stream.raw(),
+            )
+        })
+    }
+
     /// Один проход по таблице на весь batch. Батчи больше
     /// `MAX_BATCHED_LOGITS` всё ещё режутся, но это далеко за пределами
     /// `MAX_BATCH` исполнителя.

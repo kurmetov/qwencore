@@ -15,6 +15,11 @@ pub enum Dtype {
     Fp8E4m3,
     /// NVFP4: 4 бита на элемент + fp8-шкала на блок из 16.
     Nvfp4,
+    /// int8 с масштабом f32 на строку состояния (128 элементов). Формат
+    /// хранения рекуррентного состояния DeltaNet: строки плоские, и на них
+    /// он вчетверо точнее fp8 при том же байте
+    /// (`bench/results/delta-state-8bit.md`).
+    Int8Row128,
     Fp32,
 }
 
@@ -27,6 +32,7 @@ impl Dtype {
             Dtype::Bf16 => (n * 2) as u64,
             Dtype::Fp8E4m3 => n as u64,
             Dtype::Nvfp4 => (n / 2 + n.div_ceil(NVFP4_BLOCK)) as u64,
+            Dtype::Int8Row128 => (n + n.div_ceil(128) * 4) as u64,
         }
     }
 
@@ -37,6 +43,7 @@ impl Dtype {
             Dtype::Bf16 => 16.0,
             Dtype::Fp8E4m3 => 8.0,
             Dtype::Nvfp4 => 4.5,
+            Dtype::Int8Row128 => 8.25,
         }
     }
 
@@ -46,6 +53,7 @@ impl Dtype {
             Dtype::Bf16 => "bf16",
             Dtype::Fp8E4m3 => "fp8_e4m3",
             Dtype::Nvfp4 => "nvfp4",
+            Dtype::Int8Row128 => "int8_row128",
         }
     }
 }
