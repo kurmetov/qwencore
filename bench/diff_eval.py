@@ -97,6 +97,19 @@ def package_version(name: str) -> str:
         return "unknown"
 
 
+def display_path(path: Path | str) -> str:
+    """Путь для run-header: дом — через `$HOME`. Артефакты уходят в публичный
+    репозиторий, и имя пользователя в каждом из них не нужно. Движок при этом
+    получает настоящий путь — подменяется только записываемая строка."""
+    resolved = Path(path).expanduser().resolve()
+    home = Path.home().resolve()
+    try:
+        relative = resolved.relative_to(home)
+    except ValueError:
+        return str(resolved)
+    return "$HOME" if str(relative) == "." else f"$HOME/{relative.as_posix()}"
+
+
 def run_header(
     engine: str,
     version: str,
@@ -111,7 +124,7 @@ def run_header(
         "schema_version": SCHEMA_VERSION,
         "engine": engine,
         "engine_version": version,
-        "model": str(model.resolve()),
+        "model": display_path(model),
         "corpus_sha256": corpus_digest(corpus),
         "top_k": top_k,
         "logits": logits,

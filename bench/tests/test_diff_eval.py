@@ -81,5 +81,18 @@ class DiffEvalTest(unittest.TestCase):
             self.assertEqual(score["cases"]["case"]["status"], "prompt_mismatch")
 
 
+class RunHeaderPathTest(unittest.TestCase):
+    def test_checkpoint_under_home_is_written_through_env_var(self):
+        inside = Path.home().resolve() / "models/Qwen3.8-27B-QUASAR-NVFP4"
+        self.assertEqual(
+            diff_eval.display_path(inside),
+            "$HOME/models/Qwen3.8-27B-QUASAR-NVFP4",
+        )
+
+    def test_checkpoint_outside_home_is_left_alone(self):
+        # Скрывать там нечего, и путь должен остаться проверяемым.
+        self.assertEqual(diff_eval.display_path(Path("/opt/ckpt/qwen")), "/opt/ckpt/qwen")
+
+
 if __name__ == "__main__":
     unittest.main()

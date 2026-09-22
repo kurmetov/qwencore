@@ -229,6 +229,19 @@ def run_text(command: Sequence[str]) -> str | None:
     return result.stdout.strip()
 
 
+def display_path(path: Path | str) -> str:
+    """Путь для run-header: дом — через `$HOME`. Артефакты уходят в публичный
+    репозиторий, и имя пользователя в каждом из них не нужно. Движок при этом
+    получает настоящий путь — подменяется только записываемая строка."""
+    resolved = Path(path).expanduser().resolve()
+    home = Path.home().resolve()
+    try:
+        relative = resolved.relative_to(home)
+    except ValueError:
+        return str(resolved)
+    return "$HOME" if str(relative) == "." else f"$HOME/{relative.as_posix()}"
+
+
 def git_metadata() -> dict[str, object]:
     commit = run_text(("git", "rev-parse", "HEAD")) or "unknown"
     status = run_text(("git", "status", "--porcelain"))
@@ -354,7 +367,7 @@ def run_suite(args: argparse.Namespace) -> int:
         "repeats": args.repeats,
         "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "python": sys.executable,
-        "model": str(args.model),
+        "model": display_path(args.model),
         "git": git_metadata(),
         "gpu": initial_gpu,
         "max_background_memory_gb": args.max_background_memory_gb,
