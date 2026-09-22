@@ -110,12 +110,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 token IDs и top-k log-probabilities с внешними runtime описано в
 [`10-differential-eval.md`](10-differential-eval.md).
 
-## Что осталось
+## Ограничения decode-пути
 
-* несколько prefill-последовательностей смешанного batch пока исполняются
+* несколько prefill-последовательностей смешанного batch исполняются
   последовательно, хотя каждый их чанк использует tensor cores;
-* W4A4 gate/up всё ещё перечитывают нормализованную активацию и требуют общий
-  fused mainloop;
-* нет preemption, prefix snapshots, MTP и corpus-level perplexity eval;
+* W4A4 gate/up перечитывают нормализованную активацию: общего fused mainloop
+  у них нет;
+* нет preemption, prefix snapshots и corpus-level perplexity eval;
 * `scripts/tok.py` использует ASCII-приближение pre-tokenizer; для Unicode
   нужен полный tokenizer.
