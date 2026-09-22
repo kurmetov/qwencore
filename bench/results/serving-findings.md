@@ -1,5 +1,12 @@
 # Serving throughput under concurrency — 2026-09-11
 
+> **Single-session points, no confidence intervals.** The vLLM comparison here
+> predates the protocol in
+> [`docs/11-experiments.md`](../../docs/11-experiments.md): one or two runs per
+> point, no variant-order rotation, no bootstrap CI, on a partially occupied
+> card. These multipliers are superseded by the comparison suite and must not be
+> quoted as a project result. Per-point conditions are given below.
+
 200 requests, 256 prompt tokens, 128 generated tokens each, all submitted at
 t=0 so both engines run saturated. Same model files, same GPU, greedy,
 `detokenize=False`, CUDA graphs on, warmup before timing.

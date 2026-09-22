@@ -1,5 +1,12 @@
 # Batch-1 decode latency — 2026-09-11
 
+> **Single-session points, no confidence intervals.** The vLLM comparison here
+> predates the protocol in
+> [`docs/11-experiments.md`](../../docs/11-experiments.md): one or two runs per
+> point, no variant-order rotation, no bootstrap CI, on a partially occupied
+> card. These multipliers are superseded by the comparison suite and must not be
+> quoted as a project result. Per-point conditions are given below.
+
 Hardware: RTX 5090, 32 GB. Model: `Qwen3.8-27B-QUASAR-NVFP4`, packed
 compressed-tensors NVFP4, identical files for both engines.
 
