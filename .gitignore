@@ -3,3 +3,12 @@
 /third_party/cuda-shim
 __pycache__/
 *.py[cod]
+
+# Веса модели: качаются scripts/fetch-checkpoint.sh, в репозитории им не место.
+/models/
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+
