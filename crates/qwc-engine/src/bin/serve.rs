@@ -15,7 +15,7 @@ use qwc_cuda::delta_net::DeltaStateMode;
 use qwc_cuda::paged_attention::{KvCacheDtype, PAGE_SIZE};
 use qwc_engine::{DecodeLinearMode, Executor, ExecutorConfig, ModelWeights, PREFILL_CHUNK_SIZE};
 use qwc_model::Checkpoint;
-use qwc_runtime::{BatchLayout, CacheManager, FinishReason, Request, Scheduler, SchedulerConfig};
+use qwc_runtime::{Batch, BatchLayout, CacheManager, FinishReason, Request, Scheduler, SchedulerConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -49,6 +49,7 @@ struct Args {
     kv_cache_bytes: usize,
     kv_cache_dtype: KvCacheDtype,
     delta_state: DeltaStateMode,
+    prefix_snapshots: usize,
 }
 
 struct WorkerConfig {
@@ -60,6 +61,7 @@ struct WorkerConfig {
     kv_pool_blocks: usize,
     kv_cache_dtype: KvCacheDtype,
     delta_state: DeltaStateMode,
+    prefix_snapshots: usize,
     eos_ids: Vec<u32>,
 }
 
@@ -70,6 +72,9 @@ enum Command {
 struct GenerateJob {
     id: u32,
     prompt: Vec<u32>,
+    /// Длина истории диалога: всё до промпта генерации. На этой границе
+    /// снимается кэш префиксов — следующий ход повторит историю дословно.
+    history_tokens: usize,
     max_new_tokens: usize,
     stop: Vec<String>,
     buffer_output: bool,
@@ -213,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kv_pool_blocks,
         kv_cache_dtype: args.kv_cache_dtype,
         delta_state: args.delta_state,
+        prefix_snapshots: args.prefix_snapshots,
         eos_ids,
     };
     std::thread::Builder::new()
@@ -236,12 +242,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     eprintln!(
-        "qwc serve: http://{} model={} context={} KV={} pages ({:.2} GB cache+state)",
+        "qwc serve: http://{} model={} context={} KV={} pages ({:.2} GB cache+state), \
+prefix cache {} snapshots ({:.2} GB)",
         args.bind,
         args.model_name,
         args.max_context,
         kv_pool_blocks,
-        cache_bytes as f64 / 1e9
+        cache_bytes as f64 / 1e9,
+        args.prefix_snapshots,
+        (args.prefix_snapshots * Executor::prefix_snapshot_bytes()) as f64 / 1e9
     );
     axum::serve(listener, app).await?;
     Ok(())
@@ -310,6 +319,13 @@ async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
     let prompt_tokens = prompt.len();
+    // Промпт генерации начинается последним `<|im_start|>`: ход модели в
+    // историю следующего запроса попадёт уже без `<think>` и с ответом.
+    let history_tokens = state
+        .tokenizer
+        .token_to_id("<|im_start|>")
+        .and_then(|start| prompt.iter().rposition(|&token| token == start))
+        .unwrap_or(prompt_tokens);
     let stop = match request.stop {
         None => Vec::new(),
         Some(Stop::One(stop)) => vec![stop],
@@ -328,6 +344,7 @@ async fn chat_completions(
         .send(Command::Generate(GenerateJob {
             id,
             prompt,
+            history_tokens,
             max_new_tokens: requested,
             stop,
             buffer_output,
@@ -555,6 +572,12 @@ fn run_worker(
             input.extend_from_slice(&job.prompt[chunk.offset..chunk.offset + chunk.tokens]);
         }
 
+        if let Err(error) = apply_prefix_ops(&mut executor, &batch) {
+            let _ = scheduler.abort_batch();
+            fail_all(&mut jobs, format!("prefix cache failed: {error}"));
+            return;
+        }
+
         let sampled = match executor.execute_layout(&weights, &layout, &input) {
             Ok(sampled) => sampled,
             Err(error) => {
@@ -616,6 +639,34 @@ fn run_worker(
     }
 }
 
+/// Кэш префиксов перед шагом: скопировать неполные страницы продолжаемых
+/// префиксов и сказать исполнителю, какие слоты поднять и какие снять.
+fn apply_prefix_ops(executor: &mut Executor, batch: &Batch) -> qwc_cuda::Result<()> {
+    for op in &batch.restores {
+        if let Some((from, to)) = op.copy_block {
+            executor.copy_kv_block(from as usize, to as usize)?;
+        }
+        if let Some(chunk) = batch.prefill.iter().find(|chunk| chunk.id == op.id) {
+            eprintln!(
+                "prefix cache: sequence {} continues {} cached tokens",
+                op.id, chunk.offset
+            );
+        }
+    }
+    let restores: Vec<(usize, usize)> = batch
+        .restores
+        .iter()
+        .map(|op| (op.state_slot as usize, op.snapshot as usize))
+        .collect();
+    let saves: Vec<(usize, usize)> = batch
+        .saves
+        .iter()
+        .map(|op| (op.state_slot as usize, op.snapshot as usize))
+        .collect();
+    executor.plan_prefix(&restores, &saves);
+    Ok(())
+}
+
 fn initialize_worker(config: &WorkerConfig) -> Result<(Executor, ModelWeights, Scheduler), String> {
     qwc_cuda::Device::init(0).map_err(|error| error.to_string())?;
     qwc_cuda::set_memory_limit(config.memory_limit).map_err(str::to_owned)?;
@@ -632,11 +683,16 @@ fn initialize_worker(config: &WorkerConfig) -> Result<(Executor, ModelWeights, S
         Some(config.kv_pool_blocks),
     )
     .map_err(|error| error.to_string())?;
+    let mut executor = executor;
+    executor
+        .enable_prefix_snapshots(config.prefix_snapshots)
+        .map_err(|error| format!("prefix snapshots: {error}"))?;
     let cache = CacheManager::new(config.max_seqs, config.kv_pool_blocks, PAGE_SIZE);
-    let scheduler = Scheduler::new(
+    let mut scheduler = Scheduler::new(
         SchedulerConfig::new(config.max_seqs, config.prefill_chunk),
         cache,
     );
+    scheduler.enable_prefix_cache(config.prefix_snapshots);
     Ok((executor, weights, scheduler))
 }
 
@@ -647,7 +703,9 @@ fn accept_command(command: Command, scheduler: &mut Scheduler, jobs: &mut HashMa
         prompt_tokens: job.prompt.len(),
         max_new_tokens: job.max_new_tokens,
     };
-    if let Err(error) = scheduler.submit(request) {
+    if let Err(error) =
+        scheduler.submit_prompt(request, Arc::from(job.prompt.as_slice()), job.history_tokens)
+    {
         let _ = job.event_tx.send(EngineEvent::Error(error.to_string()));
         return;
     }
@@ -996,6 +1054,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut kv_cache_bytes = 5_000_000_000usize;
     let mut kv_cache_dtype = KvCacheDtype::Fp8;
     let mut delta_state = DeltaStateMode::Wy;
+    // Снимков состояния под кэш префиксов, ~81 МБ каждый. Восемь — это
+    // восемь диалогов, чей следующий ход не пересчитывает историю.
+    let mut prefix_snapshots = 8usize;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1010,6 +1071,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--memory-limit-gb" => {
                 let gb: f64 = args.next().ok_or("--memory-limit-gb")?.parse()?;
                 memory_limit = (gb * 1e9) as usize;
+            }
+            "--prefix-cache" => {
+                prefix_snapshots = args.next().ok_or("--prefix-cache needs N (0 = off)")?.parse()?
             }
             "--kv-cache-gb" => {
                 let gb: f64 = args.next().ok_or("--kv-cache-gb")?.parse()?;
@@ -1035,7 +1099,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     "qwc serve [--model PATH] [--bind 127.0.0.1:8000] \
 [--context 32768] [--max-seqs 32] [--kv-cache fp8|bf16] [--kv-cache-gb 5] \
 [--memory-limit-gb 28] [--prefill-chunk N] [--delta-state wy|bf16|fp32] \
-[--served-model-name NAME]"
+[--served-model-name NAME] [--prefix-cache 8]"
                 );
                 std::process::exit(0);
             }
@@ -1072,6 +1136,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         kv_cache_bytes,
         kv_cache_dtype,
         delta_state,
+        prefix_snapshots,
     })
 }
 

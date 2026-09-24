@@ -138,6 +138,16 @@ pub struct Executor {
     /// слои по очереди и распаковка каждого слоя своя.
     work_owner: Vec<Option<usize>>,
     conv_pools: Vec<DeviceBuffer<f32>>,
+    /// Снимки кэша префиксов: bf16-состояние и conv-история по слоям.
+    /// Держатся в bf16, а не в 8 битах покоящихся слотов: продолжение
+    /// префикса — это префилл тысяч токенов с этого состояния, и с
+    /// квантованного он ошибается в разы (`bench/results/delta-state-8bit.md`).
+    prefix_state: Vec<DeviceBuffer<u16>>,
+    prefix_conv: Vec<DeviceBuffer<f32>>,
+    /// Операции следующего прохода: `(слот, снимок)`. Подъём — вместо
+    /// распаковки слота, снятие — сразу после скана сегмента.
+    prefix_restores: Vec<(usize, usize)>,
+    prefix_saves: Vec<(usize, usize)>,
     /// Скретч WY-скана. Общий на все слои и все последовательности: скан
     /// вызывается до 48 раз за шаг, и аллокация внутри вызова сериализовала
     /// бы этот путь. Заводится только в режиме `Wy` — он стоит десятки
@@ -479,6 +489,10 @@ impl Executor {
             state_work,
             work_owner: vec![None; NUM_LINEAR_LAYERS],
             conv_pools,
+            prefix_state: Vec::new(),
+            prefix_conv: Vec::new(),
+            prefix_restores: Vec::new(),
+            prefix_saves: Vec::new(),
             delta_prefill,
             speculation_mixer,
             speculation_rows,
@@ -746,6 +760,62 @@ impl Executor {
     /// на котором проверяются спекулятивные токены.
     pub fn state_capacity(&self) -> usize {
         self.max_batch + 1
+    }
+
+    /// Байты одного снимка кэша префиксов.
+    pub fn prefix_snapshot_bytes() -> usize {
+        NUM_LINEAR_LAYERS
+            * (STATE_ELEMS * std::mem::size_of::<u16>()
+                + CONV_STATE_ELEMS * std::mem::size_of::<f32>())
+    }
+
+    /// Память под `snapshots` снимков кэша префиксов.
+    pub fn enable_prefix_snapshots(&mut self, snapshots: usize) -> Result<()> {
+        self.prefix_state.clear();
+        self.prefix_conv.clear();
+        if snapshots == 0 {
+            return Ok(());
+        }
+        for _ in 0..NUM_LINEAR_LAYERS {
+            self.prefix_state
+                .push(DeviceBuffer::zeroed(snapshots * STATE_ELEMS)?);
+            self.prefix_conv
+                .push(DeviceBuffer::zeroed(snapshots * CONV_STATE_ELEMS)?);
+        }
+        Ok(())
+    }
+
+    pub fn prefix_snapshots(&self) -> usize {
+        self.prefix_state
+            .first()
+            .map_or(0, |buffer| buffer.len() / STATE_ELEMS)
+    }
+
+    /// Операции кэша префиксов на следующий смешанный шаг. Подъём
+    /// выполняется вместо распаковки слота, снятие — после скана чанка;
+    /// оба только для сегментов префилла этого шага.
+    pub fn plan_prefix(&mut self, restores: &[(usize, usize)], saves: &[(usize, usize)]) {
+        let snapshots = self.prefix_snapshots();
+        assert!(
+            restores.iter().chain(saves).all(|&(slot, snapshot)| {
+                slot < self.max_batch && snapshot < snapshots
+            }),
+            "снимок вне пула или слот вне batch"
+        );
+        self.prefix_restores = restores.to_vec();
+        self.prefix_saves = saves.to_vec();
+    }
+
+    /// Скопировать страницу KV во всех слоях полного внимания: хвост
+    /// закэшированного префикса лежит в неполной странице, а дописывать в
+    /// неё будет новая последовательность.
+    pub fn copy_kv_block(&mut self, from: usize, to: usize) -> Result<()> {
+        assert!(from < self.kv_pool_blocks && to < self.kv_pool_blocks);
+        for cache in self.key_caches.iter_mut().chain(self.value_caches.iter_mut()) {
+            let page = cache.len() / self.kv_pool_blocks;
+            cache.copy_within(to * page, from * page, page, &self.stream)?;
+        }
+        Ok(())
     }
 
     /// Индекс чернового слота.
@@ -1138,6 +1208,9 @@ impl Executor {
             timeline.as_mut(),
         );
         self.profile = timeline;
+        // План одноразовый: повтор шага после ошибки строит его заново.
+        self.prefix_restores.clear();
+        self.prefix_saves.clear();
         result
     }
 
@@ -1263,6 +1336,28 @@ impl Executor {
                         )?;
                     }
                     for segment in &segments[decode_rows..] {
+                        let slot = segment.state_slot;
+                        let restore = self
+                            .prefix_restores
+                            .iter()
+                            .find(|&&(owner, _)| owner == slot)
+                            .map(|&(_, snapshot)| snapshot);
+                        let save = self
+                            .prefix_saves
+                            .iter()
+                            .find(|&&(owner, _)| owner == slot)
+                            .map(|&(_, snapshot)| snapshot);
+                        if let Some(snapshot) = restore {
+                            // Свёртка читает свою историю в prepare — она
+                            // должна быть на месте до него.
+                            self.conv_pools[linear_layer].copy_from_device_at(
+                                slot * CONV_STATE_ELEMS,
+                                &self.prefix_conv[linear_layer],
+                                snapshot * CONV_STATE_ELEMS,
+                                CONV_STATE_ELEMS,
+                                &self.stream,
+                            )?;
+                        }
                         mark!("delta.prepare_prefill");
                         mixer.prepare.prepare_prefill(
                             RowView::packed(&prefill.mixer_in, MIXER_FUSED_WIDTH),
@@ -1295,7 +1390,16 @@ impl Executor {
                         // держит этот слот — распаковки нет, и продолжение
                         // многосегментного промпта стартует с того же
                         // состояния, каким его оставил прошлый сегмент.
-                        if self.work_owner[linear_layer] != Some(segment.state_slot) {
+                        if let Some(snapshot) = restore {
+                            self.state_work[linear_layer].copy_from_device_at(
+                                0,
+                                &self.prefix_state[linear_layer],
+                                snapshot * STATE_ELEMS,
+                                STATE_ELEMS,
+                                &self.stream,
+                            )?;
+                            self.work_owner[linear_layer] = Some(slot);
+                        } else if self.work_owner[linear_layer] != Some(segment.state_slot) {
                             delta_net::unpack_state_slot(
                                 &self.state_pools[linear_layer],
                                 segment.state_slot,
@@ -1341,6 +1445,22 @@ impl Executor {
                             segment.state_slot,
                             &self.stream,
                         )?;
+                        if let Some(snapshot) = save {
+                            self.prefix_state[linear_layer].copy_from_device_at(
+                                snapshot * STATE_ELEMS,
+                                &self.state_work[linear_layer],
+                                0,
+                                STATE_ELEMS,
+                                &self.stream,
+                            )?;
+                            self.prefix_conv[linear_layer].copy_from_device_at(
+                                snapshot * CONV_STATE_ELEMS,
+                                &self.conv_pools[linear_layer],
+                                slot * CONV_STATE_ELEMS,
+                                CONV_STATE_ELEMS,
+                                &self.stream,
+                            )?;
+                        }
                     }
                     mark!("delta.norm");
                     mixer.output_norm.forward(

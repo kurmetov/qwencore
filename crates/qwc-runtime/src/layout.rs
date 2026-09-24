@@ -174,6 +174,7 @@ mod tests {
                 offset: 32,
                 tokens: 16,
             }],
+            ..Default::default()
         };
         let layout = BatchLayout::build(&batch, &cache).unwrap();
 
@@ -200,6 +201,7 @@ mod tests {
                 offset: 0,
                 tokens: 1,
             }],
+            ..Default::default()
         };
         assert_eq!(
             BatchLayout::build(&duplicate, &cache),
@@ -209,6 +211,7 @@ mod tests {
         let missing = Batch {
             decode: vec![7],
             prefill: vec![],
+            ..Default::default()
         };
         assert_eq!(
             BatchLayout::build(&missing, &cache),
@@ -227,6 +230,7 @@ mod tests {
                 offset: 8,
                 tokens: 4,
             }],
+            ..Default::default()
         };
         assert_eq!(
             BatchLayout::build(&batch, &cache),

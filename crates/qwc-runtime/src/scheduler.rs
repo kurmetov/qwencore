@@ -5,8 +5,9 @@
 //! однозначными и позволяет полностью откатить план, если запуск кернела не
 //! состоялся.
 
-use crate::cache::{CacheManager, Rejected, SeqId};
+use crate::cache::{CacheManager, PrefixRestore, Rejected, SeqId};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerConfig {
@@ -48,10 +49,32 @@ pub struct PrefillChunk {
     pub tokens: usize,
 }
 
+/// Поднять снимок префикса в слот до того, как пойдёт первый чанк.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixRestoreOp {
+    pub id: SeqId,
+    pub state_slot: u32,
+    pub snapshot: u32,
+    /// `(откуда, куда)`: неполную страницу префикса надо скопировать до шага.
+    pub copy_block: Option<(u32, u32)>,
+}
+
+/// Снять состояние слота в снимок сразу после чанка, закончившего промпт.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixSaveOp {
+    pub id: SeqId,
+    pub state_slot: u32,
+    pub snapshot: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Batch {
     pub prefill: Vec<PrefillChunk>,
     pub decode: Vec<SeqId>,
+    /// Операции кэша префиксов. Исполнитель обязан выполнить их в этом же
+    /// шаге: подъём — до прохода, снятие — внутри, после скана чанка.
+    pub restores: Vec<PrefixRestoreOp>,
+    pub saves: Vec<PrefixSaveOp>,
 }
 
 impl Batch {
@@ -159,6 +182,8 @@ struct ActiveRequest {
     prefilled: usize,
     generated: usize,
     phase: Phase,
+    /// Снимок префикса ещё не поднят: первый чанк его не отработал.
+    restore: Option<PrefixRestore>,
 }
 
 /// FIFO admission + round-robin decode. Длинный prompt, временно не
@@ -175,6 +200,18 @@ pub struct Scheduler {
     /// Физически CacheManager выделяет их лениво.
     committed_kv_blocks: usize,
     in_flight: Option<Batch>,
+    /// Токены промптов, по которым ищется и сохраняется кэш префиксов.
+    /// Без них запрос принимается обычным путём.
+    prompts: HashMap<SeqId, PromptTokens>,
+}
+
+#[derive(Debug)]
+struct PromptTokens {
+    tokens: Arc<[u32]>,
+    /// Где снять снимок. Не конец промпта: хвост промпта генерации
+    /// (`<|im_start|>assistant\n<think>\n`) в историю следующего хода не
+    /// попадает, и снимок после него никогда не стал бы её префиксом.
+    snapshot_at: usize,
 }
 
 impl Scheduler {
@@ -188,7 +225,39 @@ impl Scheduler {
             active: HashMap::new(),
             committed_kv_blocks: 0,
             in_flight: None,
+            prompts: HashMap::new(),
         }
+    }
+
+    /// Включает кэш префиксов на `snapshots` снимков. Исполнитель должен
+    /// держать столько же слотов под снимки.
+    pub fn enable_prefix_cache(&mut self, snapshots: usize) {
+        self.cache.enable_prefix_cache(snapshots);
+    }
+
+    /// То же, что `submit`, но с самими токенами промпта: только такой
+    /// запрос может продолжить закэшированный префикс и оставить свой.
+    ///
+    /// `snapshot_at` — длина префикса, который стоит закэшировать: у чата
+    /// это граница истории перед промптом генерации. Чанк префилла режется
+    /// на ней, чтобы снимок пришёлся ровно туда.
+    pub fn submit_prompt(
+        &mut self,
+        request: Request,
+        prompt: Arc<[u32]>,
+        snapshot_at: usize,
+    ) -> Result<(), SubmitError> {
+        assert_eq!(prompt.len(), request.prompt_tokens, "длина промпта не сходится");
+        assert!(snapshot_at <= prompt.len(), "точка снимка за концом промпта");
+        self.submit(request)?;
+        self.prompts.insert(
+            request.id,
+            PromptTokens {
+                tokens: prompt,
+                snapshot_at,
+            },
+        );
+        Ok(())
     }
 
     pub fn submit(&mut self, request: Request) -> Result<(), SubmitError> {
@@ -265,8 +334,43 @@ impl Scheduler {
             }
             let remaining = active.request.prompt_tokens - active.prefilled;
             let budget = self.config.max_num_batched_tokens - batch.num_tokens();
-            let tokens = remaining.min(budget);
+            let mut tokens = remaining.min(budget);
             let offset = active.prefilled;
+            let restore = active.restore;
+            // Точка снимка внутри чанка — чанк кончается на ней, остаток
+            // промпта уходит следующим шагом.
+            let snapshot_at = self
+                .prompts
+                .get(&id)
+                .map(|prompt| prompt.snapshot_at)
+                .filter(|&at| self.cache.prefix_capacity() > 0 && at > offset && at <= offset + tokens);
+            if let Some(at) = snapshot_at {
+                tokens = at - offset;
+            }
+
+            let state_slot = self
+                .cache
+                .sequence(id)
+                .ok_or(SchedulerError::Invariant(id))?
+                .state_slot;
+            if let Some(restore) = restore {
+                batch.restores.push(PrefixRestoreOp {
+                    id,
+                    state_slot,
+                    snapshot: restore.snapshot,
+                    copy_block: restore.copy_block,
+                });
+            }
+            // Следующий ход того же диалога начнётся с этой истории целиком.
+            if snapshot_at.is_some_and(|at| at >= self.cache.kv().block_size())
+                && let Some(snapshot) = self.cache.reserve_snapshot()
+            {
+                batch.saves.push(PrefixSaveOp {
+                    id,
+                    state_slot,
+                    snapshot,
+                });
+            }
 
             self.set_phase(id, Phase::PrefillReady, Phase::PrefillInFlight)?;
             batch.prefill.push(PrefillChunk { id, offset, tokens });
@@ -319,6 +423,22 @@ impl Scheduler {
         }
 
         let batch = self.in_flight.take().unwrap();
+        for op in &batch.restores {
+            if let Some(active) = self.active.get_mut(&op.id) {
+                active.restore = None;
+            }
+            self.cache.finish_restore(op.snapshot);
+        }
+        for op in &batch.saves {
+            match self.prompts.get(&op.id) {
+                Some(prompt) => self.cache.commit_snapshot(
+                    op.snapshot,
+                    op.id,
+                    prompt.tokens[..prompt.snapshot_at].to_vec(),
+                ),
+                None => self.cache.cancel_snapshot(op.snapshot),
+            }
+        }
         for chunk in batch.prefill {
             let active = self
                 .active
@@ -365,6 +485,7 @@ impl Scheduler {
                 let active = self.active.remove(&id).unwrap();
                 self.committed_kv_blocks -= active.reserved_blocks;
                 self.cache.release(id);
+                self.prompts.remove(&id);
                 completed.push(Completion {
                     id,
                     generated_tokens,
@@ -412,6 +533,11 @@ impl Scheduler {
             return Err(SchedulerError::NoBatchInFlight);
         };
 
+        // Подъёмы остаются за последовательностями и уйдут со следующим
+        // чанком; снимки не сняты — их слоты свободны.
+        for op in &batch.saves {
+            self.cache.cancel_snapshot(op.snapshot);
+        }
         for chunk in batch.prefill.into_iter().rev() {
             self.set_phase(chunk.id, Phase::PrefillInFlight, Phase::PrefillReady)?;
             self.prefill_ready.push_front(chunk.id);
@@ -436,13 +562,18 @@ impl Scheduler {
 
         if let Some(index) = self.waiting.iter().position(|request| request.id == id) {
             self.waiting.remove(index);
+            self.prompts.remove(&id);
             return Ok(true);
         }
         if let Some(active) = self.active.remove(&id) {
             self.prefill_ready.retain(|queued| *queued != id);
             self.decode_ready.retain(|queued| *queued != id);
             self.committed_kv_blocks -= active.reserved_blocks;
+            if let Some(restore) = active.restore {
+                self.cache.finish_restore(restore.snapshot);
+            }
             self.cache.release(id);
+            self.prompts.remove(&id);
             return Ok(true);
         }
         Ok(false)
@@ -487,8 +618,15 @@ impl Scheduler {
                 self.waiting.push_back(request);
                 continue;
             }
-            match self.cache.admit(request.id, request.prompt_tokens) {
-                Ok(()) => {
+            let admitted = match self.prompts.get(&request.id) {
+                Some(prompt) => self.cache.admit_prompt(request.id, &prompt.tokens),
+                None => self
+                    .cache
+                    .admit(request.id, request.prompt_tokens)
+                    .map(|()| Default::default()),
+            };
+            match admitted {
+                Ok(admission) => {
                     let id = request.id;
                     self.committed_kv_blocks += reserved_blocks;
                     self.active.insert(
@@ -496,9 +634,10 @@ impl Scheduler {
                         ActiveRequest {
                             request,
                             reserved_blocks,
-                            prefilled: 0,
+                            prefilled: admission.reused,
                             generated: 0,
                             phase: Phase::PrefillReady,
+                            restore: admission.restore,
                         },
                     );
                     return Ok(Some(id));
@@ -733,5 +872,116 @@ mod tests {
         assert_eq!(s.waiting(), 0);
         assert_eq!(s.active(), 0);
         assert!(s.next_batch().unwrap().is_none());
+    }
+
+    fn tokens(len: usize) -> Arc<[u32]> {
+        (0..len as u32).collect::<Vec<_>>().into()
+    }
+
+    /// Прогнать запрос до конца, возвращая батчи, которые он породил.
+    fn drain(s: &mut Scheduler) -> Vec<Batch> {
+        let mut batches = Vec::new();
+        while let Some(batch) = s.next_batch().unwrap() {
+            s.complete_batch(&[]).unwrap();
+            batches.push(batch);
+        }
+        batches
+    }
+
+    #[test]
+    fn next_turn_continues_from_the_previous_prompt() {
+        let mut s = scheduler(2, 100, 2, 512);
+        s.enable_prefix_cache(4);
+        s.submit_prompt(request(1, 150, 2), tokens(150), 150).unwrap();
+        let first = drain(&mut s);
+        // Промпт закончился в первом же шаге — там и снимок.
+        assert_eq!(first[0].saves.len(), 1);
+        assert!(first[0].restores.is_empty());
+        assert_eq!(s.cache().prefix_entries(), 1);
+
+        s.submit_prompt(request(2, 200, 1), tokens(200), 200).unwrap();
+        let batch = s.next_batch().unwrap().unwrap();
+        assert_eq!(
+            batch.prefill,
+            vec![PrefillChunk {
+                id: 2,
+                offset: 150,
+                tokens: 50,
+            }]
+        );
+        assert_eq!(batch.restores.len(), 1);
+        assert_eq!(batch.restores[0].snapshot, first[0].saves[0].snapshot);
+        assert!(batch.restores[0].copy_block.is_some());
+        s.complete_batch(&[]).unwrap();
+        assert_eq!(s.cache().prefix_stats().reused_tokens, 150);
+    }
+
+    #[test]
+    fn aborted_step_keeps_the_restore_and_frees_the_save() {
+        let mut s = scheduler(2, 100, 2, 512);
+        s.enable_prefix_cache(1);
+        s.submit_prompt(request(1, 100, 1), tokens(100), 100).unwrap();
+        drain(&mut s);
+
+        s.submit_prompt(request(2, 130, 1), tokens(130), 130).unwrap();
+        let batch = s.next_batch().unwrap().unwrap();
+        assert_eq!(batch.restores.len(), 1);
+        // Единственный слот держит закреплённая запись: снимать некуда.
+        assert!(batch.saves.is_empty());
+        s.abort_batch().unwrap();
+
+        let retry = s.next_batch().unwrap().unwrap();
+        assert_eq!(retry.restores, batch.restores);
+        assert_eq!(retry.prefill, batch.prefill);
+    }
+
+    #[test]
+    fn cancelling_before_restore_unpins_the_entry() {
+        let mut s = scheduler(2, 100, 2, 512);
+        s.enable_prefix_cache(1);
+        s.submit_prompt(request(1, 100, 1), tokens(100), 100).unwrap();
+        drain(&mut s);
+        s.submit_prompt(request(2, 130, 1), tokens(130), 130).unwrap();
+        s.next_batch().unwrap().unwrap();
+        s.abort_batch().unwrap();
+        assert!(s.cancel(2).unwrap());
+        // Запись снова вытесняема: новый снимок забирает её слот.
+        let other: Arc<[u32]> = tokens(64).iter().map(|t| t + 7).collect::<Vec<_>>().into();
+        s.submit_prompt(request(3, 64, 1), other, 64).unwrap();
+        let batch = s.next_batch().unwrap().unwrap();
+        assert_eq!(batch.saves.len(), 1);
+    }
+
+    #[test]
+    fn prefill_is_cut_at_the_history_boundary() {
+        // Промпт 150 токенов, из них последние 6 — промпт генерации. Снимок
+        // должен лечь на 144, а следующий ход — продолжить именно оттуда.
+        let mut s = scheduler(2, 100, 2, 512);
+        s.enable_prefix_cache(2);
+        s.submit_prompt(request(1, 150, 1), tokens(150), 144).unwrap();
+        let first = s.next_batch().unwrap().unwrap();
+        assert_eq!(first.prefill[0].tokens, 144);
+        assert_eq!(first.saves.len(), 1);
+        s.complete_batch(&[]).unwrap();
+        let tail = s.next_batch().unwrap().unwrap();
+        assert_eq!(
+            tail.prefill,
+            vec![PrefillChunk {
+                id: 1,
+                offset: 144,
+                tokens: 6,
+            }]
+        );
+        assert!(tail.saves.is_empty());
+        s.complete_batch(&[]).unwrap();
+        drain(&mut s);
+
+        // Следующий ход: те же 144 токена истории, дальше другое.
+        let mut next: Vec<u32> = (0..144).collect();
+        next.extend(1000..1100);
+        s.submit_prompt(request(2, 244, 1), next.into(), 238).unwrap();
+        let batch = s.next_batch().unwrap().unwrap();
+        assert_eq!(batch.prefill[0].offset, 144);
+        assert_eq!(batch.restores.len(), 1);
     }
 }

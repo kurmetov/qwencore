@@ -4,9 +4,9 @@ pub mod cache;
 pub mod layout;
 pub mod scheduler;
 
-pub use cache::{CacheManager, Pressure, Rejected, SeqId};
+pub use cache::{Admission, CacheManager, PrefixRestore, PrefixStats, Pressure, Rejected, SeqId};
 pub use layout::{BatchLayout, LayoutError};
 pub use scheduler::{
-    Batch, Completion, FinishReason, PrefillChunk, Request, Scheduler, SchedulerConfig,
+    Batch, Completion, FinishReason, PrefillChunk, PrefixRestoreOp, PrefixSaveOp, Request, Scheduler, SchedulerConfig,
     SchedulerError, SubmitError,
 };
