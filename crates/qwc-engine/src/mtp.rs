@@ -382,6 +382,9 @@ pub struct Speculator {
     argmax: qwc_cuda::sampling::Argmax,
     stream: Stream,
     owner: Option<u32>,
+    /// Промпт владельца: по нему `bind_prompt` решает, какая часть KV
+    /// головы годится следующему ходу того же диалога.
+    owner_prompt: Vec<u32>,
     shortlist: Option<Shortlist>,
 }
 
@@ -461,6 +464,7 @@ impl Speculator {
             argmax: qwc_cuda::sampling::Argmax::new(1, VOCAB_SIZE)?,
             stream: Stream::new()?,
             owner: None,
+            owner_prompt: Vec::new(),
             shortlist: None,
         })
     }
@@ -512,7 +516,34 @@ impl Speculator {
         }
         self.scratch.reset_cache()?;
         self.owner = Some(sequence);
+        self.owner_prompt.clear();
         Ok(true)
+    }
+
+    /// Привязать спекулятор к последовательности с промптом `prompt`.
+    ///
+    /// Если новый промпт продолжает промпт прежнего владельца — следующий ход
+    /// того же диалога, — KV головы на общей части остаётся: пары (h, токен)
+    /// там те же. Это важно вместе с кэшем префиксов: закэшированную
+    /// историю движок не прогоняет, и голова её заново не увидит. Возвращает
+    /// длину унаследованной части; 0 — KV сброшен.
+    pub fn bind_prompt(&mut self, sequence: u32, prompt: &[u32]) -> qwc_cuda::Result<usize> {
+        if self.owner == Some(sequence) {
+            return Ok(prompt.len());
+        }
+        let common = self
+            .owner_prompt
+            .iter()
+            .zip(prompt)
+            .take_while(|(old, new)| old == new)
+            .count();
+        if common == 0 {
+            self.scratch.reset_cache()?;
+        }
+        self.owner = Some(sequence);
+        self.owner_prompt = prompt.to_vec();
+        self.set_context(prompt);
+        Ok(common)
     }
 
     /// Заполняет KV головы по строкам prefill-шага: строка `first_row + i`

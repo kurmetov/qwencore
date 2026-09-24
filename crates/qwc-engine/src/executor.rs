@@ -2063,7 +2063,9 @@ impl Executor {
         row: usize,
         destination: &mut DeviceBuffer<u16>,
     ) -> Result<()> {
-        copy_hidden_row(&self.normed, row, destination, &self.stream)
+        copy_hidden_row(&self.normed, row, destination, &self.stream)?;
+        // Читать строку будет поток спекулятора, а не этот.
+        self.stream.synchronize()
     }
 
     pub fn copy_prefill_hidden_row(

@@ -13,9 +13,13 @@ use futures_util::StreamExt;
 use qwc_core::arch::{KV_ELEMS_PER_TOKEN, VOCAB_SIZE};
 use qwc_cuda::delta_net::DeltaStateMode;
 use qwc_cuda::paged_attention::{KvCacheDtype, PAGE_SIZE};
+use qwc_engine::executor::MAX_SPECULATION_ROWS;
+use qwc_engine::mtp::Speculator;
 use qwc_engine::{DecodeLinearMode, Executor, ExecutorConfig, ModelWeights, PREFILL_CHUNK_SIZE};
 use qwc_model::Checkpoint;
-use qwc_runtime::{Batch, BatchLayout, CacheManager, FinishReason, Request, Scheduler, SchedulerConfig};
+use qwc_runtime::{
+    Batch, BatchLayout, CacheManager, Completion, FinishReason, Request, Scheduler, SchedulerConfig,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -50,6 +54,19 @@ struct Args {
     kv_cache_dtype: KvCacheDtype,
     delta_state: DeltaStateMode,
     prefix_snapshots: usize,
+    speculation: SpeculationConfig,
+}
+
+/// Спекуляция MTP-головой. Работает, когда decode идёт у одной
+/// последовательности: голова держит KV только одного диалога.
+#[derive(Clone, Copy)]
+struct SpeculationConfig {
+    /// Глубина черновика; 0 — спекуляция выключена.
+    depth: usize,
+    /// Шортлист словаря для черновых логитов; 0 — полная проекция.
+    shortlist: usize,
+    /// Сколько последних токенов промпта голова прогоняет на префилле.
+    prime_window: usize,
 }
 
 struct WorkerConfig {
@@ -62,6 +79,7 @@ struct WorkerConfig {
     kv_cache_dtype: KvCacheDtype,
     delta_state: DeltaStateMode,
     prefix_snapshots: usize,
+    speculation: SpeculationConfig,
     eos_ids: Vec<u32>,
 }
 
@@ -219,6 +237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kv_cache_dtype: args.kv_cache_dtype,
         delta_state: args.delta_state,
         prefix_snapshots: args.prefix_snapshots,
+        speculation: args.speculation,
         eos_ids,
     };
     std::thread::Builder::new()
@@ -500,7 +519,7 @@ fn run_worker(
     ready_tx: mpsc::SyncSender<Result<usize, String>>,
 ) {
     let initialized = initialize_worker(&config);
-    let (mut executor, weights, mut scheduler) = match initialized {
+    let (mut executor, weights, mut scheduler, mut speculator) = match initialized {
         Ok(worker) => worker,
         Err(error) => {
             let _ = ready_tx.send(Err(error));
@@ -517,6 +536,11 @@ fn run_worker(
     };
     let mut jobs = HashMap::<u32, ActiveJob>::new();
     let mut pending = HashMap::<u32, u32>::new();
+    // Для какой последовательности у спекулятора лежат настоящие скрытые
+    // состояния и для каких токенов: после обычного шага это один ожидающий
+    // токен, после проверки — все принятые плюс исправленный.
+    let mut hidden_for: Option<u32> = None;
+    let mut head_tokens: Vec<u32> = Vec::new();
 
     loop {
         while let Ok(command) = command_rx.try_recv() {
@@ -548,6 +572,87 @@ fn run_worker(
                 return;
             }
         };
+        // Одна decode-последовательность и свежие скрытые состояния — шаг
+        // идёт спекулятивно: черновик головы, проверка k+1 строк за один
+        // проход по весам.
+        let depth = match (speculator.as_ref(), batch.decode.as_slice()) {
+            (Some(_), &[id]) if batch.prefill.is_empty() && hidden_for == Some(id) => {
+                let remaining = scheduler.remaining_tokens(id).unwrap_or(0);
+                config.speculation.depth.min(remaining.saturating_sub(1))
+            }
+            _ => 0,
+        };
+        if let (Some(spec), true) = (speculator.as_mut(), depth > 0) {
+            let id = batch.decode[0];
+            let token = pending[&id];
+            // Голова могла обслуживать другой диалог: без привязки черновик
+            // шёл бы по чужому KV и чужому шортлисту.
+            let bound = match jobs.get(&id) {
+                Some(job) => spec.bind_prompt(id, &job.prompt).map(|_| ()),
+                None => Ok(()),
+            };
+            if let Err(error) = bound {
+                let _ = scheduler.abort_batch();
+                fail_all(&mut jobs, format!("MTP bind failed: {error}"));
+                return;
+            }
+            let step = speculative_step(
+                &mut executor,
+                &weights,
+                &mut scheduler,
+                spec,
+                &layout,
+                id,
+                &head_tokens,
+                depth,
+            );
+            let (truth, accepted) = match step {
+                Ok(step) => step,
+                Err(error) => {
+                    let _ = scheduler.abort_batch();
+                    fail_all(&mut jobs, format!("speculative step failed: {error}"));
+                    return;
+                }
+            };
+
+            // Шаг выдал ожидающий токен и принятые черновики; на первом
+            // стоп-токене или стоп-строке выдача обрывается.
+            let mut produced = 0;
+            let mut stopped = Vec::new();
+            for &emitted in std::iter::once(&token).chain(&truth[..accepted]) {
+                produced += 1;
+                let stop = config.eos_ids.contains(&emitted)
+                    || jobs
+                        .get_mut(&id)
+                        .is_none_or(|job| emit_token(job, emitted, &tokenizer));
+                if stop {
+                    stopped.push(id);
+                    break;
+                }
+            }
+            pending.insert(id, truth[accepted]);
+            let rows = accepted + 1;
+            head_tokens.clear();
+            head_tokens.extend_from_slice(&truth[..rows]);
+            for &observed in &truth[..rows] {
+                spec.observe(observed);
+            }
+            hidden_for = Some(id);
+
+            let completed = match scheduler.complete_batch_multi(&stopped, &[(id, produced)]) {
+                Ok(completed) => completed,
+                Err(error) => {
+                    fail_all(&mut jobs, format!("batch completion failed: {error}"));
+                    return;
+                }
+            };
+            for completion in completed {
+                finish_job(&mut jobs, &mut pending, &tokenizer, completion);
+                hidden_for = None;
+            }
+            continue;
+        }
+
         let mut input = Vec::with_capacity(layout.num_tokens());
         for &id in &batch.decode {
             let Some(&token) = pending.get(&id) else {
@@ -598,8 +703,40 @@ fn run_worker(
                 stopped.push(id);
             }
         }
-        for (id, token) in sampled {
+        if let Some(spec) = speculator.as_mut() {
+            let primed = prime_head(
+                spec,
+                &executor,
+                &weights,
+                &scheduler,
+                &jobs,
+                &batch,
+                &layout,
+                &sampled,
+                config.speculation.prime_window,
+            );
+            if let Err(error) = primed {
+                let _ = scheduler.abort_batch();
+                fail_all(&mut jobs, format!("MTP priming failed: {error}"));
+                return;
+            }
+        }
+        for &(id, token) in &sampled {
             pending.insert(id, token);
+        }
+        // Вход головы — скрытое состояние только что сделанного шага.
+        hidden_for = None;
+        if let (Some(spec), &[id]) = (speculator.as_mut(), batch.decode.as_slice())
+            && batch.prefill.is_empty()
+        {
+            if let Err(error) = executor.copy_decode_hidden_row(0, spec.hidden_mut()) {
+                let _ = scheduler.abort_batch();
+                fail_all(&mut jobs, format!("MTP hidden copy failed: {error}"));
+                return;
+            }
+            hidden_for = Some(id);
+            head_tokens.clear();
+            head_tokens.push(pending[&id]);
         }
 
         let completed = match scheduler.complete_batch(&stopped) {
@@ -610,20 +747,10 @@ fn run_worker(
             }
         };
         for completion in completed {
-            if let Some(mut job) = jobs.remove(&completion.id) {
-                finish_text(&mut job, &tokenizer);
-                let finish_reason = match completion.reason {
-                    FinishReason::Length => "length",
-                    FinishReason::Stopped => "stop",
-                };
-                let _ = job.event_tx.send(EngineEvent::Done {
-                    text: job.rendered,
-                    finish_reason,
-                    completion_tokens: job.output.len(),
-                    buffered_output: job.buffer_output,
-                });
+            if hidden_for == Some(completion.id) {
+                hidden_for = None;
             }
-            pending.remove(&completion.id);
+            finish_job(&mut jobs, &mut pending, &tokenizer, completion);
         }
 
         let abandoned: Vec<u32> = jobs
@@ -637,6 +764,136 @@ fn run_worker(
             }
         }
     }
+}
+
+fn finish_job(
+    jobs: &mut HashMap<u32, ActiveJob>,
+    pending: &mut HashMap<u32, u32>,
+    tokenizer: &Tokenizer,
+    completion: Completion,
+) {
+    if let Some(mut job) = jobs.remove(&completion.id) {
+        finish_text(&mut job, tokenizer);
+        let finish_reason = match completion.reason {
+            FinishReason::Length => "length",
+            FinishReason::Stopped => "stop",
+        };
+        let _ = job.event_tx.send(EngineEvent::Done {
+            text: job.rendered,
+            finish_reason,
+            completion_tokens: job.output.len(),
+            buffered_output: job.buffer_output,
+        });
+    }
+    pending.remove(&completion.id);
+}
+
+/// Спекулятивный шаг одной последовательности: черновик головы, проверка
+/// основной моделью, фиксация принятого. Возвращает argmax проверки по
+/// строкам и число принятых черновиков; `truth[accepted]` — следующий
+/// ожидающий токен.
+#[allow(clippy::too_many_arguments)]
+fn speculative_step(
+    executor: &mut Executor,
+    weights: &ModelWeights,
+    scheduler: &mut Scheduler,
+    spec: &mut Speculator,
+    layout: &BatchLayout,
+    id: u32,
+    head_tokens: &[u32],
+    depth: usize,
+) -> Result<(Vec<u32>, usize), String> {
+    let position = layout.position_starts[0] as usize;
+    let state_slot = layout.state_slots[0] as usize;
+    let token = *head_tokens.last().ok_or("no head tokens")?;
+    let first = position + 1 - head_tokens.len();
+    let drafts = spec
+        .draft_chain(weights, head_tokens, first, depth)
+        .map_err(|error| error.to_string())?;
+    // Проверка пишет KV всем строкам разом, страницы нужны заранее. Не дал
+    // пул — черновик короче.
+    let reserved = scheduler.reserve_extra(id, drafts.len());
+    let drafts = &drafts[..reserved];
+    let blocks = scheduler
+        .cache()
+        .sequence(id)
+        .ok_or("sequence is gone")?
+        .blocks
+        .clone();
+    let mut rows_in = Vec::with_capacity(reserved + 1);
+    rows_in.push(token);
+    rows_in.extend_from_slice(drafts);
+    let truth = executor
+        .verify_speculation(weights, &rows_in, position, state_slot, &blocks)
+        .map_err(|error| error.to_string())?;
+    let accepted = drafts
+        .iter()
+        .zip(&truth)
+        .take_while(|(draft, truth)| draft == truth)
+        .count();
+    let rows = accepted + 1;
+    executor
+        .commit_speculation(weights, rows_in.len(), rows, state_slot)
+        .map_err(|error| error.to_string())?;
+    scheduler
+        .release_extra(id, reserved - accepted)
+        .map_err(|error| error.to_string())?;
+    executor
+        .copy_prefill_hidden_rows(0, rows, spec.hidden_mut())
+        .map_err(|error| error.to_string())?;
+    Ok((truth, accepted))
+}
+
+/// Голова заполняет свой KV по промпту, пока тот идёт префиллом: без этого
+/// на промпте у неё нули и acceptance проседает с 0.92 до 0.88. Только когда
+/// в движке одна последовательность: иначе спекуляции не будет, а прогрев
+/// стоит ~80 мкс на токен.
+#[allow(clippy::too_many_arguments)]
+fn prime_head(
+    spec: &mut Speculator,
+    executor: &Executor,
+    weights: &ModelWeights,
+    scheduler: &Scheduler,
+    jobs: &HashMap<u32, ActiveJob>,
+    batch: &Batch,
+    layout: &BatchLayout,
+    sampled: &[(u32, u32)],
+    window: usize,
+) -> qwc_cuda::Result<()> {
+    let [chunk] = batch.prefill.as_slice() else {
+        return Ok(());
+    };
+    if window == 0 || scheduler.active() != 1 {
+        return Ok(());
+    }
+    let Some(job) = jobs.get(&chunk.id) else {
+        return Ok(());
+    };
+    let prompt = &job.prompt;
+    spec.bind_prompt(chunk.id, prompt)?;
+    let Some(row) = layout.seq_ids.iter().position(|&id| id == chunk.id) else {
+        return Ok(());
+    };
+    let row_begin = layout.token_offsets[row] as usize;
+    let begin = chunk.offset.max(prompt.len().saturating_sub(window));
+    let end = chunk.offset + chunk.tokens;
+    if begin >= end {
+        return Ok(());
+    }
+    // Пара строки t — (h_t, токен t+1); для последней позиции промпта это
+    // токен, который шаг только что выдал.
+    let generated = sampled
+        .iter()
+        .find(|&&(id, _)| id == chunk.id)
+        .map(|&(_, token)| token);
+    let mut next = Vec::with_capacity(end - begin);
+    for t in begin..end {
+        match prompt.get(t + 1).copied().or(generated) {
+            Some(token) => next.push(token),
+            None => return Ok(()),
+        }
+    }
+    spec.prime(weights, executor, row_begin + begin - chunk.offset, &next, begin + 1)
 }
 
 /// Кэш префиксов перед шагом: скопировать неполные страницы продолжаемых
@@ -667,7 +924,9 @@ fn apply_prefix_ops(executor: &mut Executor, batch: &Batch) -> qwc_cuda::Result<
     Ok(())
 }
 
-fn initialize_worker(config: &WorkerConfig) -> Result<(Executor, ModelWeights, Scheduler), String> {
+fn initialize_worker(
+    config: &WorkerConfig,
+) -> Result<(Executor, ModelWeights, Scheduler, Option<Speculator>), String> {
     qwc_cuda::Device::init(0).map_err(|error| error.to_string())?;
     qwc_cuda::set_memory_limit(config.memory_limit).map_err(str::to_owned)?;
     let checkpoint = Checkpoint::open(&config.model_path).map_err(|error| error.to_string())?;
@@ -693,7 +952,21 @@ fn initialize_worker(config: &WorkerConfig) -> Result<(Executor, ModelWeights, S
         cache,
     );
     scheduler.enable_prefix_cache(config.prefix_snapshots);
-    Ok((executor, weights, scheduler))
+    let speculator = match config.speculation.depth {
+        0 => None,
+        _ => {
+            let mut speculator =
+                Speculator::new(&checkpoint, config.max_context, config.kv_cache_dtype)
+                    .map_err(|error| format!("MTP head: {error}"))?;
+            if config.speculation.shortlist > 0 {
+                speculator
+                    .enable_shortlist(config.speculation.shortlist, config.max_context)
+                    .map_err(|error| format!("MTP shortlist: {error}"))?;
+            }
+            Some(speculator)
+        }
+    };
+    Ok((executor, weights, scheduler, speculator))
 }
 
 fn accept_command(command: Command, scheduler: &mut Scheduler, jobs: &mut HashMap<u32, ActiveJob>) {
@@ -1057,6 +1330,13 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     // Снимков состояния под кэш префиксов, ~81 МБ каждый. Восемь — это
     // восемь диалогов, чей следующий ход не пересчитывает историю.
     let mut prefix_snapshots = 8usize;
+    // Лучшая точка замера batch-1: глубина 3 и шортлист 32k (156.7 tok/s
+    // против 78 без спекуляции). Голова стоит 0.85 ГБ VRAM.
+    let mut speculation = SpeculationConfig {
+        depth: 3,
+        shortlist: 32768,
+        prime_window: 2048,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1071,6 +1351,15 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--memory-limit-gb" => {
                 let gb: f64 = args.next().ok_or("--memory-limit-gb")?.parse()?;
                 memory_limit = (gb * 1e9) as usize;
+            }
+            "--speculative" => {
+                speculation.depth = args.next().ok_or("--speculative needs K (0 = off)")?.parse()?
+            }
+            "--shortlist" => {
+                speculation.shortlist = args.next().ok_or("--shortlist needs N (0 = full)")?.parse()?
+            }
+            "--mtp-prime" => {
+                speculation.prime_window = args.next().ok_or("--mtp-prime needs N")?.parse()?
             }
             "--prefix-cache" => {
                 prefix_snapshots = args.next().ok_or("--prefix-cache needs N (0 = off)")?.parse()?
@@ -1099,7 +1388,8 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     "qwc serve [--model PATH] [--bind 127.0.0.1:8000] \
 [--context 32768] [--max-seqs 32] [--kv-cache fp8|bf16] [--kv-cache-gb 5] \
 [--memory-limit-gb 28] [--prefill-chunk N] [--delta-state wy|bf16|fp32] \
-[--served-model-name NAME] [--prefix-cache 8]"
+[--served-model-name NAME] [--prefix-cache 8] [--speculative 3] \
+[--shortlist 32768] [--mtp-prime 2048]"
                 );
                 std::process::exit(0);
             }
@@ -1114,6 +1404,12 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     }
     if !(1..=PREFILL_CHUNK_SIZE).contains(&prefill_chunk) {
         return Err(format!("--prefill-chunk must be 1..={PREFILL_CHUNK_SIZE}").into());
+    }
+    if speculation.depth + 1 > MAX_SPECULATION_ROWS {
+        return Err(format!("--speculative must be 0..={}", MAX_SPECULATION_ROWS - 1).into());
+    }
+    if speculation.shortlist > VOCAB_SIZE {
+        return Err(format!("--shortlist must be 0..={VOCAB_SIZE}").into());
     }
     if memory_limit == 0 || kv_cache_bytes == 0 {
         return Err("memory limits must be positive".into());
@@ -1137,6 +1433,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         kv_cache_dtype,
         delta_state,
         prefix_snapshots,
+        speculation,
     })
 }
 
