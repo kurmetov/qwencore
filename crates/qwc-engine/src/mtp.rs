@@ -12,7 +12,9 @@
 use qwc_core::arch::*;
 use qwc_cuda::attention_prepare::AttentionPreprocessor;
 use qwc_cuda::mtp as kernels;
-use qwc_cuda::paged_attention::{self, KvCacheDtype, PAGE_SIZE, PagedAttentionWorkspace};
+use qwc_cuda::paged_attention::{
+    self, KvCacheDtype, PAGE_SIZE, PackedAttentionWorkspace, PackedShape, PagedAttentionWorkspace,
+};
 use qwc_cuda::rmsnorm::RmsNorm;
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
 
@@ -60,6 +62,7 @@ pub struct MtpScratch {
     query: DeviceBuffer<u16>,
     attention_out: DeviceBuffer<u16>,
     attention_workspace: PagedAttentionWorkspace,
+    packed_workspace: PackedAttentionWorkspace,
     mlp_gate: DeviceBuffer<u16>,
     mlp_up: DeviceBuffer<u16>,
     mlp_hidden: DeviceBuffer<u16>,
@@ -102,6 +105,7 @@ impl MtpScratch {
             query: DeviceBuffer::zeroed(rows * Q_PROJ_DIM)?,
             attention_out: DeviceBuffer::zeroed(rows * Q_PROJ_DIM)?,
             attention_workspace: PagedAttentionWorkspace::new(rows, max_context)?,
+            packed_workspace: PackedAttentionWorkspace::new(&[PackedShape::Rows], rows, max_context)?,
             mlp_gate: DeviceBuffer::zeroed(rows * INTERMEDIATE_SIZE)?,
             mlp_up: DeviceBuffer::zeroed(rows * INTERMEDIATE_SIZE)?,
             mlp_hidden: DeviceBuffer::zeroed(rows * INTERMEDIATE_SIZE)?,
@@ -256,22 +260,42 @@ pub fn draft(
         stream,
     )?;
     let max_context = positions.iter().max().copied().unwrap_or(0) as usize + 1;
-    paged_attention::decode_gated(
-        &scratch.query,
-        &scratch.query_gate,
-        &scratch.key_cache,
-        &scratch.value_cache,
-        scratch.max_blocks,
-        &scratch.block_tables,
-        &scratch.context_lengths,
-        scratch.max_blocks,
-        &mut scratch.attention_out,
-        &mut scratch.attention_workspace,
-        rows,
-        max_context,
-        scratch.cache_dtype,
-        stream,
-    )?;
+    if scratch.cache_dtype == KvCacheDtype::Fp8 {
+        paged_attention::gated_packed(
+            &scratch.query,
+            &scratch.query_gate,
+            &scratch.key_cache,
+            &scratch.value_cache,
+            scratch.max_blocks,
+            &scratch.block_tables,
+            &scratch.context_lengths,
+            scratch.max_blocks,
+            &mut scratch.attention_out,
+            PackedShape::Rows,
+            rows,
+            0,
+            max_context,
+            &mut scratch.packed_workspace,
+            stream,
+        )?;
+    } else {
+        paged_attention::decode_gated(
+            &scratch.query,
+            &scratch.query_gate,
+            &scratch.key_cache,
+            &scratch.value_cache,
+            scratch.max_blocks,
+            &scratch.block_tables,
+            &scratch.context_lengths,
+            scratch.max_blocks,
+            &mut scratch.attention_out,
+            &mut scratch.attention_workspace,
+            rows,
+            max_context,
+            scratch.cache_dtype,
+            stream,
+        )?;
+    }
     kernels::bf16_linear(&head.output, &scratch.attention_out, &mut scratch.normed,
         rows, Q_PROJ_DIM, HIDDEN_SIZE, stream)?;
 

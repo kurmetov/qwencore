@@ -17,7 +17,9 @@ use qwc_cuda::delta_net::{
 };
 use qwc_cuda::graph::CudaGraph;
 use qwc_cuda::nvfp4::{self, QuantizedActivation, W4A4Workspace};
-use qwc_cuda::paged_attention::{self, KvCacheDtype, PAGE_SIZE, PagedAttentionWorkspace};
+use qwc_cuda::paged_attention::{
+    self, KvCacheDtype, PAGE_SIZE, PackedAttentionWorkspace, PackedShape, PagedAttentionWorkspace,
+};
 use qwc_cuda::sampling::Argmax;
 use qwc_cuda::{DeviceBuffer, Result, Stream, Timeline, bf16};
 use qwc_runtime::BatchLayout;
@@ -176,6 +178,7 @@ pub struct Executor {
     key_caches: Vec<DeviceBuffer<u8>>,
     value_caches: Vec<DeviceBuffer<u8>>,
     workspace: PagedAttentionWorkspace,
+    packed_workspace: PackedAttentionWorkspace,
 
     // Вход и выход шага.
     tokens: DeviceBuffer<u32>,
@@ -230,6 +233,9 @@ struct PrefillBuffers {
     block_tables: DeviceBuffer<u32>,
     context_lengths: DeviceBuffer<u32>,
     attention_workspace: PagedAttentionWorkspace,
+    /// Частичные суммы упакованного внимания: и decode-строки шага, и
+    /// сегменты идут через него при fp8-кэше.
+    packed_workspace: PackedAttentionWorkspace,
 
     tokens: DeviceBuffer<u32>,
     /// Last row of each segment, and the dense gather of those rows.
@@ -302,6 +308,11 @@ impl PrefillBuffers {
             // на MAX_DECODE_ROWS.
             attention_workspace: PagedAttentionWorkspace::new(
                 rows.min(paged_attention::MAX_DECODE_ROWS),
+                max_context,
+            )?,
+            packed_workspace: PackedAttentionWorkspace::new(
+                &[PackedShape::Rows, PackedShape::Segment],
+                rows,
                 max_context,
             )?,
             tokens: DeviceBuffer::zeroed(rows)?,
@@ -510,6 +521,11 @@ impl Executor {
             key_caches,
             value_caches,
             workspace: PagedAttentionWorkspace::new(batch, config.max_context)?,
+            packed_workspace: PackedAttentionWorkspace::new(
+                &[PackedShape::Rows],
+                batch,
+                config.max_context,
+            )?,
             tokens: DeviceBuffer::zeroed(batch)?,
             // Проверка черновиков просит логиты сразу на k+1 строк, даже
             // когда последовательность одна.
@@ -1529,11 +1545,33 @@ impl Executor {
                         self.kv_cache_dtype,
                         &self.stream,
                     )?;
-                    // Строки decode идут построчным ядром, чанки префилла —
-                    // ядром на тензорных ядрах. Чанк вызывается отдельно:
-                    // тайл запросов не имеет права пересекать границу
-                    // последовательности, у него одна таблица страниц на тайл.
-                    if decode_rows > 0 {
+                    // Строки decode и сегменты при fp8-кэше идут упакованным
+                    // ядром: decode-строка — свой тайл со своей таблицей,
+                    // сегмент — тайлы до десяти строк с общей. Сегмент
+                    // вызывается отдельно: тайл запросов не имеет права
+                    // пересекать границу последовательности. bf16-кэш идёт
+                    // прежними ядрами.
+                    let packed = self.kv_cache_dtype == KvCacheDtype::Fp8;
+                    if decode_rows > 0 && packed {
+                        mark!("attn.decode");
+                        paged_attention::gated_packed(
+                            &prefill.query,
+                            &prefill.query_gate,
+                            &self.key_caches[full_layer],
+                            &self.value_caches[full_layer],
+                            blocks,
+                            &prefill.block_tables,
+                            &prefill.context_lengths,
+                            self.max_blocks,
+                            &mut prefill.attention_out,
+                            PackedShape::Rows,
+                            decode_rows,
+                            0,
+                            max_context,
+                            &mut prefill.packed_workspace,
+                            &self.stream,
+                        )?;
+                    } else if decode_rows > 0 {
                         mark!("attn.decode");
                         paged_attention::decode_gated(
                             &prefill.query,
@@ -1554,21 +1592,41 @@ impl Executor {
                     }
                     mark!("attn.prefill");
                     for segment in &segments[decode_rows..] {
-                        paged_attention::prefill_gated_mma(
-                            &prefill.query,
-                            &prefill.query_gate,
-                            &self.key_caches[full_layer],
-                            &self.value_caches[full_layer],
-                            blocks,
-                            &prefill.block_tables,
-                            &prefill.context_lengths,
-                            self.max_blocks,
-                            &mut prefill.attention_out,
-                            segment.tokens,
-                            segment.row_begin,
-                            self.kv_cache_dtype,
-                            &self.stream,
-                        )?;
+                        if packed {
+                            paged_attention::gated_packed(
+                                &prefill.query,
+                                &prefill.query_gate,
+                                &self.key_caches[full_layer],
+                                &self.value_caches[full_layer],
+                                blocks,
+                                &prefill.block_tables,
+                                &prefill.context_lengths,
+                                self.max_blocks,
+                                &mut prefill.attention_out,
+                                PackedShape::Segment,
+                                segment.tokens,
+                                segment.row_begin,
+                                segment.position_start + segment.tokens,
+                                &mut prefill.packed_workspace,
+                                &self.stream,
+                            )?;
+                        } else {
+                            paged_attention::prefill_gated_mma(
+                                &prefill.query,
+                                &prefill.query_gate,
+                                &self.key_caches[full_layer],
+                                &self.value_caches[full_layer],
+                                blocks,
+                                &prefill.block_tables,
+                                &prefill.context_lengths,
+                                self.max_blocks,
+                                &mut prefill.attention_out,
+                                segment.tokens,
+                                segment.row_begin,
+                                self.kv_cache_dtype,
+                                &self.stream,
+                            )?;
+                        }
                     }
                     mark!("gemm.attn_out");
                     project_w4a4(
@@ -1827,22 +1885,45 @@ impl Executor {
             &self.stream,
         )?;
         self.mark("attn.decode")?;
-        paged_attention::decode_gated(
-            &self.query,
-            &self.query_gate,
-            &self.key_caches[layer],
-            &self.value_caches[layer],
-            blocks,
-            &self.block_tables,
-            &self.context_lengths,
-            self.max_blocks,
-            &mut self.attention_out,
-            &mut self.workspace,
-            batch,
-            max_position + 1,
-            self.kv_cache_dtype,
-            &self.stream,
-        )?;
+        if self.kv_cache_dtype == KvCacheDtype::Fp8 {
+            // Шаг захватывается в CUDA-граф, поэтому партиции выбираются по
+            // потолку контекста, а не по текущему: отрезки ядро режет само по
+            // фактической длине каждой строки.
+            paged_attention::gated_packed(
+                &self.query,
+                &self.query_gate,
+                &self.key_caches[layer],
+                &self.value_caches[layer],
+                blocks,
+                &self.block_tables,
+                &self.context_lengths,
+                self.max_blocks,
+                &mut self.attention_out,
+                PackedShape::Rows,
+                batch,
+                0,
+                self.max_context,
+                &mut self.packed_workspace,
+                &self.stream,
+            )?;
+        } else {
+            paged_attention::decode_gated(
+                &self.query,
+                &self.query_gate,
+                &self.key_caches[layer],
+                &self.value_caches[layer],
+                blocks,
+                &self.block_tables,
+                &self.context_lengths,
+                self.max_blocks,
+                &mut self.attention_out,
+                &mut self.workspace,
+                batch,
+                max_position + 1,
+                self.kv_cache_dtype,
+                &self.stream,
+            )?;
+        }
         self.mark("gemm.attn_out")?;
         project_decode(
             &mixer.o,
