@@ -716,3 +716,48 @@ fn prefill_tile_is_not_less_accurate_than_rowwise_decode() {
         );
     }
 }
+
+#[test]
+fn workspace_partitions_follow_actual_rows() {
+    // Исполнитель на 32 слота и 32K: одиночный decode обязан разбить
+    // контекст по партициям, а не идти одной, как полный batch.
+    let workspace = PagedAttentionWorkspace::new(32, 32_768).unwrap();
+    let (_, single) = workspace.plan_for(1);
+    let (_, full) = workspace.plan_for(32);
+    assert!(single > 1, "batch 1 идёт {single} партицией");
+    assert_eq!(full, 1);
+    let alone = PagedAttentionWorkspace::new(1, 32_768).unwrap();
+    assert_eq!(workspace.plan_for(1), alone.plan_for(1));
+}
+
+#[test]
+fn oversized_workspace_matches_exact_one_bit_for_bit() {
+    // Разметка по фактическим строкам: ответ не зависит от ёмкости workspace.
+    const CONTEXT: usize = 4_096;
+    let max_blocks = CONTEXT.div_ceil(PAGE_SIZE);
+    let cache_elements = max_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
+    let key: Vec<u8> = (0..cache_elements).map(|index| (index * 7 % 113) as u8 & 0x3f).collect();
+    let value: Vec<u8> = (0..cache_elements).map(|index| (index * 5 % 97) as u8 & 0x3f).collect();
+    let tables: Vec<u32> = (0..max_blocks as u32).collect();
+    let query: Vec<u16> = (0..NUM_ATTN_HEADS * ATTN_HEAD_DIM)
+        .map(|index| bf16::from_f32(((index * 11 % 31) as f32 - 15.0) / 30.0))
+        .collect();
+    let stream = Stream::new().unwrap();
+    let device_query = DeviceBuffer::from_slice(&query).unwrap();
+    let device_key = DeviceBuffer::from_slice(&key).unwrap();
+    let device_value = DeviceBuffer::from_slice(&value).unwrap();
+    let device_tables = DeviceBuffer::from_slice(&tables).unwrap();
+    let device_lengths = DeviceBuffer::from_slice(&[CONTEXT as u32]).unwrap();
+    let mut run = |capacity: usize| {
+        let mut workspace = PagedAttentionWorkspace::new(capacity, CONTEXT).unwrap();
+        let mut output = DeviceBuffer::<u16>::zeroed(query.len()).unwrap();
+        paged_attention::decode_fp8(
+            &device_query, &device_key, &device_value, max_blocks, &device_tables,
+            &device_lengths, max_blocks, &mut output, &mut workspace, 1, CONTEXT, &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        output.to_vec().unwrap()
+    };
+    assert_eq!(run(1), run(32));
+}

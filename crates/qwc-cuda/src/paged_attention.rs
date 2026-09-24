@@ -77,11 +77,45 @@ pub struct PagedAttentionWorkspace {
     max_context: usize,
     partitions: usize,
     kernel: DecodeKernel,
+    /// Ядро и партиции выбираются на каждом вызове по фактическому числу
+    /// строк, а не по ёмкости. Иначе исполнитель на 32 слота гонял бы
+    /// одиночный decode на 32K одной партицией: 24 CTA на 170 SM и 15x к
+    /// времени внимания против разбиения под batch 1.
+    adaptive: bool,
+}
+
+/// Floats of split-K scratch that `batch` rows need across `partitions`.
+fn workspace_floats(batch: usize, partitions: usize) -> usize {
+    if partitions == 1 {
+        0
+    } else {
+        batch * NUM_ATTN_HEADS * partitions * (ATTN_HEAD_DIM + 2)
+    }
 }
 
 impl PagedAttentionWorkspace {
+    /// Workspace for up to `batch` rows; kernel and partitions follow the
+    /// row count of each call.
     pub fn new(batch: usize, max_context: usize) -> Result<Self> {
-        Self::with_kernel(select_decode_kernel(batch, max_context), batch, max_context)
+        assert!((1..=MAX_DECODE_ROWS).contains(&batch));
+        assert!(max_context > 0);
+        let floats = (1..=batch)
+            .map(|rows| {
+                let kernel = select_decode_kernel(rows, max_context);
+                workspace_floats(rows, partition_count(kernel, rows, max_context))
+            })
+            .max()
+            .unwrap_or(0);
+        let kernel = select_decode_kernel(batch, max_context);
+        Ok(Self {
+            storage: DeviceBuffer::zeroed(floats.max(1))?,
+            bytes: floats * size_of::<f32>(),
+            batch,
+            max_context,
+            partitions: partition_count(kernel, batch, max_context),
+            kernel,
+            adaptive: true,
+        })
     }
 
     pub fn with_kernel(kernel: DecodeKernel, batch: usize, max_context: usize) -> Result<Self> {
@@ -98,11 +132,7 @@ impl PagedAttentionWorkspace {
         assert!((1..=MAX_DECODE_ROWS).contains(&batch));
         assert!(max_context > 0);
         assert!((1..=max_context).contains(&partitions));
-        let floats = if partitions == 1 {
-            0
-        } else {
-            batch * NUM_ATTN_HEADS * partitions * (ATTN_HEAD_DIM + 2)
-        };
+        let floats = workspace_floats(batch, partitions);
         Ok(Self {
             storage: DeviceBuffer::zeroed(floats.max(1))?,
             bytes: floats * size_of::<f32>(),
@@ -110,7 +140,18 @@ impl PagedAttentionWorkspace {
             max_context,
             partitions,
             kernel,
+            adaptive: false,
         })
+    }
+
+    /// Kernel and partitions a call with `rows` rows will use.
+    pub fn plan_for(&self, rows: usize) -> (DecodeKernel, usize) {
+        if self.adaptive {
+            let kernel = select_decode_kernel(rows, self.max_context);
+            (kernel, partition_count(kernel, rows, self.max_context))
+        } else {
+            (self.kernel, self.partitions)
+        }
     }
 
     pub fn bytes(&self) -> usize {
@@ -262,6 +303,7 @@ fn decode_impl(
     assert_eq!(value_cache.len(), cache_bytes);
     assert_eq!(GQA_GROUP, 6);
 
+    let (kernel, partitions) = workspace.plan_for(batch);
     let launch = match cache_dtype {
         KvCacheDtype::Fp8 => ffi::qwc_paged_attention_fp8,
         KvCacheDtype::Bf16 => ffi::qwc_paged_attention_bf16,
@@ -279,8 +321,8 @@ fn decode_impl(
             workspace.bytes,
             batch as i32,
             max_blocks_per_sequence as i32,
-            workspace.partitions as i32,
-            i32::from(workspace.kernel == DecodeKernel::SharedKv),
+            partitions as i32,
+            i32::from(kernel == DecodeKernel::SharedKv),
             1.0 / (ATTN_HEAD_DIM as f32).sqrt(),
             stream.raw(),
         )
