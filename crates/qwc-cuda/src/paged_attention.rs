@@ -252,6 +252,220 @@ impl PrefillAttentionWorkspace {
     }
 }
 
+/// Больше строк запроса в тайле упакованного ядра не бывает: 10 строк по
+/// 6 голов — 60 из 64 строк MMA-тайла.
+pub const PACKED_MAX_TILE_ROWS: usize = 64 / GQA_GROUP;
+/// SM у RTX 5090: упакованное ядро держит один CTA на SM, shared у него
+/// 72-98 КиБ.
+const PACKED_SMS: usize = 170;
+/// Четыре страницы: короче отрезок не окупает запись частичных сумм.
+const PACKED_MIN_TOKENS_PER_PARTITION: usize = 4 * PAGE_SIZE;
+/// Потолок пар (строка, партиция): держит частичные суммы в 51 МБ. Без него
+/// хвост промпта в полторы тысячи строк просил бы две партиции и 73 МБ ради
+/// выигрыша на хвосте последней волны.
+const PACKED_MAX_PARTIAL_ROWS: usize = 2048;
+
+/// Чьи строки идут в упакованное ядро.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedShape {
+    /// Decode-строки разных последовательностей: у каждой своя таблица
+    /// страниц, тайл — одна строка.
+    Rows,
+    /// Сегмент одной последовательности: проверка черновиков, хвост промпта,
+    /// чанк. Тайл — несколько строк с общей таблицей.
+    Segment,
+}
+
+/// Строк запроса в тайле упакованного ядра.
+pub fn packed_tile_rows(shape: PackedShape, rows: usize) -> usize {
+    assert!(rows > 0);
+    match shape {
+        PackedShape::Rows => 1,
+        // До пяти строк сегмент ложится в один тайл на 16 или 32 строки
+        // целиком; дальше — тайлы по 64.
+        PackedShape::Segment if rows * GQA_GROUP <= 32 => rows,
+        PackedShape::Segment => PACKED_MAX_TILE_ROWS,
+    }
+}
+
+/// m16-тайлов в тайле упакованного ядра на `tile_rows` строк.
+fn packed_m_tiles(tile_rows: usize) -> usize {
+    match tile_rows * GQA_GROUP {
+        0..=16 => 1,
+        17..=32 => 2,
+        _ => 4,
+    }
+}
+
+/// Партиций контекста у упакованного ядра на `rows` строк с контекстом до
+/// `context`. Числа — `packedbench --sweep`, 16 слоёв, fp8.
+pub fn packed_partition_count(shape: PackedShape, rows: usize, context: usize) -> usize {
+    assert!(rows > 0 && context > 0);
+    let tile_rows = packed_tile_rows(shape, rows);
+    let ctas = NUM_KV_HEADS * rows.div_ceil(tile_rows);
+    let wanted = if packed_m_tiles(tile_rows) < 4 {
+        // Один-два m-тайла упираются в полосу памяти, и её насыщают 64 CTA на
+        // m-тайл; лишние партиции только пишут частичные суммы. Decode на 60k:
+        // P=16 — 84 мкс, P=42 — 91; проверка 4 строк на 30k: P=32 — 50, P=16 — 70.
+        (64 * packed_m_tiles(tile_rows)).div_ceil(ctas)
+    } else if PACKED_SMS / ctas >= 16 {
+        // Тайлов мало: одна полная волна. 8 строк на 60k: P=42 — 117 мкс,
+        // P=64 — 150, там уже вторая волна.
+        PACKED_SMS / ctas
+    } else {
+        // Упор в тензорные ядра. CTA на SM один, и разгон следующего CTA ничем
+        // не перекрыт, поэтому одна длинная волна проигрывает нескольким
+        // коротким: 512 строк на 60k — P=1 7.65 мс, P=4 (4.9 волны) 4.80.
+        // Берём от 3.5 до 6 волн с самой полной последней.
+        let lowest = (7 * PACKED_SMS).div_ceil(2 * ctas).max(1);
+        let highest = (6 * PACKED_SMS / ctas).max(lowest);
+        (lowest..=highest)
+            .max_by_key(|&partitions| {
+                let total = ctas * partitions;
+                let filled = total * 1000 / (total.div_ceil(PACKED_SMS) * PACKED_SMS);
+                (filled, std::cmp::Reverse(partitions))
+            })
+            .unwrap()
+    };
+    wanted
+        .min(context.div_ceil(PACKED_MIN_TOKENS_PER_PARTITION))
+        .min(PACKED_MAX_PARTIAL_ROWS / rows)
+        .max(1)
+}
+
+/// Частичные суммы упакованного внимания.
+pub struct PackedAttentionWorkspace {
+    storage: DeviceBuffer<f32>,
+    bytes: usize,
+    max_rows: usize,
+    max_context: usize,
+    /// Число партиций для стендов и тестов; `None` — по форме вызова.
+    forced: Option<usize>,
+}
+
+/// План вызова упакованного ядра. Отрезок партиции ядро считает само, по
+/// фактическому контексту тайла.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackedPlan {
+    pub tile_rows: usize,
+    pub partitions: usize,
+}
+
+impl PackedAttentionWorkspace {
+    /// Под любой вызов форм `shapes` до `max_rows` строк с контекстом до
+    /// `max_context`. Decode-строкам хватает килобайт, сегментам нужно до
+    /// 51 МБ.
+    pub fn new(shapes: &[PackedShape], max_rows: usize, max_context: usize) -> Result<Self> {
+        assert!(max_rows > 0 && max_context > 0 && !shapes.is_empty());
+        let floats = (1..=max_rows)
+            .flat_map(|rows| {
+                shapes.iter().map(move |&shape| {
+                    workspace_floats(rows, packed_partition_count(shape, rows, max_context))
+                })
+            })
+            .max()
+            .unwrap_or(0);
+        Self::allocate(floats, max_rows, max_context, None)
+    }
+
+    pub fn with_partitions(max_rows: usize, max_context: usize, partitions: usize) -> Result<Self> {
+        assert!(max_rows > 0 && max_context > 0);
+        assert!((1..=max_context.div_ceil(PAGE_SIZE)).contains(&partitions));
+        Self::allocate(workspace_floats(max_rows, partitions), max_rows, max_context, Some(partitions))
+    }
+
+    fn allocate(
+        floats: usize,
+        max_rows: usize,
+        max_context: usize,
+        forced: Option<usize>,
+    ) -> Result<Self> {
+        Ok(Self {
+            storage: DeviceBuffer::zeroed(floats.max(1))?,
+            bytes: floats * size_of::<f32>(),
+            max_rows,
+            max_context,
+            forced,
+        })
+    }
+
+    /// Тайл и партиции для вызова.
+    pub fn plan_for(&self, shape: PackedShape, rows: usize, context: usize) -> PackedPlan {
+        assert!(rows > 0 && rows <= self.max_rows);
+        assert!(context > 0 && context <= self.max_context);
+        let partitions = self
+            .forced
+            .unwrap_or_else(|| packed_partition_count(shape, rows, context));
+        PackedPlan { tile_rows: packed_tile_rows(shape, rows), partitions }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// Внимание с упакованной GQA-группой по fp8-кэшу: CTA на KV-голову, шесть
+/// голов группы идут строками одного MMA-тайла, и KV читается один раз.
+///
+/// `context` выбирает число партиций и должен быть не меньше наибольшего
+/// контекста строк; сами отрезки ядро режет по фактическому контексту. Под
+/// CUDA-графом сюда стоит отдавать потолок контекста, а не текущий. Строки
+/// `row_base..row_base + rows`; для [`PackedShape::Segment`] у них общая
+/// таблица страниц.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_packed(
+    query: &DeviceBuffer<u16>,
+    query_gate_projection: &DeviceBuffer<u16>,
+    key_cache: &DeviceBuffer<u8>,
+    value_cache: &DeviceBuffer<u8>,
+    num_blocks: usize,
+    block_tables: &DeviceBuffer<u32>,
+    context_lengths: &DeviceBuffer<u32>,
+    max_blocks_per_sequence: usize,
+    output: &mut DeviceBuffer<u16>,
+    shape: PackedShape,
+    rows: usize,
+    row_base: usize,
+    context: usize,
+    workspace: &mut PackedAttentionWorkspace,
+    stream: &Stream,
+) -> Result<()> {
+    let plan = workspace.plan_for(shape, rows, context);
+    assert!(
+        plan.partitions == 1
+            || workspace.bytes >= workspace_floats(rows, plan.partitions) * size_of::<f32>()
+    );
+    let end = row_base + rows;
+    assert!(query.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM);
+    assert!(query_gate_projection.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM * 2);
+    assert!(output.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM);
+    assert!(context_lengths.len() >= end);
+    assert!(block_tables.len() >= end * max_blocks_per_sequence);
+    let cache_bytes = num_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
+    assert_eq!(key_cache.len(), cache_bytes, "упакованное ядро только для fp8-кэша");
+    assert_eq!(value_cache.len(), cache_bytes);
+    check(unsafe {
+        ffi::qwc_paged_attention_packed_fp8(
+            query.as_ptr(),
+            query_gate_projection.as_ptr(),
+            key_cache.as_ptr(),
+            value_cache.as_ptr(),
+            block_tables.as_ptr(),
+            context_lengths.as_ptr(),
+            output.as_mut_ptr(),
+            workspace.storage.as_mut_ptr().cast(),
+            workspace.bytes,
+            rows as i32,
+            row_base as i32,
+            max_blocks_per_sequence as i32,
+            plan.tile_rows as i32,
+            plan.partitions as i32,
+            1.0 / (ATTN_HEAD_DIM as f32).sqrt(),
+            stream.raw(),
+        )
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn decode_fp8(
     query: &DeviceBuffer<u16>,
@@ -632,6 +846,29 @@ mod tests {
         assert_eq!(select_decode_kernel(8, 8_192), DecodeKernel::SharedKv);
         assert_eq!(select_decode_kernel(16, 2_048), DecodeKernel::QueryHead);
         assert_eq!(select_decode_kernel(32, 8_192), DecodeKernel::QueryHead);
+    }
+
+    /// Лучшие точки `packedbench --sweep` на 60k: выбор партиций должен в них
+    /// попадать.
+    #[test]
+    fn packed_partitions_follow_the_measured_sweep() {
+        let rows_plan = |rows| packed_partition_count(PackedShape::Rows, rows, 60_000);
+        assert_eq!([1, 2, 4, 8, 32].map(rows_plan), [16, 8, 4, 2, 1]);
+        let segment_plan = |rows| packed_partition_count(PackedShape::Segment, rows, 60_000);
+        assert_eq!(segment_plan(1), 16);
+        assert_eq!(segment_plan(4), 32);
+        assert_eq!(segment_plan(8), 42);
+        assert_eq!(segment_plan(64), 24);
+        assert_eq!(segment_plan(256), 8);
+        assert_eq!(segment_plan(512), 4);
+        assert_eq!(segment_plan(2_048), 1);
+        // Короткий контекст не режется мельче четырёх страниц.
+        assert_eq!(packed_partition_count(PackedShape::Segment, 4, 1_000), 4);
+        // Частичные суммы не выходят за потолок пар (строка, партиция).
+        for rows in 1..=2_048 {
+            let partitions = segment_plan(rows);
+            assert!(partitions == 1 || rows * partitions <= PACKED_MAX_PARTIAL_ROWS, "{rows}");
+        }
     }
 }
 

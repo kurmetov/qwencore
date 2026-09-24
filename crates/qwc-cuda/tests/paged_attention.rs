@@ -2,8 +2,8 @@
 
 use qwc_core::arch::{ATTN_HEAD_DIM, NUM_ATTN_HEADS, NUM_KV_HEADS};
 use qwc_cuda::paged_attention::{
-    self, DecodeKernel, KvCacheDtype, PAGE_SIZE, PagedAttentionWorkspace,
-    PrefillAttentionWorkspace,
+    self, DecodeKernel, KvCacheDtype, PAGE_SIZE, PackedAttentionWorkspace, PackedShape,
+    PagedAttentionWorkspace, PrefillAttentionWorkspace,
 };
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
 
@@ -925,4 +925,333 @@ fn prefill_split_survives_an_underestimated_context() {
     // Хост недооценил контекст: последняя партиция всё равно доходит до
     // конца причинного префикса, страдает только скорость.
     split_case(4, 4_000, 0, Some(4), 2_000, true);
+}
+
+/// Входы упакованного ядра на арене в `arena` строк.
+///
+/// V зависит от номера физической страницы, K псевдослучайны: веса
+/// неравномерны, и потерянная партиция или чужая таблица страниц сдвигают
+/// выход заметно, а не на шум.
+struct PackedInputs {
+    query: Vec<u16>,
+    query_gate: Vec<u16>,
+    key_cache: Vec<u8>,
+    value_cache: Vec<u8>,
+}
+
+fn packed_inputs(arena: usize, num_blocks: usize) -> PackedInputs {
+    let cache_elements = num_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
+    let key_codes = [0x18u8, 0x98, 0x20, 0xa0, 0x28, 0xa8, 0x30, 0xb0];
+    let value_codes = [0xb8u8, 0xb0, 0xa8, 0x00, 0x28, 0x30, 0x38];
+    let key_cache = (0..cache_elements)
+        .map(|index| {
+            let hash = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 59;
+            key_codes[hash as usize % key_codes.len()]
+        })
+        .collect();
+    let value_cache = (0..cache_elements)
+        .map(|index| {
+            let physical = index / (NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM);
+            let level = physical * value_codes.len() / num_blocks;
+            value_codes[(level + index % 2 + index / ATTN_HEAD_DIM % 3) % value_codes.len()]
+        })
+        .collect();
+    let query = (0..arena * NUM_ATTN_HEADS * ATTN_HEAD_DIM)
+        .map(|index| bf16::from_f32(((index * 13 % 29) as f32 - 14.0) / 28.0))
+        .collect();
+    let mut query_gate = vec![0u16; arena * NUM_ATTN_HEADS * ATTN_HEAD_DIM * 2];
+    for row in 0..arena {
+        for head in 0..NUM_ATTN_HEADS {
+            let base = (row * NUM_ATTN_HEADS + head) * ATTN_HEAD_DIM * 2 + ATTN_HEAD_DIM;
+            for dimension in 0..ATTN_HEAD_DIM {
+                query_gate[base + dimension] =
+                    bf16::from_f32(((dimension + row + head) % 17) as f32 * 0.1 - 0.8);
+            }
+        }
+    }
+    PackedInputs { query, query_gate, key_cache, value_cache }
+}
+
+/// Упакованное ядро на строках `row_base..row_base + rows` арены. Возвращает
+/// выход всей арены и CPU-эталон с гейтом.
+#[allow(clippy::too_many_arguments)]
+fn run_packed(
+    inputs: &PackedInputs,
+    contexts: &[u32],
+    tables: &[u32],
+    num_blocks: usize,
+    max_blocks: usize,
+    shape: PackedShape,
+    rows: usize,
+    row_base: usize,
+    partitions: Option<usize>,
+    host_context: usize,
+) -> Vec<u16> {
+    let arena = contexts.len();
+    let stream = Stream::new().unwrap();
+    let device_query = DeviceBuffer::from_slice(&inputs.query).unwrap();
+    let device_gate = DeviceBuffer::from_slice(&inputs.query_gate).unwrap();
+    let device_key = DeviceBuffer::from_slice(&inputs.key_cache).unwrap();
+    let device_value = DeviceBuffer::from_slice(&inputs.value_cache).unwrap();
+    let device_tables = DeviceBuffer::from_slice(tables).unwrap();
+    let device_lengths = DeviceBuffer::from_slice(contexts).unwrap();
+    let max_context = *contexts.iter().max().unwrap() as usize;
+    let mut workspace = match partitions {
+        Some(partitions) => {
+            PackedAttentionWorkspace::with_partitions(rows, max_context, partitions).unwrap()
+        }
+        None => PackedAttentionWorkspace::new(&[shape], rows, max_context).unwrap(),
+    };
+    let mut output = DeviceBuffer::<u16>::zeroed(arena * NUM_ATTN_HEADS * ATTN_HEAD_DIM).unwrap();
+    paged_attention::gated_packed(
+        &device_query, &device_gate, &device_key, &device_value, num_blocks,
+        &device_tables, &device_lengths, max_blocks, &mut output, shape, rows, row_base,
+        host_context, &mut workspace, &stream,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+    output.to_vec().unwrap()
+}
+
+/// Сверка строк `row_base..row_base + rows` с CPU-эталоном; строки вне
+/// сегмента должны остаться нулями.
+#[allow(clippy::too_many_arguments)]
+fn check_packed_against_cpu(
+    label: &str,
+    inputs: &PackedInputs,
+    contexts: &[u32],
+    tables: &[u32],
+    max_blocks: usize,
+    rows: usize,
+    row_base: usize,
+    actual: &[u16],
+) {
+    let arena = contexts.len();
+    let width = NUM_ATTN_HEADS * ATTN_HEAD_DIM;
+    let mut expected = vec![0.0f32; arena * width];
+    paged_attention::reference::decode_fp8(
+        &inputs.query, &inputs.key_cache, &inputs.value_cache, tables, contexts, max_blocks,
+        &mut expected, arena,
+    );
+    let mut worst = 0.0f32;
+    for (index, &value) in actual.iter().enumerate() {
+        let row = index / width;
+        let actual = bf16::to_f32(value);
+        if row < row_base || row >= row_base + rows {
+            assert_eq!(value, 0, "{label}: задета строка {row} вне сегмента");
+            continue;
+        }
+        let raw = bf16::to_f32(
+            inputs.query_gate[(index / ATTN_HEAD_DIM) * ATTN_HEAD_DIM * 2
+                + ATTN_HEAD_DIM
+                + index % ATTN_HEAD_DIM],
+        );
+        let expected = expected[index] / (1.0 + (-raw).exp());
+        worst = worst.max((actual - expected).abs());
+        assert!(
+            (actual - expected).abs() <= 0.004 + expected.abs() * 0.004,
+            "{label}: строка {row}, голова {}, канал {}: GPU={actual}, CPU={expected}",
+            index / ATTN_HEAD_DIM % NUM_ATTN_HEADS,
+            index % ATTN_HEAD_DIM
+        );
+    }
+    println!("{label}: макс. ошибка {worst:.3e}");
+}
+
+/// Сегмент одной последовательности за историей `start`, после `row_base`
+/// чужих однострочных строк.
+fn packed_segment_case(
+    rows: usize,
+    start: usize,
+    row_base: usize,
+    partitions: Option<usize>,
+    host_context: Option<usize>,
+) {
+    let arena = row_base + rows;
+    let contexts: Vec<u32> = (0..arena)
+        .map(|row| if row < row_base { 1 } else { (start + row - row_base + 1) as u32 })
+        .collect();
+    let max_context = *contexts.iter().max().unwrap() as usize;
+    let max_blocks = max_context.div_ceil(PAGE_SIZE);
+    let num_blocks = max_blocks;
+    let one_table: Vec<u32> = (0..max_blocks as u32).rev().collect();
+    let tables: Vec<u32> = (0..arena).flat_map(|_| one_table.clone()).collect();
+    let inputs = packed_inputs(arena, num_blocks);
+    let actual = run_packed(
+        &inputs, &contexts, &tables, num_blocks, max_blocks, PackedShape::Segment, rows,
+        row_base, partitions, host_context.unwrap_or(max_context),
+    );
+    let label = format!("сегмент {rows} строк на {start}, P={partitions:?}");
+    check_packed_against_cpu(&label, &inputs, &contexts, &tables, max_blocks, rows, row_base, &actual);
+}
+
+#[test]
+fn packed_segment_matches_cpu() {
+    // Проверка трёх черновиков за длинной историей после decode-строк арены.
+    packed_segment_case(4, 6_000, 3, None, None);
+    // Одна строка, число партиций не делит контекст.
+    packed_segment_case(1, 3_000, 0, Some(7), None);
+    // Две и пять строк: тайлы на 16 и 32 упакованные строки.
+    packed_segment_case(2, 700, 1, None, None);
+    packed_segment_case(5, 1_000, 0, Some(3), None);
+    // Хвост промпта: тайлы по десять строк, у первых строк поздние партиции
+    // пусты, и последний тайл неполный.
+    packed_segment_case(203, 150, 5, Some(4), None);
+    // Без разбиения, причинный край внутри тайла и внутри страницы.
+    packed_segment_case(130, 0, 0, Some(1), None);
+}
+
+#[test]
+fn packed_segment_survives_an_underestimated_context() {
+    // Хост недооценил контекст: последняя партиция всё равно доходит до
+    // конца причинного префикса.
+    packed_segment_case(4, 4_000, 0, Some(4), Some(2_000));
+}
+
+#[test]
+fn packed_decode_rows_use_their_own_tables_and_contexts() {
+    // Decode-строки разных последовательностей: у каждой своя перестановка
+    // страниц и свой контекст, включая неполные страницы и одну строку в
+    // один токен.
+    let contexts: Vec<u32> = vec![1, 63, 64, 65, 3_000, 777, 4_096];
+    let arena = contexts.len();
+    let max_context = *contexts.iter().max().unwrap() as usize;
+    let max_blocks = max_context.div_ceil(PAGE_SIZE);
+    let num_blocks = max_blocks + 3;
+    let tables: Vec<u32> = (0..arena)
+        .flat_map(|row| {
+            (0..max_blocks).map(move |block| ((block * 7 + row * 5) % num_blocks) as u32)
+        })
+        .collect();
+    let inputs = packed_inputs(arena, num_blocks);
+    for partitions in [None, Some(1), Some(5)] {
+        let actual = run_packed(
+            &inputs, &contexts, &tables, num_blocks, max_blocks, PackedShape::Rows, arena, 0,
+            partitions, max_context,
+        );
+        let label = format!("decode {arena} строк, P={partitions:?}");
+        check_packed_against_cpu(&label, &inputs, &contexts, &tables, max_blocks, arena, 0, &actual);
+    }
+}
+
+/// Прежнее MMA-ядро и упакованное на общей форме; эталон на CPU здесь
+/// слишком дорог.
+fn packed_matches_unsplit(rows: usize, start: usize) {
+    let contexts: Vec<u32> = (0..rows).map(|row| (start + row + 1) as u32).collect();
+    let max_context = *contexts.iter().max().unwrap() as usize;
+    let max_blocks = max_context.div_ceil(PAGE_SIZE);
+    let num_blocks = max_blocks;
+    let one_table: Vec<u32> = (0..max_blocks as u32).rev().collect();
+    let tables: Vec<u32> = (0..rows).flat_map(|_| one_table.clone()).collect();
+    let inputs = packed_inputs(rows, num_blocks);
+    let packed = run_packed(
+        &inputs, &contexts, &tables, num_blocks, max_blocks, PackedShape::Segment, rows, 0,
+        None, max_context,
+    );
+
+    let stream = Stream::new().unwrap();
+    let mut unsplit = DeviceBuffer::<u16>::zeroed(packed.len()).unwrap();
+    paged_attention::prefill_gated_mma(
+        &DeviceBuffer::from_slice(&inputs.query).unwrap(),
+        &DeviceBuffer::from_slice(&inputs.query_gate).unwrap(),
+        &DeviceBuffer::from_slice(&inputs.key_cache).unwrap(),
+        &DeviceBuffer::from_slice(&inputs.value_cache).unwrap(),
+        num_blocks,
+        &DeviceBuffer::from_slice(&tables).unwrap(),
+        &DeviceBuffer::from_slice(&contexts).unwrap(),
+        max_blocks,
+        &mut unsplit,
+        rows,
+        0,
+        KvCacheDtype::Fp8,
+        &stream,
+    )
+    .unwrap();
+    stream.synchronize().unwrap();
+    let unsplit = unsplit.to_vec().unwrap();
+    let mut worst = 0.0f32;
+    for (index, (&a, &b)) in packed.iter().zip(&unsplit).enumerate() {
+        let (a, b) = (bf16::to_f32(a), bf16::to_f32(b));
+        worst = worst.max((a - b).abs());
+        // Прежнее ядро округляет P до bf16, упакованное — до f16.
+        assert!(
+            (a - b).abs() <= 0.004 + b.abs() * 0.012,
+            "{rows} строк на {start}, индекс {index}: упакованное={a}, прежнее={b}"
+        );
+    }
+    println!("{rows} строк на {start}: макс. расхождение с прежним ядром {worst:.3e}");
+}
+
+#[test]
+fn packed_matches_unsplit_on_a_long_context() {
+    packed_matches_unsplit(4, 30_000);
+}
+
+#[test]
+fn packed_matches_unsplit_on_a_full_chunk() {
+    packed_matches_unsplit(2_048, 1_000);
+}
+
+/// Острый softmax: K до ±4, q до ±2, скоры порядка единиц. На тестовых кэшах
+/// выше скоры сотые, softmax почти равномерный, и выход — среднее V при любой
+/// ошибке в QK: перепутанная раскладка измерений там бы не упала. Допуск —
+/// доля наибольшего элемента эталона, а не абсолют.
+#[test]
+fn packed_matches_cpu_on_a_sharp_softmax() {
+    for (rows, start, partitions) in [
+        (1usize, 200usize, Some(1)),
+        (1, 3_000, None),
+        (4, 200, Some(1)),
+        (4, 3_000, None),
+        (8, 200, Some(1)),
+        (130, 0, Some(1)),
+        (130, 500, Some(3)),
+    ] {
+        let contexts: Vec<u32> = (0..rows).map(|row| (start + row + 1) as u32).collect();
+        let max_context = *contexts.iter().max().unwrap() as usize;
+        let max_blocks = max_context.div_ceil(PAGE_SIZE);
+        let num_blocks = max_blocks;
+        let mut inputs = packed_inputs(rows, num_blocks);
+        let codes = [0x40u8, 0xc0, 0x48, 0xc8, 0x38, 0xb8, 0x50, 0xd0, 0x30, 0x00];
+        for (index, byte) in inputs.key_cache.iter_mut().enumerate() {
+            let hash = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58;
+            *byte = codes[hash as usize % codes.len()];
+        }
+        for (index, value) in inputs.query.iter_mut().enumerate() {
+            let hash = ((index as u64 + 7).wrapping_mul(0xd6e8_feb8_6659_fd93) >> 40) % 1000;
+            *value = bf16::from_f32(hash as f32 / 250.0 - 2.0);
+        }
+        let one_table: Vec<u32> = (0..max_blocks as u32).rev().collect();
+        let tables: Vec<u32> = (0..rows).flat_map(|_| one_table.clone()).collect();
+        let actual = run_packed(
+            &inputs, &contexts, &tables, num_blocks, max_blocks, PackedShape::Segment, rows, 0,
+            partitions, max_context,
+        );
+        let mut expected = vec![0.0f32; actual.len()];
+        paged_attention::reference::decode_fp8(
+            &inputs.query, &inputs.key_cache, &inputs.value_cache, &tables, &contexts, max_blocks,
+            &mut expected, rows,
+        );
+        let gated: Vec<f32> = expected
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let raw = bf16::to_f32(
+                    inputs.query_gate[(index / ATTN_HEAD_DIM) * ATTN_HEAD_DIM * 2
+                        + ATTN_HEAD_DIM
+                        + index % ATTN_HEAD_DIM],
+                );
+                value / (1.0 + (-raw).exp())
+            })
+            .collect();
+        let scale = gated.iter().fold(0.0f32, |acc, value| acc.max(value.abs()));
+        let worst = actual
+            .iter()
+            .zip(&gated)
+            .map(|(&value, &expected)| (bf16::to_f32(value) - expected).abs())
+            .fold(0.0f32, f32::max);
+        println!("{rows} строк на {start}, P={partitions:?}: ошибка {worst:.2e} при масштабе {scale:.3}");
+        // Округление выхода до bf16 — 0.4% элемента; наблюдалось до 0.3% масштаба.
+        assert!(worst <= scale * 0.006, "{rows} строк на {start}: {worst} при масштабе {scale}");
+    }
 }

@@ -521,6 +521,26 @@ unsafe extern "C" {
     ) -> c_int;
 
     #[allow(clippy::too_many_arguments)]
+    pub fn qwc_paged_attention_packed_fp8(
+        query: *const c_void,
+        query_gate_projection: *const c_void,
+        key_cache: *const c_void,
+        value_cache: *const c_void,
+        block_tables: *const c_void,
+        context_lengths: *const c_void,
+        output: *mut c_void,
+        workspace: *mut c_void,
+        workspace_bytes: usize,
+        rows: c_int,
+        row_base: c_int,
+        max_blocks: c_int,
+        tile_rows: c_int,
+        partitions: c_int,
+        softmax_scale: f32,
+        stream: Stream,
+    ) -> c_int;
+
+    #[allow(clippy::too_many_arguments)]
     pub fn qwc_paged_attention_prefill_mma_fp8(
         query: *const c_void,
         query_gate_projection: *const c_void,
