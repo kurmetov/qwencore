@@ -316,10 +316,7 @@ pub fn packed_partition_count(shape: PackedShape, rows: usize, context: usize) -
     assert!(rows > 0 && context > 0);
     let tile_size = packed_tile_size(shape, rows);
     let ctas = NUM_KV_HEADS * (rows * GQA_GROUP).div_ceil(tile_size);
-    let most = context
-        .div_ceil(PACKED_MIN_TOKENS_PER_PARTITION)
-        .min(PACKED_MAX_PARTIAL_ROWS / rows)
-        .max(1);
+    let most = packed_most_partitions(rows, context);
     if packed_m_tiles(tile_size) < 4 {
         // Один-два m-тайла упираются в полосу памяти, и её насыщают 64 CTA на
         // m-тайл; лишние партиции только пишут частичные суммы. Decode на 60k:
@@ -338,6 +335,42 @@ pub fn packed_partition_count(shape: PackedShape, rows: usize, context: usize) -
             (ctas * used).div_ceil(PACKED_SMS) * (span + PACKED_CTA_OVERHEAD_KEYS)
         })
         .unwrap()
+}
+
+/// Больше партиций `packed_partition_count` не даёт: отрезок не короче
+/// четырёх страниц, пар (строка, партиция) не больше потолка.
+fn packed_most_partitions(rows: usize, context: usize) -> usize {
+    context
+        .div_ceil(PACKED_MIN_TOKENS_PER_PARTITION)
+        .min(PACKED_MAX_PARTIAL_ROWS / rows)
+        .max(1)
+}
+
+/// Партиций, которых хватит `rows` строкам при любом контексте до
+/// `max_context`. Волновая модель по контексту не монотонна: восемь строк
+/// прогрева MTP берут на 32768 P=40, а на 32256 — P=42, и workspace по
+/// потолку контекста оказывался мал. Для неё граница — наибольшее допустимое
+/// P; у одного-двух m-тайлов P растёт с контекстом, и хватает значения на
+/// потолке.
+fn packed_partition_bound(shape: PackedShape, rows: usize, max_context: usize) -> usize {
+    if packed_m_tiles(packed_tile_size(shape, rows)) < 4 {
+        packed_partition_count(shape, rows, max_context)
+    } else {
+        packed_most_partitions(rows, max_context)
+    }
+}
+
+/// Байт частичных сумм, которых хватит любому вызову форм `shapes` до
+/// `max_rows` строк с контекстом до `max_context`.
+fn packed_workspace_capacity(shapes: &[PackedShape], max_rows: usize, max_context: usize) -> usize {
+    (1..=max_rows)
+        .flat_map(|rows| {
+            shapes.iter().map(move |&shape| {
+                packed_workspace_bytes(rows, packed_partition_bound(shape, rows, max_context))
+            })
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// Сколько партиций получат ключи и какой длины отрезок, если контекст
@@ -372,14 +405,7 @@ impl PackedAttentionWorkspace {
     /// 51 МБ.
     pub fn new(shapes: &[PackedShape], max_rows: usize, max_context: usize) -> Result<Self> {
         assert!(max_rows > 0 && max_context > 0 && !shapes.is_empty());
-        let bytes = (1..=max_rows)
-            .flat_map(|rows| {
-                shapes.iter().map(move |&shape| {
-                    packed_workspace_bytes(rows, packed_partition_count(shape, rows, max_context))
-                })
-            })
-            .max()
-            .unwrap_or(0);
+        let bytes = packed_workspace_capacity(shapes, max_rows, max_context);
         Self::allocate(bytes, max_rows, max_context, None)
     }
 
@@ -888,6 +914,39 @@ mod tests {
             let partitions = segment_plan(rows);
             assert!(partitions == 1 || rows * partitions <= PACKED_MAX_PARTIAL_ROWS, "{rows}");
         }
+    }
+
+    /// Workspace, размеченный по потолку контекста, должен вмещать вызов с
+    /// любым меньшим контекстом: прогрев MTP восемью строками на 32256
+    /// просил P=42 при P=40 на потолке 32768 и падал на проверке размера.
+    #[test]
+    fn packed_workspace_covers_every_context_below_the_ceiling() {
+        for (shapes, max_rows) in [
+            (&[PackedShape::Segment][..], 8),
+            (&[PackedShape::Rows][..], 8),
+            (&[PackedShape::Rows, PackedShape::Segment][..], 2_048),
+        ] {
+            let max_context = 32_768;
+            let capacity = packed_workspace_capacity(shapes, max_rows, max_context);
+            for &shape in shapes {
+                let sizes = (1..=12).chain([64, 96, 384, 512, 585, 1_024, 2_048]);
+                for rows in sizes.filter(|&rows| rows <= max_rows) {
+                    for context in (PAGE_SIZE..=max_context).step_by(PAGE_SIZE) {
+                        let partitions = packed_partition_count(shape, rows, context);
+                        assert!(
+                            packed_workspace_bytes(rows, partitions) <= capacity,
+                            "{shape:?}: {rows} строк на {context}, P={partitions}"
+                        );
+                    }
+                }
+            }
+        }
+        // Восемь строк сегмента: 12.8 МБ, а не 51, как у арены префилла.
+        assert_eq!(packed_workspace_capacity(&[PackedShape::Segment], 8, 32_768), 8 * 24 * 128 * 520);
+        assert_eq!(
+            packed_workspace_capacity(&[PackedShape::Rows, PackedShape::Segment], 2_048, 32_768),
+            PACKED_MAX_PARTIAL_ROWS * NUM_ATTN_HEADS * PACKED_PARTIAL_BYTES
+        );
     }
 }
 
