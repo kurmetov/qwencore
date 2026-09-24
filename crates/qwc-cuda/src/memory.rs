@@ -270,6 +270,29 @@ impl<T> DeviceBuffer<T> {
         Ok(host)
     }
 
+    /// Элементы `[start, start + len)` на хост.
+    pub fn to_vec_range(&self, start: usize, len: usize) -> Result<Vec<T>>
+    where
+        T: Copy + Default,
+    {
+        assert!(start <= self.len && len <= self.len - start);
+        let mut host = vec![T::default(); len];
+        if len == 0 {
+            return Ok(host);
+        }
+        // SAFETY: the asserted element range lies inside this allocation.
+        let source = unsafe { (self.ptr as *const u8).add(start * std::mem::size_of::<T>()) };
+        check(unsafe {
+            ffi::cudaMemcpy(
+                host.as_mut_ptr().cast(),
+                source.cast(),
+                len * std::mem::size_of::<T>(),
+                ffi::MEMCPY_DEVICE_TO_HOST,
+            )
+        })?;
+        Ok(host)
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }

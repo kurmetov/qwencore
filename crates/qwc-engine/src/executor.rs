@@ -2046,11 +2046,10 @@ impl Executor {
         Ok(())
     }
 
-    /// Логиты одной последовательности на хост.
+    /// Логиты одной строки последнего шага на хост: последовательности в
+    /// обычном шаге или строки проверки черновиков.
     pub fn logits_to_host(&self, sequence: usize) -> Result<Vec<f32>> {
-        let all = self.logits.to_vec()?;
-        let start = sequence * VOCAB_SIZE;
-        Ok(all[start..start + VOCAB_SIZE].to_vec())
+        self.logits.to_vec_range(sequence * VOCAB_SIZE, VOCAB_SIZE)
     }
 
     /// Greedy sampling on the GPU; only the resulting token IDs cross PCIe.

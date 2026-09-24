@@ -579,6 +579,9 @@ def run_tgi(args: argparse.Namespace) -> None:
 
 def token_text_id(tokenizer: Any, text: str) -> int | None:
     """Recover an ID only when a server token round-trips unambiguously."""
+    # vLLM and qwc serve spell tokens as "token_id:N" when asked to.
+    if text.startswith("token_id:") and text[len("token_id:"):].isdigit():
+        return int(text[len("token_id:"):])
     token_id = tokenizer.convert_tokens_to_ids(text)
     unknown = getattr(tokenizer, "unk_token_id", None)
     if token_id is not None and token_id != unknown:
@@ -665,6 +668,11 @@ def run_openai(args: argparse.Namespace) -> None:
             "stream": False,
             "seed": 0,
         }
+        if args.openai_token_ids:
+            # vLLM extensions: exact IDs instead of text round-trips, and
+            # exactly max_tokens steps like the reference adapters.
+            payload["return_tokens_as_token_ids"] = True
+            payload["ignore_eos"] = True
         started = time.perf_counter()
         result = http_json(args.url.rstrip("/") + "/v1/completions", payload, args.timeout)
         elapsed_ms = (time.perf_counter() - started) * 1e3
@@ -1026,6 +1034,11 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--eager", action="store_true", help="disable vLLM CUDA graphs")
     run.add_argument("--url", help="base URL for an HTTP backend")
     run.add_argument("--served-model-name", help="model field sent to an OpenAI server")
+    run.add_argument(
+        "--openai-token-ids",
+        action="store_true",
+        help="send return_tokens_as_token_ids and ignore_eos (vLLM, qwc serve)",
+    )
     run.add_argument("--timeout", type=float, default=600.0)
     run.set_defaults(func=dispatch_run)
 

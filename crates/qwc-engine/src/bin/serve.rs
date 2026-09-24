@@ -96,6 +96,11 @@ struct GenerateJob {
     max_new_tokens: usize,
     stop: Vec<String>,
     buffer_output: bool,
+    /// Сколько лучших токенов отдавать с логвероятностями на каждом шаге.
+    logprobs: Option<usize>,
+    /// Не останавливаться на EOS: сверка с `eval` идёт ровно `max_tokens`
+    /// шагов.
+    ignore_eos: bool,
     event_tx: async_mpsc::UnboundedSender<EngineEvent>,
 }
 
@@ -106,8 +111,17 @@ enum EngineEvent {
         finish_reason: &'static str,
         completion_tokens: usize,
         buffered_output: bool,
+        tokens: Vec<u32>,
+        scores: Vec<StepScores>,
     },
     Error(String),
+}
+
+/// Логвероятности одного выданного токена: его собственная и лучших
+/// `top_k`, как их считает `eval`.
+struct StepScores {
+    chosen: f32,
+    top: Vec<(u32, f32)>,
 }
 
 struct ActiveJob {
@@ -116,6 +130,12 @@ struct ActiveJob {
     rendered: String,
     stop: Vec<String>,
     buffer_output: bool,
+    logprobs: Option<usize>,
+    ignore_eos: bool,
+    scores: Vec<StepScores>,
+    /// Оценки токена, который выдаст следующий `emit_token`. Логиты есть в
+    /// момент выборки, а выдача идёт шагом позже.
+    next_scores: Option<StepScores>,
     event_tx: async_mpsc::UnboundedSender<EngineEvent>,
 }
 
@@ -158,6 +178,45 @@ enum Stop {
     One(String),
     Many(Vec<String>),
 }
+
+/// Старый OpenAI `/v1/completions`: промпт идёт мимо chat template, текстом
+/// или готовыми id токенов. Нужен сверке с `eval`, которой нужны логиты
+/// сервера на тех же токенах.
+#[derive(Debug, Deserialize)]
+struct CompletionRequest {
+    #[serde(default)]
+    model: Option<String>,
+    prompt: CompletionPrompt,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    max_tokens: Option<usize>,
+    #[serde(default)]
+    #[serde(rename = "temperature")]
+    _temperature: Option<f32>,
+    #[serde(default)]
+    stop: Option<Stop>,
+    #[serde(default)]
+    logprobs: Option<usize>,
+    /// Расширение vLLM: генерировать ровно `max_tokens`, не глядя на EOS.
+    #[serde(default)]
+    ignore_eos: bool,
+    /// Расширение vLLM: токены в `logprobs` как `token_id:N`, чтобы клиенту
+    /// не восстанавливать id по тексту.
+    #[serde(default)]
+    return_tokens_as_token_ids: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CompletionPrompt {
+    Text(String),
+    Tokens(Vec<u32>),
+}
+
+/// Столько лучших токенов отдаёт vLLM по умолчанию; больше клиенту сверки не
+/// нужно.
+const MAX_LOGPROBS: usize = 20;
 
 #[derive(Serialize)]
 struct ErrorEnvelope {
@@ -258,6 +317,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     eprintln!(
@@ -338,13 +398,7 @@ async fn chat_completions(
         .unwrap_or_default()
         .as_secs();
     let prompt_tokens = prompt.len();
-    // Промпт генерации начинается последним `<|im_start|>`: ход модели в
-    // историю следующего запроса попадёт уже без `<think>` и с ответом.
-    let history_tokens = state
-        .tokenizer
-        .token_to_id("<|im_start|>")
-        .and_then(|start| prompt.iter().rposition(|&token| token == start))
-        .unwrap_or(prompt_tokens);
+    let history_tokens = history_boundary(&state.tokenizer, &prompt);
     let stop = match request.stop {
         None => Vec::new(),
         Some(Stop::One(stop)) => vec![stop],
@@ -367,6 +421,8 @@ async fn chat_completions(
             max_new_tokens: requested,
             stop,
             buffer_output,
+            logprobs: None,
+            ignore_eos: false,
             event_tx,
         }))
         .map_err(|_| ApiError::unavailable("engine worker is not running"))?;
@@ -439,6 +495,166 @@ async fn chat_completions(
         }
     }
     Err(ApiError::unavailable("engine closed the response channel"))
+}
+
+/// Промпт генерации начинается последним `<|im_start|>`: ход модели в
+/// историю следующего запроса попадёт уже без `<think>` и с ответом. На этой
+/// границе снимается кэш префиксов.
+fn history_boundary(tokenizer: &Tokenizer, prompt: &[u32]) -> usize {
+    tokenizer
+        .token_to_id("<|im_start|>")
+        .and_then(|start| prompt.iter().rposition(|&token| token == start))
+        .unwrap_or(prompt.len())
+}
+
+async fn completions(
+    State(state): State<AppState>,
+    Json(request): Json<CompletionRequest>,
+) -> Result<Response, ApiError> {
+    if let Some(model) = request.model.as_deref()
+        && model != state.model.as_ref()
+    {
+        return Err(ApiError::bad_request(format!("unknown model: {model}")));
+    }
+    if request.stream {
+        return Err(ApiError::bad_request(
+            "stream is not supported on /v1/completions",
+        ));
+    }
+    if request.logprobs.is_some_and(|top_k| top_k > MAX_LOGPROBS) {
+        return Err(ApiError::bad_request(format!(
+            "logprobs must be at most {MAX_LOGPROBS}"
+        )));
+    }
+    let prompt = match request.prompt {
+        CompletionPrompt::Tokens(tokens) => tokens,
+        CompletionPrompt::Text(text) => state
+            .tokenizer
+            .encode(text, false)
+            .map_err(|error| ApiError::bad_request(format!("tokenization failed: {error}")))?
+            .get_ids()
+            .to_vec(),
+    };
+    if prompt.is_empty() {
+        return Err(ApiError::bad_request("prompt is empty"));
+    }
+    if prompt.iter().any(|&token| token as usize >= VOCAB_SIZE) {
+        return Err(ApiError::bad_request("prompt has an out-of-vocabulary ID"));
+    }
+    let requested = request.max_tokens.unwrap_or(16);
+    let remaining = state.max_context.saturating_sub(prompt.len());
+    if requested == 0 || requested > remaining {
+        return Err(ApiError::bad_request(format!(
+            "prompt has {} tokens; requested {} output tokens exceed context {}",
+            prompt.len(),
+            requested,
+            state.max_context
+        )));
+    }
+
+    let id = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed).max(1);
+    let created = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let prompt_tokens = prompt.len();
+    let history_tokens = history_boundary(&state.tokenizer, &prompt);
+    let stop = match request.stop {
+        None => Vec::new(),
+        Some(Stop::One(stop)) => vec![stop],
+        Some(Stop::Many(stops)) => stops,
+    };
+    let (event_tx, event_rx) = async_mpsc::unbounded_channel();
+    state
+        .command_tx
+        .send(Command::Generate(GenerateJob {
+            id,
+            prompt,
+            history_tokens,
+            max_new_tokens: requested,
+            stop,
+            buffer_output: true,
+            logprobs: request.logprobs,
+            ignore_eos: request.ignore_eos,
+            event_tx,
+        }))
+        .map_err(|_| ApiError::unavailable("engine worker is not running"))?;
+
+    let mut events = UnboundedReceiverStream::new(event_rx);
+    while let Some(event) = events.next().await {
+        match event {
+            EngineEvent::Delta(_) => {}
+            EngineEvent::Done {
+                text,
+                finish_reason,
+                completion_tokens,
+                tokens,
+                scores,
+                ..
+            } => {
+                let logprobs = request.logprobs.map(|_| {
+                    completion_logprobs(
+                        &state.tokenizer,
+                        &tokens,
+                        &scores,
+                        request.return_tokens_as_token_ids,
+                    )
+                });
+                return Ok(Json(json!({
+                    "id": format!("cmpl-qwc-{id}"),
+                    "object": "text_completion",
+                    "created": created,
+                    "model": state.model.as_ref(),
+                    "choices": [{
+                        "index": 0,
+                        "text": text,
+                        "logprobs": logprobs,
+                        "finish_reason": finish_reason
+                    }],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": prompt_tokens + completion_tokens
+                    }
+                }))
+                .into_response());
+            }
+            EngineEvent::Error(message) => return Err(ApiError::unavailable(message)),
+        }
+    }
+    Err(ApiError::unavailable("engine closed the response channel"))
+}
+
+/// `logprobs` старого формата: токены, их логвероятности и словари лучших.
+fn completion_logprobs(
+    tokenizer: &Tokenizer,
+    tokens: &[u32],
+    scores: &[StepScores],
+    as_ids: bool,
+) -> Value {
+    let name = |token: u32| {
+        if as_ids {
+            format!("token_id:{token}")
+        } else {
+            tokenizer.decode(&[token], false).unwrap_or_default()
+        }
+    };
+    let top: Vec<Value> = scores
+        .iter()
+        .map(|step| {
+            let row: serde_json::Map<String, Value> = step
+                .top
+                .iter()
+                .map(|&(token, logprob)| (name(token), json!(logprob)))
+                .collect();
+            Value::Object(row)
+        })
+        .collect();
+    json!({
+        "tokens": tokens.iter().map(|&token| name(token)).collect::<Vec<_>>(),
+        "token_logprobs": scores.iter().map(|step| step.chosen).collect::<Vec<_>>(),
+        "top_logprobs": top,
+    })
 }
 
 fn stream_events(id: &str, created: u64, model: &str, event: EngineEvent) -> Vec<Event> {
@@ -615,22 +831,55 @@ fn run_worker(
                 }
             };
 
+            // Логиты строк проверки ещё лежат у исполнителя: фиксация их не
+            // трогает.
+            let mut verified = match jobs.get(&id).and_then(|job| job.logprobs) {
+                Some(top_k) => {
+                    let rows: Result<Vec<_>, String> = (0..=accepted)
+                        .map(|row| score_row(&executor, row, truth[row], top_k).map(Some))
+                        .collect();
+                    match rows {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            fail_all(&mut jobs, format!("logprobs failed: {error}"));
+                            return;
+                        }
+                    }
+                }
+                None => Vec::new(),
+            };
+
             // Шаг выдал ожидающий токен и принятые черновики; на первом
             // стоп-токене или стоп-строке выдача обрывается.
             let mut produced = 0;
+            let mut emitted_index = 0;
             let mut stopped = Vec::new();
             for &emitted in std::iter::once(&token).chain(&truth[..accepted]) {
                 produced += 1;
-                let stop = config.eos_ids.contains(&emitted)
-                    || jobs
-                        .get_mut(&id)
-                        .is_none_or(|job| emit_token(job, emitted, &tokenizer));
+                let stop = match jobs.get_mut(&id) {
+                    Some(job) => {
+                        // Первый токен ждал с прошлого шага, его оценки уже
+                        // лежат в задаче; строка i проверки дала truth[i].
+                        if emitted_index > 0
+                            && let Some(scores) = verified.get_mut(emitted_index - 1)
+                        {
+                            job.next_scores = scores.take();
+                        }
+                        emitted_index += 1;
+                        (!job.ignore_eos && config.eos_ids.contains(&emitted))
+                            || emit_token(job, emitted, &tokenizer)
+                    }
+                    None => true,
+                };
                 if stop {
                     stopped.push(id);
                     break;
                 }
             }
             pending.insert(id, truth[accepted]);
+            if let Some(job) = jobs.get_mut(&id) {
+                job.next_scores = verified.get_mut(accepted).and_then(Option::take);
+            }
             let rows = accepted + 1;
             head_tokens.clear();
             head_tokens.extend_from_slice(&truth[..rows]);
@@ -691,14 +940,22 @@ fn run_worker(
                 return;
             }
         };
+        let scored = match score_sampled(&executor, &jobs, &sampled) {
+            Ok(scored) => scored,
+            Err(error) => {
+                let _ = scheduler.abort_batch();
+                fail_all(&mut jobs, format!("logprobs failed: {error}"));
+                return;
+            }
+        };
 
         let mut stopped = Vec::new();
         for &id in &batch.decode {
             let token = pending[&id];
-            let should_stop = config.eos_ids.contains(&token)
-                || jobs
-                    .get_mut(&id)
-                    .is_none_or(|job| emit_token(job, token, &tokenizer));
+            let should_stop = jobs.get_mut(&id).is_none_or(|job| {
+                (!job.ignore_eos && config.eos_ids.contains(&token))
+                    || emit_token(job, token, &tokenizer)
+            });
             if should_stop {
                 stopped.push(id);
             }
@@ -723,6 +980,11 @@ fn run_worker(
         }
         for &(id, token) in &sampled {
             pending.insert(id, token);
+        }
+        for (id, scores) in scored {
+            if let Some(job) = jobs.get_mut(&id) {
+                job.next_scores = Some(scores);
+            }
         }
         // Вход головы — скрытое состояние только что сделанного шага.
         hidden_for = None;
@@ -766,6 +1028,63 @@ fn run_worker(
     }
 }
 
+/// Логвероятности строки `row` последнего шага так же, как их считает
+/// `eval`. `chosen` выбрал argmax на карте: если его логит не максимален,
+/// строка не та, и молча отдавать чужие числа нельзя.
+fn score_row(
+    executor: &Executor,
+    row: usize,
+    chosen: u32,
+    top_k: usize,
+) -> Result<StepScores, String> {
+    let logits = executor
+        .logits_to_host(row)
+        .map_err(|error| error.to_string())?;
+    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if logits[chosen as usize] != maximum {
+        return Err(format!("row {row}: token {chosen} is not the argmax"));
+    }
+    let sum_exp: f64 = logits
+        .iter()
+        .map(|&value| f64::from(value - maximum).exp())
+        .sum();
+    let logsumexp = maximum + sum_exp.ln() as f32;
+    let order = |left: &usize, right: &usize| {
+        logits[*right]
+            .total_cmp(&logits[*left])
+            .then_with(|| left.cmp(right))
+    };
+    let mut indices: Vec<usize> = (0..logits.len()).collect();
+    let top_k = top_k.min(logits.len());
+    if top_k > 0 {
+        indices.select_nth_unstable_by(top_k - 1, order);
+    }
+    indices.truncate(top_k);
+    indices.sort_unstable_by(order);
+    Ok(StepScores {
+        chosen: logits[chosen as usize] - logsumexp,
+        top: indices
+            .into_iter()
+            .map(|token| (token as u32, logits[token] - logsumexp))
+            .collect(),
+    })
+}
+
+/// Оценки всех строк обычного шага, чьи задачи просили `logprobs`.
+fn score_sampled(
+    executor: &Executor,
+    jobs: &HashMap<u32, ActiveJob>,
+    sampled: &[(u32, u32)],
+) -> Result<Vec<(u32, StepScores)>, String> {
+    let mut scored = Vec::new();
+    for (row, &(id, token)) in sampled.iter().enumerate() {
+        if let Some(top_k) = jobs.get(&id).and_then(|job| job.logprobs) {
+            scored.push((id, score_row(executor, row, token, top_k)?));
+        }
+    }
+    Ok(scored)
+}
+
 fn finish_job(
     jobs: &mut HashMap<u32, ActiveJob>,
     pending: &mut HashMap<u32, u32>,
@@ -783,6 +1102,8 @@ fn finish_job(
             finish_reason,
             completion_tokens: job.output.len(),
             buffered_output: job.buffer_output,
+            tokens: job.output,
+            scores: job.scores,
         });
     }
     pending.remove(&completion.id);
@@ -990,6 +1311,10 @@ fn accept_command(command: Command, scheduler: &mut Scheduler, jobs: &mut HashMa
             rendered: String::new(),
             stop: job.stop,
             buffer_output: job.buffer_output,
+            logprobs: job.logprobs,
+            ignore_eos: job.ignore_eos,
+            scores: Vec::new(),
+            next_scores: None,
             event_tx: job.event_tx,
         },
     );
@@ -998,6 +1323,9 @@ fn accept_command(command: Command, scheduler: &mut Scheduler, jobs: &mut HashMa
 /// Returns true when a stop string was reached or the client disconnected.
 fn emit_token(job: &mut ActiveJob, token: u32, tokenizer: &Tokenizer) -> bool {
     job.output.push(token);
+    if let Some(scores) = job.next_scores.take() {
+        job.scores.push(scores);
+    }
     let Ok(decoded) = tokenizer.decode(&job.output, true) else {
         let _ = job
             .event_tx
