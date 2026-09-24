@@ -262,11 +262,44 @@ def run_vllm(args: argparse.Namespace) -> None:
         enforce_eager=args.eager,
         disable_log_stats=True,
         max_logprobs=max(args.top_k, 20),
+        # Случаи идут по одному, и каждый считается с нуля. В state-length
+        # короткий промпт — префикс длинного того же документа: с кэшем vLLM
+        # поднял бы его KV и состояние DeltaNet вместо префилла.
+        enable_prefix_caching=False,
+        # Чекпоинт мультимодальный, корпус текстовый. vision tower (0.92 ГБ) и
+        # профиль энкодера на картинке максимального размера текстового пути
+        # не касаются, а на общей карте 16k-шаг и без них влезает впритык.
+        language_model_only=not args.vllm_keep_vision,
+        # Перед захватом CUDA-графов vLLM размечает KV на min(max_num_seqs, 512)
+        # блоков, а блок гибридной модели — состояние DeltaNet одной
+        # последовательности: при умолчании 256 это 784 MiB на каждый из 64
+        # слоёв. Случаи идут по одному, decode — граф размера 1 при любом числе.
+        max_num_seqs=args.vllm_max_num_seqs,
     )
     if args.vllm_kv_cache_dtype != "auto":
         llm_options["kv_cache_dtype"] = args.vllm_kv_cache_dtype
+    # Шаг префилла: по умолчанию на 5090 — 8192 токена, и промпт длиннее
+    # режется на чанки со своими границами состояния.
+    if args.vllm_max_batched_tokens:
+        llm_options["max_num_batched_tokens"] = args.vllm_max_batched_tokens
     llm = LLM(**llm_options)
     load_seconds = time.perf_counter() - started
+    # В артефакт идёт итог конфигурации, а не запрос: значения по умолчанию
+    # зависят от карты и версии vLLM.
+    engine_config = llm.llm_engine.vllm_config
+    # "auto" берёт `mamba_ssm_dtype` из config.json, у этой модели — float32.
+    ssm_dtype = str(engine_config.cache_config.mamba_ssm_cache_dtype)
+    if ssm_dtype == "auto":
+        ssm_dtype = str(
+            getattr(engine_config.model_config.hf_text_config, "mamba_ssm_dtype", "auto")
+        )
+    effective = dict(
+        max_num_batched_tokens=engine_config.scheduler_config.max_num_batched_tokens,
+        max_num_seqs=engine_config.scheduler_config.max_num_seqs,
+        prefix_caching=bool(engine_config.cache_config.enable_prefix_caching),
+        mamba_ssm_cache_dtype=ssm_dtype,
+        language_model_only=not args.vllm_keep_vision,
+    )
     records = [
         run_header(
             args.name
@@ -282,6 +315,7 @@ def run_vllm(args: argparse.Namespace) -> None:
             "raw_logprobs_top_k",
             load_seconds=load_seconds,
             kv_cache_dtype=args.vllm_kv_cache_dtype,
+            **effective,
         )
     ]
     for case in cases:
@@ -1030,6 +1064,26 @@ def parser() -> argparse.ArgumentParser:
         choices=("auto", "fp8"),
         default="auto",
         help="vLLM full-attention KV dtype; mamba state dtype is unchanged",
+    )
+    run.add_argument(
+        "--vllm-max-batched-tokens",
+        type=int,
+        default=0,
+        help="vLLM prefill step in tokens (0 — vLLM default); a prompt longer "
+        "than this is prefilled in chunks",
+    )
+    run.add_argument(
+        "--vllm-max-num-seqs",
+        type=int,
+        default=4,
+        help="vLLM max_num_seqs; the default 256 does not fit the CUDA graph "
+        "profiling KV of this hybrid model on a 32 GB card",
+    )
+    run.add_argument(
+        "--vllm-keep-vision",
+        action="store_true",
+        help="do not pass language_model_only: vLLM loads the vision tower "
+        "(bench/results/vllm.jsonl was recorded this way)",
     )
     run.add_argument("--eager", action="store_true", help="disable vLLM CUDA graphs")
     run.add_argument("--url", help="base URL for an HTTP backend")
