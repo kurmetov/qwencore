@@ -9,13 +9,17 @@
 «волны x (отрезок + k0 ключей)» с сеткой k0 и цены редукции. Промах —
 насколько время при выбранном P хуже лучшего замеренного. Модель в
 `packed_partition_count` — k0 = 64, без цены редукции. Данные 2026-09-24 —
-`bench/results/packed-dense-sweep-2026-09-24.txt`.
+`bench/results/packed-dense-sweep-2026-09-24.txt` (частичные суммы в fp32,
+потолок 2048 пар) и `packed-dense-sweep-f16-2026-09-24.txt` (f16, 4096 пар);
+потолок задаёт `--max-pairs`.
 """
 import math
 import re
 import sys
 
 SMS, KV, GROUP, PAGE = 170, 4, 6, 64
+# Потолок пар (строка, партиция), PACKED_MAX_PARTIAL_ROWS.
+MAX_PAIRS = 4096
 
 
 def parse(path):
@@ -49,7 +53,7 @@ def wave_rule(rows, context, k0, reduce_cost, max_partitions=48):
     ctas = KV * tiles(rows)
     best = None
     for p in range(1, max_partitions + 1):
-        if rows * p > 2048 and p > 1:
+        if rows * p > MAX_PAIRS and p > 1:
             break
         n, span = used(context, p)
         cost = math.ceil(ctas * n / SMS) * (span + k0) + (reduce_cost * rows * p if p > 1 else 0)
@@ -90,6 +94,10 @@ def regret(table, rule):
 
 
 if __name__ == "__main__":
+    if "--max-pairs" in sys.argv:
+        at = sys.argv.index("--max-pairs")
+        MAX_PAIRS = int(sys.argv.pop(at + 1))
+        sys.argv.pop(at)
     table = parse(sys.argv[1])
     print(f"форм: {len(table)}")
     mean, worst, details = regret(table, previous_rule)

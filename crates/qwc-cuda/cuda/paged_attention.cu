@@ -1417,7 +1417,7 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
     __nv_bfloat16* __restrict__ output,
     float* __restrict__ partial_max,
     float* __restrict__ partial_sum,
-    float* __restrict__ partial_output,
+    __half* __restrict__ partial_output,
     int max_blocks,
     int rows,
     int row_base,
@@ -1765,7 +1765,10 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
     const int query_head = kv_head * kGroup + (tile_first + r) % kGroup;
     if constexpr (!Direct) {
       // Строки партиций нумеруются от начала сегмента: row_base добавит
-      // редукция, когда будет писать выход.
+      // редукция, когда будет писать выход. Выход партиции уходит уже
+      // нормированным, в f16: это выпуклая комбинация V, по модулю не больше
+      // 448, и f16 держит её с запасом по диапазону и на три бита точнее
+      // bf16 итогового выхода. Сумма и максимум остаются в fp32.
       const size_t slot =
           (static_cast<size_t>(local) * kQueryHeads + query_head) *
               partitions +
@@ -1774,14 +1777,16 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
         partial_max[slot] = running_max[half];
         partial_sum[slot] = running_sum[half];
       }
+      const float inverse =
+          running_sum[half] > 0.0f ? 1.0f / running_sum[half] : 0.0f;
 #pragma unroll
       for (int c = 0; c < kPackedChunks; ++c) {
-        *reinterpret_cast<float4*>(
+        *reinterpret_cast<uint2*>(
             &partial_output[slot * kHeadDim + c * 16 + pos * 4]) =
-            make_float4(accumulator[2 * c][2 * half],
-                        accumulator[2 * c + 1][2 * half],
-                        accumulator[2 * c][2 * half + 1],
-                        accumulator[2 * c + 1][2 * half + 1]);
+            make_uint2(pack_half2(accumulator[2 * c][2 * half] * inverse,
+                                  accumulator[2 * c + 1][2 * half] * inverse),
+                       pack_half2(accumulator[2 * c][2 * half + 1] * inverse,
+                                  accumulator[2 * c + 1][2 * half + 1] * inverse));
       }
     } else {
       const int batch_row = row_base + local;
@@ -1816,6 +1821,120 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
     }
   }
 }
+
+__device__ __forceinline__ float warp_all_max(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
+  }
+  return value;
+}
+
+__device__ __forceinline__ float warp_all_sum(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_xor_sync(0xffffffffu, value, offset);
+  }
+  return value;
+}
+
+// Редукция партиций упакованного ядра. Выход партиции лежит нормированным в
+// f16, поэтому вес партиции — её доля знаменателя, sum * exp(max - M) / D.
+// Варп на пару (строка, голова), дорожка — восемь измерений подряд: одно
+// 16-байтное чтение на партицию. У общей reduce_partitions_kernel поток на
+// измерение и последовательный проход нулевого потока по весам.
+__global__ __launch_bounds__(kThreads) void reduce_packed_partitions_kernel(
+    const float* __restrict__ partial_max,
+    const float* __restrict__ partial_sum,
+    const __half* __restrict__ partial_output,
+    const __nv_bfloat16* __restrict__ query_gate_projection,
+    __nv_bfloat16* __restrict__ output,
+    int pairs,
+    int partitions,
+    int row_base) {
+  const int pair = blockIdx.x * kWarps + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (pair >= pairs) {
+    return;
+  }
+  const size_t first = static_cast<size_t>(pair) * partitions;
+  const int output_row = row_base + pair / kQueryHeads;
+  const int query_head = pair % kQueryHeads;
+  const size_t row_offset =
+      (static_cast<size_t>(output_row) * kQueryHeads + query_head) * kHeadDim;
+  // Гейт от партиций не зависит, и его чтение идёт вместе с первыми: на
+  // decode редукция — цепочка из пары обращений к L2, и третье в конце
+  // стоило бы заметную долю её времени.
+  uint4 gate_raw = make_uint4(0u, 0u, 0u, 0u);
+  if (query_gate_projection != nullptr) {
+    gate_raw = *reinterpret_cast<const uint4*>(
+        query_gate_projection + row_offset * 2 + kHeadDim + lane * 8);
+  }
+
+  float maximum = -CUDART_INF_F;
+  for (int part = lane; part < partitions; part += 32) {
+    if (partial_sum[first + part] > 0.0f) {
+      maximum = fmaxf(maximum, partial_max[first + part]);
+    }
+  }
+  maximum = warp_all_max(maximum);
+  float denominator = 0.0f;
+  for (int part = lane; part < partitions; part += 32) {
+    const float sum = partial_sum[first + part];
+    if (sum > 0.0f) {
+      denominator += sum * __expf(partial_max[first + part] - maximum);
+    }
+  }
+  denominator = warp_all_sum(denominator);
+  const float inverse = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+
+  float value[8] = {};
+  for (int base = 0; base < partitions; base += 32) {
+    float weight = 0.0f;
+    if (base + lane < partitions) {
+      const float sum = partial_sum[first + base + lane];
+      weight = sum > 0.0f
+          ? sum * __expf(partial_max[first + base + lane] - maximum) * inverse
+          : 0.0f;
+    }
+    // Без ветки на пустую партицию: она пишет точные нули, а ветка не даёт
+    // компилятору выдать загрузки раскрученного цикла разом, и проверка
+    // черновиков на P=32 ждала 32 чтения цепочкой.
+    const int count = min(32, partitions - base);
+    const __half* source = partial_output + (first + base) * kHeadDim + lane * 8;
+#pragma unroll 16
+    for (int j = 0; j < count; ++j) {
+      const float share = __shfl_sync(0xffffffffu, weight, j);
+      const uint4 raw = *reinterpret_cast<const uint4*>(source + j * kHeadDim);
+      const __half2* halves = reinterpret_cast<const __half2*>(&raw);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const float2 pairwise = __half22float2(halves[e]);
+        value[2 * e] += pairwise.x * share;
+        value[2 * e + 1] += pairwise.y * share;
+      }
+    }
+  }
+
+  if (query_gate_projection != nullptr) {
+    const __nv_bfloat16* gate = reinterpret_cast<const __nv_bfloat16*>(&gate_raw);
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      value[e] *= 1.0f / (1.0f + __expf(-__bfloat162float(gate[e])));
+    }
+  }
+  __nv_bfloat16 packed[8];
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    packed[e] = __float2bfloat16(value[e]);
+  }
+  *reinterpret_cast<uint4*>(output + row_offset + lane * 8) =
+      *reinterpret_cast<const uint4*>(packed);
+}
+
+// Байт частичных сумм на пару (строка запроса x голова, партиция): max и sum
+// в fp32 и нормированный выход в f16.
+constexpr size_t kPackedPartialBytes = 2 * sizeof(float) + kHeadDim * sizeof(__half);
 
 template <int MTiles>
 cudaError_t launch_packed_attention(
@@ -1865,13 +1984,14 @@ cudaError_t launch_packed_attention(
   }
 
   const size_t partials = static_cast<size_t>(rows) * kQueryHeads * partitions;
-  const size_t required = partials * (kHeadDim + 2) * sizeof(float);
+  const size_t required = partials * kPackedPartialBytes;
   if (workspace == nullptr || workspace_bytes < required) {
     return cudaErrorInvalidValue;
   }
+  // partials кратно 24, и выход в f16 начинается с 16-байтной границы.
   auto* partial_max = static_cast<float*>(workspace);
   auto* partial_sum = partial_max + partials;
-  auto* partial_output = partial_sum + partials;
+  auto* partial_output = reinterpret_cast<__half*>(partial_sum + partials);
   paged_attention_packed_kernel<MTiles, false>
       <<<grid, packed_warps<MTiles>() * 32, shared, stream>>>(
           static_cast<const __nv_bfloat16*>(query),
@@ -1887,11 +2007,11 @@ cudaError_t launch_packed_attention(
   if (launched != cudaSuccess) {
     return launched;
   }
-  const dim3 reduction_grid(kQueryHeads, rows);
-  reduce_partitions_kernel<<<reduction_grid, kThreads, 0, stream>>>(
+  const int pairs = rows * kQueryHeads;
+  reduce_packed_partitions_kernel<<<(pairs + kWarps - 1) / kWarps, kThreads, 0, stream>>>(
       partial_max, partial_sum, partial_output,
       static_cast<const __nv_bfloat16*>(query_gate_projection),
-      static_cast<__nv_bfloat16*>(output), partitions, row_base);
+      static_cast<__nv_bfloat16*>(output), pairs, partitions, row_base);
   return cudaGetLastError();
 }
 

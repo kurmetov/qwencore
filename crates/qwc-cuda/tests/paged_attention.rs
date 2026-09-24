@@ -1091,6 +1091,8 @@ fn packed_segment_matches_cpu() {
     packed_segment_case(4, 6_000, 3, None, None);
     // Одна строка, число партиций не делит контекст.
     packed_segment_case(1, 3_000, 0, Some(7), None);
+    // Партиций больше 32: редукция берёт веса второй порцией дорожек.
+    packed_segment_case(1, 3_000, 0, Some(45), None);
     // Две и пять строк: тайлы на 16 и 32 упакованные строки.
     packed_segment_case(2, 700, 1, None, None);
     packed_segment_case(5, 1_000, 0, Some(3), None);
@@ -1206,6 +1208,10 @@ fn packed_matches_cpu_on_a_sharp_softmax() {
         (8, 200, Some(1)),
         (130, 0, Some(1)),
         (130, 500, Some(3)),
+        // Разбитые формы движка: частичные выходы в f16 сводит редукция,
+        // и у партиций острого softmax сильно разные максимумы.
+        (8, 3_000, Some(40)),
+        (64, 3_000, Some(7)),
     ] {
         let contexts: Vec<u32> = (0..rows).map(|row| (start + row + 1) as u32).collect();
         let max_context = *contexts.iter().max().unwrap() as usize;

@@ -263,10 +263,19 @@ const PACKED_MIN_TOKENS_PER_PARTITION: usize = 4 * PAGE_SIZE;
 /// Постоянные издержки CTA в ключах отрезка: укладка запроса, разгон
 /// конвейера, запись частичных сумм.
 const PACKED_CTA_OVERHEAD_KEYS: usize = 64;
-/// Потолок пар (строка, партиция): держит частичные суммы в 51 МБ. Без него
-/// хвост промпта в полторы тысячи строк просил бы две партиции и 73 МБ ради
-/// выигрыша на хвосте последней волны.
-const PACKED_MAX_PARTIAL_ROWS: usize = 2048;
+/// Потолок пар (строка, партиция): держит частичные суммы в 51 МБ. Выход
+/// партиции лежит в f16, и пар влезает вдвое больше, чем в fp32: 384 и 512
+/// строк берут P=7 — 6 и 8 почти полных волн — вместо P=1 (144 CTA на
+/// 170 SM) и P=4 (4.5 волны, пятая наполовину пуста).
+const PACKED_MAX_PARTIAL_ROWS: usize = 4096;
+/// Байт частичных сумм на пару (строка запроса x голова, партиция): max и
+/// sum в fp32, нормированный выход партиции в f16.
+const PACKED_PARTIAL_BYTES: usize = 2 * size_of::<f32>() + ATTN_HEAD_DIM * size_of::<u16>();
+
+/// Байт частичных сумм упакованного ядра на `rows` строк и `partitions`.
+fn packed_workspace_bytes(rows: usize, partitions: usize) -> usize {
+    if partitions == 1 { 0 } else { rows * NUM_ATTN_HEADS * partitions * PACKED_PARTIAL_BYTES }
+}
 
 /// Чьи строки идут в упакованное ядро.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,7 +349,7 @@ fn packed_split(context: usize, partitions: usize) -> (usize, usize) {
 
 /// Частичные суммы упакованного внимания.
 pub struct PackedAttentionWorkspace {
-    storage: DeviceBuffer<f32>,
+    storage: DeviceBuffer<u8>,
     bytes: usize,
     max_rows: usize,
     max_context: usize,
@@ -363,32 +372,33 @@ impl PackedAttentionWorkspace {
     /// 51 МБ.
     pub fn new(shapes: &[PackedShape], max_rows: usize, max_context: usize) -> Result<Self> {
         assert!(max_rows > 0 && max_context > 0 && !shapes.is_empty());
-        let floats = (1..=max_rows)
+        let bytes = (1..=max_rows)
             .flat_map(|rows| {
                 shapes.iter().map(move |&shape| {
-                    workspace_floats(rows, packed_partition_count(shape, rows, max_context))
+                    packed_workspace_bytes(rows, packed_partition_count(shape, rows, max_context))
                 })
             })
             .max()
             .unwrap_or(0);
-        Self::allocate(floats, max_rows, max_context, None)
+        Self::allocate(bytes, max_rows, max_context, None)
     }
 
     pub fn with_partitions(max_rows: usize, max_context: usize, partitions: usize) -> Result<Self> {
         assert!(max_rows > 0 && max_context > 0);
         assert!((1..=max_context.div_ceil(PAGE_SIZE)).contains(&partitions));
-        Self::allocate(workspace_floats(max_rows, partitions), max_rows, max_context, Some(partitions))
+        let bytes = packed_workspace_bytes(max_rows, partitions);
+        Self::allocate(bytes, max_rows, max_context, Some(partitions))
     }
 
     fn allocate(
-        floats: usize,
+        bytes: usize,
         max_rows: usize,
         max_context: usize,
         forced: Option<usize>,
     ) -> Result<Self> {
         Ok(Self {
-            storage: DeviceBuffer::zeroed(floats.max(1))?,
-            bytes: floats * size_of::<f32>(),
+            storage: DeviceBuffer::zeroed(bytes.max(1))?,
+            bytes,
             max_rows,
             max_context,
             forced,
@@ -437,10 +447,7 @@ pub fn gated_packed(
     stream: &Stream,
 ) -> Result<()> {
     let plan = workspace.plan_for(shape, rows, context);
-    assert!(
-        plan.partitions == 1
-            || workspace.bytes >= workspace_floats(rows, plan.partitions) * size_of::<f32>()
-    );
+    assert!(workspace.bytes >= packed_workspace_bytes(rows, plan.partitions));
     let end = row_base + rows;
     assert!(query.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM);
     assert!(query_gate_projection.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM * 2);
@@ -868,8 +875,11 @@ mod tests {
         // Тайлы по 64 строки — 24 CTA на партицию, и 7 партиций дают 168 CTA:
         // одна почти полная волна или целое их число.
         assert_eq!([64, 128, 192, 256].map(segment_plan), [7, 7, 7, 7]);
+        // 384 и 512 строк — 144 и 192 CTA на партицию: P=7 даёт 6 и 8 почти
+        // полных волн. В fp32 частичные суммы пускали их только до P=5 и P=4.
+        assert_eq!([384, 512].map(segment_plan), [7, 7]);
         // Дальше P упирается в потолок частичных сумм.
-        assert_eq!(segment_plan(512), 4);
+        assert_eq!(segment_plan(1_024), 3);
         assert_eq!(segment_plan(2_048), 1);
         // Короткий контекст не режется мельче четырёх страниц.
         assert_eq!(packed_partition_count(PackedShape::Segment, 4, 1_000), 4);
