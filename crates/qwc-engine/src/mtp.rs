@@ -129,9 +129,19 @@ impl MtpScratch {
     /// Обнуляет KV головы. Нужен при переходе на другую последовательность:
     /// позиции те же, а ключи остались от прежней.
     pub fn reset_cache(&mut self) -> qwc_cuda::Result<()> {
-        let bytes = self.key_cache.len();
-        self.key_cache.zero_range(0, bytes)?;
-        self.value_cache.zero_range(0, bytes)
+        self.truncate_cache(0)
+    }
+
+    /// Обнуляет KV головы начиная со страницы, где лежит позиция `keep`.
+    /// Позиции до неё остаются; хвост страницы до `keep` тоже уходит в ноль,
+    /// это дешевле, чем знать раскладку внутри страницы.
+    pub fn truncate_cache(&mut self, keep: usize) -> qwc_cuda::Result<()> {
+        let page_bytes =
+            PAGE_SIZE * NUM_KV_HEADS * ATTN_HEAD_DIM * self.cache_dtype.bytes_per_element();
+        let start = (keep / PAGE_SIZE * page_bytes).min(self.key_cache.len());
+        let bytes = self.key_cache.len() - start;
+        self.key_cache.zero_range(start, bytes)?;
+        self.value_cache.zero_range(start, bytes)
     }
 
     /// Позиционные таблицы и адрес страницы для строк [0, rows).
@@ -525,8 +535,13 @@ impl Speculator {
     /// Если новый промпт продолжает промпт прежнего владельца — следующий ход
     /// того же диалога, — KV головы на общей части остаётся: пары (h, токен)
     /// там те же. Это важно вместе с кэшем префиксов: закэшированную
-    /// историю движок не прогоняет, и голова её заново не увидит. Возвращает
-    /// длину унаследованной части; 0 — KV сброшен.
+    /// историю движок не прогоняет, и голова её заново не увидит.
+    ///
+    /// Всё за общей частью обнуляется. Иначе два диалога с одним системным
+    /// промптом видели бы за ним KV друг друга — это хуже нулей. Позиция t
+    /// несёт пару (h_t, токен t+1), поэтому последняя общая позиция тоже
+    /// чужая: её пара — с токеном, на котором промпты разошлись. Возвращает
+    /// длину унаследованной части; 0 — KV сброшен целиком.
     pub fn bind_prompt(&mut self, sequence: u32, prompt: &[u32]) -> qwc_cuda::Result<usize> {
         if self.owner == Some(sequence) {
             return Ok(prompt.len());
@@ -537,13 +552,12 @@ impl Speculator {
             .zip(prompt)
             .take_while(|(old, new)| old == new)
             .count();
-        if common == 0 {
-            self.scratch.reset_cache()?;
-        }
+        let keep = common.saturating_sub(1);
+        self.scratch.truncate_cache(keep)?;
         self.owner = Some(sequence);
         self.owner_prompt = prompt.to_vec();
         self.set_context(prompt);
-        Ok(common)
+        Ok(keep)
     }
 
     /// Заполняет KV головы по строкам prefill-шага: строка `first_row + i`

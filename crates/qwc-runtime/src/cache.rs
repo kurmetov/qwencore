@@ -20,9 +20,10 @@
 //! счётчиком ссылок, как у обычного трансформера, но их одних мало: чтобы
 //! продолжить чужой префикс, нужно ещё состояние DeltaNet ровно на его
 //! границе. Поэтому запись кэша — это снимок состояния (bf16, ~76 МБ, лежит у
-//! исполнителя) плюс страницы, покрывающие префикс. Снимок берётся в конце
-//! промпта: в агентном цикле следующий запрос начинается с предыдущего
-//! промпта целиком.
+//! исполнителя) плюс страницы, покрывающие префикс. Снимок берётся на границе
+//! истории, перед последним `<|im_start|>`: промпт генерации в историю
+//! следующего хода не попадает, и снимок в конце промпта никогда не стал бы
+//! чужим префиксом.
 
 use qwc_core::memory::{Budget, CacheConfig};
 use std::collections::HashMap;
@@ -261,14 +262,39 @@ impl PrefixCache {
             .map(|entry| entry.snapshot)
     }
 
-    /// Выбросить самую давно использованную незакреплённую запись.
-    fn evict_one(&mut self, kv: &mut KvPool) -> bool {
+    /// Выбросить наименее ценную незакреплённую запись.
+    ///
+    /// Первыми уходят вложенные записи: их префикс целиком лежит в более
+    /// длинной записи того же диалога. Дальше — записи, чьих страниц не
+    /// держит ни одна живая последовательность: запись идущего запроса нужна
+    /// его следующему ходу, как бы давно её ни трогали. Внутри — по давности.
+    ///
+    /// `for_pages` — вытесняем ради страниц KV, а не слота снимка. Тогда
+    /// запись, все страницы которой держат живые последовательности, не
+    /// трогаем: она ничего не освободит, а кэш потеряет.
+    fn evict_one(&mut self, kv: &mut KvPool, for_pages: bool) -> bool {
+        let mut holders = vec![0u32; kv.capacity()];
+        for entry in &self.entries {
+            for &block in &entry.blocks {
+                holders[block as usize] += 1;
+            }
+        }
+        // Страницу держит кто-то кроме записей — значит, живая последовательность.
+        let live = |block: u32| kv.refs[block as usize] > holders[block as usize];
         let Some(index) = self
             .entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| entry.pins == 0)
-            .min_by_key(|(_, entry)| entry.last_used)
+            .filter(|(_, entry)| !for_pages || !entry.blocks.iter().all(|&block| live(block)))
+            .min_by_key(|(_, entry)| {
+                let superseded = self.entries.iter().any(|other| {
+                    other.tokens.len() > entry.tokens.len()
+                        && other.tokens.starts_with(&entry.tokens)
+                });
+                let in_use = entry.blocks.iter().any(|&block| live(block));
+                (!superseded, in_use, entry.last_used)
+            })
             .map(|(index, _)| index)
         else {
             return false;
@@ -327,7 +353,7 @@ impl CacheManager {
             if self.kv.free_blocks() >= n {
                 return self.kv.acquire(n);
             }
-            if !self.prefix.evict_one(&mut self.kv) {
+            if !self.prefix.evict_one(&mut self.kv, true) {
                 return None;
             }
         }
@@ -504,7 +530,7 @@ impl CacheManager {
         if self.prefix.capacity == 0 {
             return None;
         }
-        if self.prefix.free_snapshots.is_empty() && !self.prefix.evict_one(&mut self.kv) {
+        if self.prefix.free_snapshots.is_empty() && !self.prefix.evict_one(&mut self.kv, false) {
             return None;
         }
         self.prefix.free_snapshots.pop()
@@ -835,6 +861,87 @@ mod tests {
         assert_eq!(m.prefix_stats().evictions, 1);
         m.release(3);
         assert_eq!(m.kv().free_blocks(), total);
+    }
+
+    fn offset_prompt(start: u32, len: usize) -> Vec<u32> {
+        (start..start + len as u32).collect()
+    }
+
+    #[test]
+    fn page_pressure_skips_entry_held_by_live_sequence() {
+        let mut m = CacheManager::new(4, 10, 64);
+        m.enable_prefix_cache(2);
+        // Запись A старше, но все её страницы держит идущий запрос 1: её
+        // вытеснение ничего не освободит, а следующий ход диалога промахнётся.
+        m.admit_prompt(1, &prompt(150)).unwrap();
+        snapshot(&mut m, 1, &prompt(150));
+        let idle = offset_prompt(1000, 150);
+        m.admit_prompt(2, &idle).unwrap();
+        snapshot(&mut m, 2, &idle);
+        m.release(2);
+        assert_eq!(m.kv().free_blocks(), 4);
+
+        m.admit(3, 6 * 64).unwrap();
+        assert_eq!(m.prefix_stats().evictions, 1);
+        assert_eq!(m.prefix_entries(), 1);
+        m.release(3);
+        assert_eq!(m.admit_prompt(4, &prompt(200)).unwrap().reused, 150);
+    }
+
+    #[test]
+    fn page_pressure_fails_without_evicting_live_entries() {
+        let mut m = CacheManager::new(4, 4, 64);
+        m.enable_prefix_cache(1);
+        m.admit_prompt(1, &prompt(150)).unwrap();
+        snapshot(&mut m, 1, &prompt(150));
+        assert!(m.admit(2, 2 * 64).is_err());
+        assert_eq!(m.prefix_entries(), 1);
+        assert_eq!(m.prefix_stats().evictions, 0);
+    }
+
+    #[test]
+    fn snapshot_pressure_keeps_entry_of_running_sequence() {
+        let mut m = CacheManager::new(4, 100, 64);
+        m.enable_prefix_cache(2);
+        m.admit_prompt(1, &prompt(150)).unwrap();
+        snapshot(&mut m, 1, &prompt(150));
+        let idle = offset_prompt(1000, 150);
+        m.admit_prompt(2, &idle).unwrap();
+        snapshot(&mut m, 2, &idle);
+        m.release(2);
+        // Слотов нет: уходит простаивающая запись, хотя она новее.
+        let fresh = offset_prompt(5000, 100);
+        m.admit_prompt(3, &fresh).unwrap();
+        snapshot(&mut m, 3, &fresh);
+        assert_eq!(m.admit_prompt(4, &offset_prompt(1000, 200)).unwrap().reused, 0);
+        assert_eq!(m.admit_prompt(5, &prompt(200)).unwrap().reused, 150);
+    }
+
+    #[test]
+    fn snapshot_pressure_evicts_superseded_entry_first() {
+        let mut m = CacheManager::new(4, 100, 64);
+        m.enable_prefix_cache(2);
+        // Ход N и ход N+1 одного диалога: N целиком лежит внутри N+1.
+        m.admit_prompt(1, &prompt(100)).unwrap();
+        snapshot(&mut m, 1, &prompt(100));
+        m.release(1);
+        let admission = m.admit_prompt(2, &prompt(200)).unwrap();
+        m.finish_restore(admission.restore.unwrap().snapshot);
+        snapshot(&mut m, 2, &prompt(180));
+        m.release(2);
+        // N трогали последним — по давности ушла бы N+1.
+        let mut branch = prompt(100);
+        branch.push(999_999);
+        let admission = m.admit_prompt(3, &branch).unwrap();
+        assert_eq!(admission.reused, 100);
+        m.finish_restore(admission.restore.unwrap().snapshot);
+        m.release(3);
+
+        let other = offset_prompt(5000, 100);
+        m.admit_prompt(4, &other).unwrap();
+        snapshot(&mut m, 4, &other);
+        m.release(4);
+        assert_eq!(m.admit_prompt(5, &prompt(250)).unwrap().reused, 180);
     }
 
     #[test]
