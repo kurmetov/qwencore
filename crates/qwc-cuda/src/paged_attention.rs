@@ -8,6 +8,14 @@ pub const PAGE_SIZE: usize = 64;
 const TARGET_CTAS: usize = 170;
 const QUERY_HEAD_TARGET_CTAS: usize = 340;
 const MIN_TOKENS_PER_PARTITION: usize = 32;
+/// Строк запроса в тайле MMA-ядра префилла и ключей в тайле ключей.
+const FLASH_ROWS: usize = 64;
+const FLASH_KEYS: usize = 32;
+/// Сколько CTA держать в работе на префилле, пока строк мало для сетки.
+const PREFILL_TARGET_CTAS: usize = 340;
+/// Отрезок короче этого не окупает укладку тайла запросов и запись частичных
+/// сумм.
+const PREFILL_MIN_TOKENS_PER_PARTITION: usize = 512;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum KvCacheDtype {
@@ -164,6 +172,83 @@ impl PagedAttentionWorkspace {
 
     pub fn kernel(&self) -> DecodeKernel {
         self.kernel
+    }
+}
+
+/// Партиций контекста для префилльного MMA-ядра на `rows` строк одной
+/// последовательности с контекстом до `context`.
+///
+/// Сетка ядра — 24 CTA на тайл в 64 строки. Пока строк мало (проверка
+/// черновиков, хвост промпта после кэша префиксов, малый чанк), CTA не хватает
+/// на карту, и каждый читает весь контекст один.
+pub fn prefill_partition_count(rows: usize, context: usize) -> usize {
+    assert!(rows > 0 && context > 0);
+    let ctas = NUM_ATTN_HEADS * rows.div_ceil(FLASH_ROWS);
+    let needed = PREFILL_TARGET_CTAS.div_ceil(ctas);
+    let useful = context.div_ceil(PREFILL_MIN_TOKENS_PER_PARTITION);
+    needed.min(useful).max(1)
+}
+
+/// Частичные суммы разбитого префилльного внимания.
+pub struct PrefillAttentionWorkspace {
+    storage: DeviceBuffer<f32>,
+    bytes: usize,
+    max_rows: usize,
+    max_context: usize,
+    /// Число партиций для стендов и тестов; `None` — по строкам и контексту.
+    forced: Option<usize>,
+}
+
+impl PrefillAttentionWorkspace {
+    /// Под любой сегмент до `max_rows` строк с контекстом до `max_context`.
+    pub fn new(max_rows: usize, max_context: usize) -> Result<Self> {
+        assert!(max_rows > 0 && max_context > 0);
+        let floats = (1..=max_rows)
+            .map(|rows| workspace_floats(rows, prefill_partition_count(rows, max_context)))
+            .max()
+            .unwrap_or(0);
+        Self::allocate(floats, max_rows, max_context, None)
+    }
+
+    pub fn with_partitions(max_rows: usize, max_context: usize, partitions: usize) -> Result<Self> {
+        assert!(max_rows > 0 && max_context > 0);
+        assert!((1..=max_context.div_ceil(FLASH_KEYS)).contains(&partitions));
+        let floats = workspace_floats(max_rows, partitions);
+        Self::allocate(floats, max_rows, max_context, Some(partitions))
+    }
+
+    fn allocate(
+        floats: usize,
+        max_rows: usize,
+        max_context: usize,
+        forced: Option<usize>,
+    ) -> Result<Self> {
+        Ok(Self {
+            storage: DeviceBuffer::zeroed(floats.max(1))?,
+            bytes: floats * size_of::<f32>(),
+            max_rows,
+            max_context,
+            forced,
+        })
+    }
+
+    /// Партиции и длина отрезка ключей для сегмента; длина кратна тайлу
+    /// ключей, поэтому партиций может выйти меньше запрошенных.
+    pub fn plan_for(&self, rows: usize, context: usize) -> (usize, usize) {
+        assert!(rows > 0 && rows <= self.max_rows);
+        assert!(context > 0 && context <= self.max_context);
+        let wanted = self
+            .forced
+            .unwrap_or_else(|| prefill_partition_count(rows, context));
+        if wanted == 1 {
+            return (1, 0);
+        }
+        let span = context.div_ceil(wanted).div_ceil(FLASH_KEYS) * FLASH_KEYS;
+        (context.div_ceil(span), span)
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -391,7 +476,7 @@ pub fn prefill_gated(
 }
 
 /// То же самое на тензорных ядрах: QK^T и PV идут через mma.m16n8k16, а не
-/// через варповые редукции.
+/// через варповые редукции. Контекст не разбивается.
 ///
 /// Тайл строк должен лежать в одной последовательности — таблица страниц
 /// берётся у первой строки тайла. Чанк префилла это условие выполняет.
@@ -411,7 +496,93 @@ pub fn prefill_gated_mma(
     cache_dtype: KvCacheDtype,
     stream: &Stream,
 ) -> Result<()> {
+    prefill_mma_impl(
+        query,
+        query_gate_projection,
+        key_cache,
+        value_cache,
+        num_blocks,
+        block_tables,
+        context_lengths,
+        max_blocks_per_sequence,
+        output,
+        rows,
+        row_base,
+        (1, 0),
+        None,
+        cache_dtype,
+        stream,
+    )
+}
+
+/// MMA-префилл с разбиением контекста по партициям, когда строк мало.
+///
+/// `context` — наибольший причинный префикс строк сегмента, то есть позиция
+/// его последней строки плюс один. Число партиций выбирает `workspace` по
+/// строкам и контексту; при одной партиции ответ тот же бит в бит, что у
+/// [`prefill_gated_mma`].
+#[allow(clippy::too_many_arguments)]
+pub fn prefill_gated_mma_split(
+    query: &DeviceBuffer<u16>,
+    query_gate_projection: &DeviceBuffer<u16>,
+    key_cache: &DeviceBuffer<u8>,
+    value_cache: &DeviceBuffer<u8>,
+    num_blocks: usize,
+    block_tables: &DeviceBuffer<u32>,
+    context_lengths: &DeviceBuffer<u32>,
+    max_blocks_per_sequence: usize,
+    output: &mut DeviceBuffer<u16>,
+    rows: usize,
+    row_base: usize,
+    context: usize,
+    workspace: &mut PrefillAttentionWorkspace,
+    cache_dtype: KvCacheDtype,
+    stream: &Stream,
+) -> Result<()> {
+    let plan = workspace.plan_for(rows, context);
+    prefill_mma_impl(
+        query,
+        query_gate_projection,
+        key_cache,
+        value_cache,
+        num_blocks,
+        block_tables,
+        context_lengths,
+        max_blocks_per_sequence,
+        output,
+        rows,
+        row_base,
+        plan,
+        Some(workspace),
+        cache_dtype,
+        stream,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefill_mma_impl(
+    query: &DeviceBuffer<u16>,
+    query_gate_projection: &DeviceBuffer<u16>,
+    key_cache: &DeviceBuffer<u8>,
+    value_cache: &DeviceBuffer<u8>,
+    num_blocks: usize,
+    block_tables: &DeviceBuffer<u32>,
+    context_lengths: &DeviceBuffer<u32>,
+    max_blocks_per_sequence: usize,
+    output: &mut DeviceBuffer<u16>,
+    rows: usize,
+    row_base: usize,
+    (partitions, partition_tokens): (usize, usize),
+    workspace: Option<&mut PrefillAttentionWorkspace>,
+    cache_dtype: KvCacheDtype,
+    stream: &Stream,
+) -> Result<()> {
     assert!(rows > 0);
+    let (workspace_ptr, workspace_bytes) = match workspace {
+        Some(workspace) => (workspace.storage.as_mut_ptr(), workspace.bytes),
+        None => (std::ptr::null_mut(), 0),
+    };
+    assert!(partitions == 1 || workspace_bytes >= workspace_floats(rows, partitions) * size_of::<f32>());
     let end = row_base + rows;
     assert!(query.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM);
     assert!(query_gate_projection.len() >= end * NUM_ATTN_HEADS * ATTN_HEAD_DIM * 2);
@@ -436,9 +607,13 @@ pub fn prefill_gated_mma(
             block_tables.as_ptr(),
             context_lengths.as_ptr(),
             output.as_mut_ptr(),
+            workspace_ptr.cast(),
+            workspace_bytes,
             rows as i32,
             row_base as i32,
             max_blocks_per_sequence as i32,
+            partitions as i32,
+            partition_tokens as i32,
             1.0 / (ATTN_HEAD_DIM as f32).sqrt(),
             stream.raw(),
         )

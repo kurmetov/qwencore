@@ -534,7 +534,15 @@ __device__ __forceinline__ float flash_row_sum(float value) {
   return value + __shfl_xor_sync(0xffffffffu, value, 2);
 }
 
-template <bool Bf16Cache>
+// Разбиение по контексту: grid.z — член GQA-группы и партиция ключей.
+//
+// На малом числе строк сетка без разбиения — 24 CTA на тайл, и каждый читает
+// весь контекст в одиночку: четыре строки проверки черновиков на 30k стоили
+// 5.3 мс на слой против 0.2 мс у decode-строки. С партициями каждый CTA
+// считает свой отрезок ключей и пишет ненормированный числитель, максимум и
+// сумму строки; сводит их reduce_partitions_kernel, как у decode. Direct —
+// одна партиция, сразу в выход: этот путь не менялся.
+template <bool Bf16Cache, bool Direct>
 __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flash_kernel(
     const __nv_bfloat16* __restrict__ query,
     const __nv_bfloat16* __restrict__ query_gate_projection,
@@ -543,13 +551,19 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
     const uint32_t* __restrict__ block_tables,
     const uint32_t* __restrict__ context_lengths,
     __nv_bfloat16* __restrict__ output,
+    float* __restrict__ partial_max,
+    float* __restrict__ partial_sum,
+    float* __restrict__ partial_output,
     int max_blocks,
     int rows,
     int row_base,
+    int partition_tokens,
     float softmax_scale) {
   const int kv_head = blockIdx.x;
   const int tile = blockIdx.y;
-  const int query_head = kv_head * kGroup + blockIdx.z;
+  const int query_head = kv_head * kGroup + blockIdx.z % kGroup;
+  const int partition = blockIdx.z / kGroup;
+  const int partitions = gridDim.z / kGroup;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
   const int grp = lane >> 2;
@@ -601,14 +615,24 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
   float running_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
   float running_sum[2] = {0.0f, 0.0f};
 
-  for (int key_base = 0; key_base < max_context; key_base += kFlashKeys) {
+  // Отрезок ключей партиции. partition_tokens кратен тайлу ключей, поэтому
+  // тайл никогда не пересекает границу отрезка: за ней лежит только конец
+  // контекста, а его маскирует причинный предел строки. Последняя партиция
+  // идёт до конца контекста тайла, даже если хост его недооценил: тогда
+  // пострадает только скорость, а не ответ.
+  const int key_begin = Direct ? 0 : partition * partition_tokens;
+  const int key_end = (Direct || partition == partitions - 1)
+      ? max_context
+      : min(max_context, key_begin + partition_tokens);
+
+  for (int key_base = key_begin; key_base < key_end; key_base += kFlashKeys) {
     __syncthreads();
     for (int i = threadIdx.x * kStageVector; i < kFlashKeys * kHeadDim;
          i += kFlashThreads * kStageVector) {
       const int key = i / kHeadDim;
       const int dimension = i - key * kHeadDim;
       const int token = key_base + key;
-      if (token < max_context) {
+      if (token < key_end) {
         const uint32_t block = table[token / kPageSize];
         const size_t offset =
             cache_offset(block, kv_head, token % kPageSize, dimension);
@@ -735,6 +759,38 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
         mma_m16n8k16(accumulator[t], probability[g], b);
       }
     }
+  }
+
+  if constexpr (!Direct) {
+    // Строки партиций нумеруются от начала сегмента: row_base добавит
+    // редукция, когда будет писать выход.
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      const int r = row0 + grp + half * 8;
+      if (pos == 0 && r < tile_rows) {
+        const size_t slot =
+            (static_cast<size_t>(tile_first + r) * kQueryHeads + query_head) *
+                partitions + partition;
+        partial_max[slot] = running_max[half];
+        partial_sum[slot] = running_sum[half];
+      }
+    }
+#pragma unroll
+    for (int t = 0; t < kFlashDimTiles; ++t) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int r = row0 + grp + (i >= 2 ? 8 : 0);
+        if (r >= tile_rows) {
+          continue;
+        }
+        const int dimension = t * 8 + pos * 2 + (i & 1);
+        const size_t slot =
+            (static_cast<size_t>(tile_first + r) * kQueryHeads + query_head) *
+                partitions + partition;
+        partial_output[slot * kHeadDim + dimension] = accumulator[t][i];
+      }
+    }
+    return;
   }
 
 #pragma unroll
@@ -910,9 +966,11 @@ __global__ __launch_bounds__(kThreads) void reduce_partitions_kernel(
     const float* __restrict__ partial_output,
     const __nv_bfloat16* __restrict__ query_gate_projection,
     __nv_bfloat16* __restrict__ output,
-    int partitions) {
+    int partitions,
+    int row_base) {
   const int query_head = blockIdx.x;
   const int batch = blockIdx.y;
+  const int output_row = row_base + batch;
   const size_t first =
       (static_cast<size_t>(batch) * kQueryHeads + query_head) * partitions;
 
@@ -946,13 +1004,13 @@ __global__ __launch_bounds__(kThreads) void reduce_partitions_kernel(
     }
   }
   const size_t output_offset =
-      (static_cast<size_t>(batch) * kQueryHeads + query_head) * kHeadDim +
+      (static_cast<size_t>(output_row) * kQueryHeads + query_head) * kHeadDim +
       threadIdx.x;
   const float value = denominator > 0.0f ? numerator / denominator : 0.0f;
   output[output_offset] = __float2bfloat16(
       value * output_gate(
                   query_gate_projection,
-                  batch,
+                  output_row,
                   query_head,
                   threadIdx.x));
 }
@@ -1075,7 +1133,7 @@ cudaError_t launch_paged_attention(
   reduce_partitions_kernel<<<reduction_grid, kThreads, 0, stream>>>(
       partial_max, partial_sum, partial_output,
       static_cast<const __nv_bfloat16*>(query_gate_projection),
-      static_cast<__nv_bfloat16*>(output), partitions);
+      static_cast<__nv_bfloat16*>(output), partitions, 0);
   return cudaGetLastError();
 }
 
@@ -1127,26 +1185,67 @@ cudaError_t launch_prefill_attention_mma(
     const void* block_tables,
     const void* context_lengths,
     void* output,
+    void* workspace,
+    size_t workspace_bytes,
     int rows,
     int row_base,
     int max_blocks,
+    int partitions,
+    int partition_tokens,
     float softmax_scale,
     cudaStream_t stream) {
   if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
       block_tables == nullptr || context_lengths == nullptr ||
-      output == nullptr || rows <= 0 || row_base < 0 || max_blocks <= 0) {
+      output == nullptr || rows <= 0 || row_base < 0 || max_blocks <= 0 ||
+      partitions <= 0 || partitions * kGroup > 65535 ||
+      (partitions > 1 &&
+       (partition_tokens <= 0 || partition_tokens % kFlashKeys != 0))) {
     return cudaErrorInvalidValue;
   }
   const size_t shared = flash_shared_bytes();
-  static const cudaError_t opted = cudaFuncSetAttribute(
-      paged_attention_prefill_flash_kernel<Bf16Cache>,
+  static const cudaError_t opted_direct = cudaFuncSetAttribute(
+      paged_attention_prefill_flash_kernel<Bf16Cache, true>,
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       static_cast<int>(shared));
-  if (opted != cudaSuccess) {
-    return opted;
+  static const cudaError_t opted_split = cudaFuncSetAttribute(
+      paged_attention_prefill_flash_kernel<Bf16Cache, false>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(shared));
+  if (opted_direct != cudaSuccess) {
+    return opted_direct;
   }
-  const dim3 grid(kKvHeads, (rows + kFlashRows - 1) / kFlashRows, kGroup);
-  paged_attention_prefill_flash_kernel<Bf16Cache>
+  if (opted_split != cudaSuccess) {
+    return opted_split;
+  }
+  const dim3 grid(kKvHeads, (rows + kFlashRows - 1) / kFlashRows, kGroup * partitions);
+  if (partitions == 1) {
+    paged_attention_prefill_flash_kernel<Bf16Cache, true>
+        <<<grid, kFlashThreads, shared, stream>>>(
+            static_cast<const __nv_bfloat16*>(query),
+            static_cast<const __nv_bfloat16*>(query_gate_projection),
+            key_cache,
+            value_cache,
+            static_cast<const uint32_t*>(block_tables),
+            static_cast<const uint32_t*>(context_lengths),
+            static_cast<__nv_bfloat16*>(output),
+            nullptr, nullptr, nullptr,
+            max_blocks,
+            rows,
+            row_base,
+            0,
+            softmax_scale);
+    return cudaGetLastError();
+  }
+
+  const size_t partials = static_cast<size_t>(rows) * kQueryHeads * partitions;
+  const size_t required = partials * (kHeadDim + 2) * sizeof(float);
+  if (workspace == nullptr || workspace_bytes < required) {
+    return cudaErrorInvalidValue;
+  }
+  auto* partial_max = static_cast<float*>(workspace);
+  auto* partial_sum = partial_max + partials;
+  auto* partial_output = partial_sum + partials;
+  paged_attention_prefill_flash_kernel<Bf16Cache, false>
       <<<grid, kFlashThreads, shared, stream>>>(
           static_cast<const __nv_bfloat16*>(query),
           static_cast<const __nv_bfloat16*>(query_gate_projection),
@@ -1155,10 +1254,21 @@ cudaError_t launch_prefill_attention_mma(
           static_cast<const uint32_t*>(block_tables),
           static_cast<const uint32_t*>(context_lengths),
           static_cast<__nv_bfloat16*>(output),
+          partial_max, partial_sum, partial_output,
           max_blocks,
           rows,
           row_base,
+          partition_tokens,
           softmax_scale);
+  const cudaError_t launched = cudaGetLastError();
+  if (launched != cudaSuccess) {
+    return launched;
+  }
+  const dim3 reduction_grid(kQueryHeads, rows);
+  reduce_partitions_kernel<<<reduction_grid, kThreads, 0, stream>>>(
+      partial_max, partial_sum, partial_output,
+      static_cast<const __nv_bfloat16*>(query_gate_projection),
+      static_cast<__nv_bfloat16*>(output), partitions, row_base);
   return cudaGetLastError();
 }
 
@@ -1172,15 +1282,19 @@ extern "C" cudaError_t qwc_paged_attention_prefill_mma_bf16(
     const void* block_tables,
     const void* context_lengths,
     void* output,
+    void* workspace,
+    size_t workspace_bytes,
     int rows,
     int row_base,
     int max_blocks,
+    int partitions,
+    int partition_tokens,
     float softmax_scale,
     cudaStream_t stream) {
   return launch_prefill_attention_mma<true>(
       query, query_gate_projection, key_cache, value_cache, block_tables,
-      context_lengths, output, rows, row_base, max_blocks, softmax_scale,
-      stream);
+      context_lengths, output, workspace, workspace_bytes, rows, row_base,
+      max_blocks, partitions, partition_tokens, softmax_scale, stream);
 }
 
 extern "C" cudaError_t qwc_paged_attention_prefill_mma_fp8(
@@ -1191,15 +1305,19 @@ extern "C" cudaError_t qwc_paged_attention_prefill_mma_fp8(
     const void* block_tables,
     const void* context_lengths,
     void* output,
+    void* workspace,
+    size_t workspace_bytes,
     int rows,
     int row_base,
     int max_blocks,
+    int partitions,
+    int partition_tokens,
     float softmax_scale,
     cudaStream_t stream) {
   return launch_prefill_attention_mma<false>(
       query, query_gate_projection, key_cache, value_cache, block_tables,
-      context_lengths, output, rows, row_base, max_blocks, softmax_scale,
-      stream);
+      context_lengths, output, workspace, workspace_bytes, rows, row_base,
+      max_blocks, partitions, partition_tokens, softmax_scale, stream);
 }
 
 extern "C" cudaError_t qwc_paged_attention_prefill_bf16(
