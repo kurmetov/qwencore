@@ -252,14 +252,17 @@ impl PrefillAttentionWorkspace {
     }
 }
 
-/// Больше строк запроса в тайле упакованного ядра не бывает: 10 строк по
-/// 6 голов — 60 из 64 строк MMA-тайла.
-pub const PACKED_MAX_TILE_ROWS: usize = 64 / GQA_GROUP;
+/// Упакованных строк (строка запроса x голова группы) в тайле упакованного
+/// ядра не больше четырёх m16-тайлов.
+const PACKED_MAX_TILE_SIZE: usize = 64;
 /// SM у RTX 5090: упакованное ядро держит один CTA на SM, shared у него
 /// 72-98 КиБ.
 const PACKED_SMS: usize = 170;
 /// Четыре страницы: короче отрезок не окупает запись частичных сумм.
 const PACKED_MIN_TOKENS_PER_PARTITION: usize = 4 * PAGE_SIZE;
+/// Постоянные издержки CTA в ключах отрезка: укладка запроса, разгон
+/// конвейера, запись частичных сумм.
+const PACKED_CTA_OVERHEAD_KEYS: usize = 64;
 /// Потолок пар (строка, партиция): держит частичные суммы в 51 МБ. Без него
 /// хвост промпта в полторы тысячи строк просил бы две партиции и 73 МБ ради
 /// выигрыша на хвосте последней волны.
@@ -276,21 +279,22 @@ pub enum PackedShape {
     Segment,
 }
 
-/// Строк запроса в тайле упакованного ядра.
-pub fn packed_tile_rows(shape: PackedShape, rows: usize) -> usize {
+/// Упакованных строк в тайле упакованного ядра.
+pub fn packed_tile_size(shape: PackedShape, rows: usize) -> usize {
     assert!(rows > 0);
     match shape {
-        PackedShape::Rows => 1,
-        // До пяти строк сегмент ложится в один тайл на 16 или 32 строки
-        // целиком; дальше — тайлы по 64.
-        PackedShape::Segment if rows * GQA_GROUP <= 32 => rows,
-        PackedShape::Segment => PACKED_MAX_TILE_ROWS,
+        // Тайл — одна строка: у соседней своя таблица страниц.
+        PackedShape::Rows => GQA_GROUP,
+        // Строки сегмента делят таблицу, и тайл режется по упакованным строкам
+        // без оглядки на границы строк запроса. До пяти строк сегмент ложится
+        // в один тайл на 16 или 32 строки.
+        PackedShape::Segment => (rows * GQA_GROUP).min(PACKED_MAX_TILE_SIZE),
     }
 }
 
-/// m16-тайлов в тайле упакованного ядра на `tile_rows` строк.
-fn packed_m_tiles(tile_rows: usize) -> usize {
-    match tile_rows * GQA_GROUP {
+/// m16-тайлов в тайле упакованного ядра на `tile_size` упакованных строк.
+fn packed_m_tiles(tile_size: usize) -> usize {
+    match tile_size {
         0..=16 => 1,
         17..=32 => 2,
         _ => 4,
@@ -301,36 +305,37 @@ fn packed_m_tiles(tile_rows: usize) -> usize {
 /// `context`. Числа — `packedbench --sweep`, 16 слоёв, fp8.
 pub fn packed_partition_count(shape: PackedShape, rows: usize, context: usize) -> usize {
     assert!(rows > 0 && context > 0);
-    let tile_rows = packed_tile_rows(shape, rows);
-    let ctas = NUM_KV_HEADS * rows.div_ceil(tile_rows);
-    let wanted = if packed_m_tiles(tile_rows) < 4 {
+    let tile_size = packed_tile_size(shape, rows);
+    let ctas = NUM_KV_HEADS * (rows * GQA_GROUP).div_ceil(tile_size);
+    let most = context
+        .div_ceil(PACKED_MIN_TOKENS_PER_PARTITION)
+        .min(PACKED_MAX_PARTIAL_ROWS / rows)
+        .max(1);
+    if packed_m_tiles(tile_size) < 4 {
         // Один-два m-тайла упираются в полосу памяти, и её насыщают 64 CTA на
         // m-тайл; лишние партиции только пишут частичные суммы. Decode на 60k:
         // P=16 — 84 мкс, P=42 — 91; проверка 4 строк на 30k: P=32 — 50, P=16 — 70.
-        (64 * packed_m_tiles(tile_rows)).div_ceil(ctas)
-    } else if PACKED_SMS / ctas >= 16 {
-        // Тайлов мало: одна полная волна. 8 строк на 60k: P=42 — 117 мкс,
-        // P=64 — 150, там уже вторая волна.
-        PACKED_SMS / ctas
-    } else {
-        // Упор в тензорные ядра. CTA на SM один, и разгон следующего CTA ничем
-        // не перекрыт, поэтому одна длинная волна проигрывает нескольким
-        // коротким: 512 строк на 60k — P=1 7.65 мс, P=4 (4.9 волны) 4.80.
-        // Берём от 3.5 до 6 волн с самой полной последней.
-        let lowest = (7 * PACKED_SMS).div_ceil(2 * ctas).max(1);
-        let highest = (6 * PACKED_SMS / ctas).max(lowest);
-        (lowest..=highest)
-            .max_by_key(|&partitions| {
-                let total = ctas * partitions;
-                let filled = total * 1000 / (total.div_ceil(PACKED_SMS) * PACKED_SMS);
-                (filled, std::cmp::Reverse(partitions))
-            })
-            .unwrap()
-    };
-    wanted
-        .min(context.div_ceil(PACKED_MIN_TOKENS_PER_PARTITION))
-        .min(PACKED_MAX_PARTIAL_ROWS / rows)
-        .max(1)
+        return (64 * packed_m_tiles(tile_size)).div_ceil(ctas).min(most);
+    }
+    // Тайл в 64 строки упирается в тензорные ядра, CTA на SM один, и каждая
+    // начатая волна стоит целую. Время — волны x (отрезок + издержки CTA);
+    // издержки подогнаны по плотному свипу (`packedbench --dense`): 64 ключа.
+    // Лучшее P модель угадывает на 28 формах из 36, в среднем промах 1.8%;
+    // прежнее правило «3.5-6 волн» промахивалось на 14%, до 53%. 64 строки
+    // на 8k: P=7 (168 CTA, одна волна) — 81 мкс, P=28 — 109.
+    (1..=most)
+        .min_by_key(|&partitions| {
+            let (used, span) = packed_split(context, partitions);
+            (ctas * used).div_ceil(PACKED_SMS) * (span + PACKED_CTA_OVERHEAD_KEYS)
+        })
+        .unwrap()
+}
+
+/// Сколько партиций получат ключи и какой длины отрезок, если контекст
+/// `context` режется на `partitions`: ядро округляет отрезок до страницы.
+fn packed_split(context: usize, partitions: usize) -> (usize, usize) {
+    let span = context.div_ceil(partitions * PAGE_SIZE) * PAGE_SIZE;
+    (context.div_ceil(span), span)
 }
 
 /// Частичные суммы упакованного внимания.
@@ -347,7 +352,8 @@ pub struct PackedAttentionWorkspace {
 /// фактическому контексту тайла.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackedPlan {
-    pub tile_rows: usize,
+    /// Упакованных строк в тайле.
+    pub tile_size: usize,
     pub partitions: usize,
 }
 
@@ -396,7 +402,7 @@ impl PackedAttentionWorkspace {
         let partitions = self
             .forced
             .unwrap_or_else(|| packed_partition_count(shape, rows, context));
-        PackedPlan { tile_rows: packed_tile_rows(shape, rows), partitions }
+        PackedPlan { tile_size: packed_tile_size(shape, rows), partitions }
     }
 
     pub fn bytes(&self) -> usize {
@@ -458,7 +464,7 @@ pub fn gated_packed(
             rows as i32,
             row_base as i32,
             max_blocks_per_sequence as i32,
-            plan.tile_rows as i32,
+            plan.tile_size as i32,
             plan.partitions as i32,
             1.0 / (ATTN_HEAD_DIM as f32).sqrt(),
             stream.raw(),
@@ -857,9 +863,12 @@ mod tests {
         let segment_plan = |rows| packed_partition_count(PackedShape::Segment, rows, 60_000);
         assert_eq!(segment_plan(1), 16);
         assert_eq!(segment_plan(4), 32);
-        assert_eq!(segment_plan(8), 42);
-        assert_eq!(segment_plan(64), 24);
-        assert_eq!(segment_plan(256), 8);
+        // Один тайл: полная волна из 164 CTA.
+        assert_eq!(segment_plan(8), 41);
+        // Тайлы по 64 строки — 24 CTA на партицию, и 7 партиций дают 168 CTA:
+        // одна почти полная волна или целое их число.
+        assert_eq!([64, 128, 192, 256].map(segment_plan), [7, 7, 7, 7]);
+        // Дальше P упирается в потолок частичных сумм.
         assert_eq!(segment_plan(512), 4);
         assert_eq!(segment_plan(2_048), 1);
         // Короткий контекст не режется мельче четырёх страниц.

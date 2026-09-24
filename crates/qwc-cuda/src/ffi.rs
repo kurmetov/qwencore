@@ -534,7 +534,7 @@ unsafe extern "C" {
         rows: c_int,
         row_base: c_int,
         max_blocks: c_int,
-        tile_rows: c_int,
+        tile_size: c_int,
         partitions: c_int,
         softmax_scale: f32,
         stream: Stream,

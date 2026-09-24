@@ -1,12 +1,13 @@
 //! Упакованное внимание против прежних путей на формах `flashinfer_attention.py`.
-//! `cargo run --release -p qwc-cuda --bin packedbench [-- --sweep]`
+//! `cargo run --release -p qwc-cuda --bin packedbench [-- --sweep] [--rows 64,128]`
 //!
 //! Сегмент — `rows` строк одной последовательности за историей `start`:
 //! проверка черновиков, хвост промпта, чанк. Прежний путь движка для него —
 //! MMA-префилл без разбиения (`prefill_gated_mma`). Decode — `batch`
 //! строк разных последовательностей с контекстом `context`, прежний путь —
 //! `decode_gated`. Слои держат отдельные кэши, иначе контекст осел бы в L2.
-//! `--sweep` добавляет свип числа партиций упакованного ядра.
+//! `--sweep` добавляет свип числа партиций упакованного ядра, `--rows`
+//! оставляет только сегменты этих размеров и пропускает decode.
 
 use qwc_core::arch::{ATTN_HEAD_DIM, NUM_ATTN_HEADS, NUM_FULL_LAYERS, NUM_KV_HEADS};
 use qwc_cuda::paged_attention::{
@@ -78,8 +79,19 @@ fn inputs(contexts: &[u32], tables: &[u32]) -> Inputs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let sweep = std::env::args().any(|arg| arg == "--sweep");
-    let forced = [2usize, 4, 8, 16, 24, 32, 42, 64];
+    let arguments: Vec<String> = std::env::args().collect();
+    let sweep = arguments.iter().any(|arg| arg == "--sweep");
+    let only_rows: Option<Vec<usize>> = arguments
+        .iter()
+        .position(|arg| arg == "--rows")
+        .map(|at| arguments[at + 1].split(',').map(|rows| rows.parse().unwrap()).collect());
+    // `--dense`: все P от 1 до 48 — для подгонки выбора партиций.
+    let dense = arguments.iter().any(|arg| arg == "--dense");
+    let forced: Vec<usize> = if dense {
+        (1..=48).collect()
+    } else {
+        vec![2, 4, 8, 12, 16, 20, 24, 28, 32, 42, 64]
+    };
     let device = Device::init(0)?;
     let stream = Stream::new()?;
     println!(
@@ -90,23 +102,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Сегмент одной последовательности");
     print!("  {:>5} | {:>6} | {:>14} | {:>14}", "строк", "старт", "MMA", "упакованное");
     if sweep {
-        for partitions in forced {
+        for &partitions in &forced {
             print!(" | {:>7}", format!("P={partitions}"));
         }
     }
     println!();
-    for start in [8_192usize, 30_000, 60_000] {
+    let starts: Vec<usize> = if dense { vec![8_192, 16_384, 30_000, 60_000] } else { vec![8_192, 30_000, 60_000] };
+    for start in starts {
         let max_context = start + 2_048;
         let max_blocks = max_context.div_ceil(PAGE_SIZE);
         let caches = caches(max_blocks);
-        for rows in [1usize, 4, 8, 64, 128, 256, 512, 2_048] {
+        let segment_rows = only_rows.clone().unwrap_or(vec![1, 4, 8, 64, 128, 256, 512, 2_048]);
+        for rows in segment_rows {
             let contexts: Vec<u32> = (0..rows).map(|row| (start + row + 1) as u32).collect();
             let context = start + rows;
             let one_table: Vec<u32> = (0..max_blocks as u32).collect();
             let tables: Vec<u32> = (0..rows).flat_map(|_| one_table.clone()).collect();
             let mut data = inputs(&contexts, &tables);
 
-            let old = time(
+            let old = if dense { f64::NAN } else { time(
                 &stream,
                 |key, value| {
                     paged_attention::prefill_gated_mma(
@@ -116,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                 },
                 &caches,
-            );
+            ) };
             let mut run_packed = |workspace: &mut PackedAttentionWorkspace| {
                 time(
                     &stream,
@@ -141,7 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{new:.1} (P={})", plan.partitions)
             );
             if sweep {
-                for partitions in forced {
+                for &partitions in &forced {
                     if partitions > context.div_ceil(PAGE_SIZE) {
                         print!(" | {:>7}", "-");
                         continue;
@@ -155,10 +169,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    if only_rows.is_some() {
+        return Ok(());
+    }
     println!("\nDecode: строки разных последовательностей");
     print!("  {:>5} | {:>7} | {:>14} | {:>14}", "batch", "контекст", "decode_gated", "упакованное");
     if sweep {
-        for partitions in forced {
+        for &partitions in &forced {
             print!(" | {:>7}", format!("P={partitions}"));
         }
     }
@@ -221,7 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("{new:.1} (P={})", plan.partitions)
         );
         if sweep {
-            for partitions in forced {
+            for &partitions in &forced {
                 if partitions > context.div_ceil(PAGE_SIZE) {
                     print!(" | {:>7}", "-");
                     continue;
