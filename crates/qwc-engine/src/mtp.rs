@@ -105,7 +105,7 @@ impl MtpScratch {
             query: DeviceBuffer::zeroed(rows * Q_PROJ_DIM)?,
             attention_out: DeviceBuffer::zeroed(rows * Q_PROJ_DIM)?,
             attention_workspace: PagedAttentionWorkspace::new(rows, max_context)?,
-            packed_workspace: PackedAttentionWorkspace::new(&[PackedShape::Rows], rows, max_context)?,
+            packed_workspace: PackedAttentionWorkspace::new(&[PackedShape::Segment], rows, max_context)?,
             mlp_gate: DeviceBuffer::zeroed(rows * INTERMEDIATE_SIZE)?,
             mlp_up: DeviceBuffer::zeroed(rows * INTERMEDIATE_SIZE)?,
             mlp_hidden: DeviceBuffer::zeroed(rows * INTERMEDIATE_SIZE)?,
@@ -261,6 +261,11 @@ pub fn draft(
     )?;
     let max_context = positions.iter().max().copied().unwrap_or(0) as usize + 1;
     if scratch.cache_dtype == KvCacheDtype::Fp8 {
+        // Строки вызова — всегда одна последовательность: KV у скретча один,
+        // и `upload` даёт всем строкам одну таблицу страниц. Поэтому форма —
+        // сегмент: шесть голов восьми строк прогрева идут одним тайлом и
+        // читают KV один раз, а не восемь. Маска у каждой строки своя, по её
+        // позиции.
         paged_attention::gated_packed(
             &scratch.query,
             &scratch.query_gate,
@@ -271,7 +276,7 @@ pub fn draft(
             &scratch.context_lengths,
             scratch.max_blocks,
             &mut scratch.attention_out,
-            PackedShape::Rows,
+            PackedShape::Segment,
             rows,
             0,
             max_context,
