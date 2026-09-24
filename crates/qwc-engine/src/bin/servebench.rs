@@ -32,6 +32,9 @@ struct Args {
     delta_state: DeltaStateMode,
     speculative: usize,
     shortlist: usize,
+    /// Сколько последних позиций промпта MTP-голова прогоняет на префилле,
+    /// чтобы её KV не был пустым: 0 — ни одной, `usize::MAX` — весь промпт.
+    mtp_prime: usize,
     corpus: Option<PathBuf>,
 }
 
@@ -167,6 +170,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Для какой последовательности в спекуляторе лежит актуальное скрытое
     // состояние. Пока его нет, шаг идёт обычным путём и заодно его добывает.
     let mut hidden_for: Option<SeqId> = None;
+    // Токены, чьи строки лежат в `spec.hidden`, в порядке позиций: после
+    // обычного шага — один ожидающий, после проверки — все принятые плюс
+    // исправленный. Первый черновой проход пишет их KV настоящими h.
+    let mut head_tokens: Vec<u32> = Vec::new();
+    let mut prime_ms = 0.0f64;
     let mut speculative_steps = 0usize;
     let mut speculative_tokens = 0usize;
     // Сколько черновиков принято на шаге, по длинам: без этого «acceptance»
@@ -212,6 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let id = batch.decode[0];
             let token = *pending.get(&id).ok_or("decode token is missing")?;
             let position = layout.position_starts[0] as usize;
+            debug_assert_eq!(head_tokens.last(), Some(&token));
             let state_slot = layout.state_slots[0] as usize;
             if spec.bind(id)? {
                 // Новая последовательность — шортлисту нужен её промпт.
@@ -219,7 +228,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let draft_started = Instant::now();
-            let drafts = spec.draft_chain(&weights, token, position, depth)?;
+            let first = position + 1 - head_tokens.len();
+            let drafts = spec.draft_chain(&weights, &head_tokens, first, depth)?;
             draft_ms += draft_started.elapsed().as_secs_f64() * 1e3;
             // Проверка пишет KV всем строкам разом, поэтому страницы под них
             // нужны заранее. Если пул не дал — черновик просто короче.
@@ -250,7 +260,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rows = accepted + 1;
             executor.commit_speculation(&weights, rows_in.len(), rows, state_slot)?;
             scheduler.release_extra(id, reserved - accepted)?;
-            executor.copy_prefill_hidden_row(rows - 1, spec.hidden_mut())?;
+            // Строки 0..rows проверки несут настоящие h для принятых позиций
+            // и для исправленной: следующий черновик перепишет ими KV головы.
+            executor.copy_prefill_hidden_rows(0, rows, spec.hidden_mut())?;
+            head_tokens.clear();
+            head_tokens.extend_from_slice(&truth[..rows]);
 
             let now = Instant::now();
             first_token_ms
@@ -292,7 +306,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             *produced.entry(id).or_insert(0) += 1;
         }
 
-        for (id, token) in executor.execute_layout(&weights, &layout, &input)? {
+        let sampled = executor.execute_layout(&weights, &layout, &input)?;
+        // Голова заполняет свой KV по промпту: без этого на промпте у неё
+        // нули, и acceptance проседает с 0.91 до 0.85. Обслуживает она одну
+        // последовательность, поэтому только в шаге с единственным чанком.
+        if let Some(spec) = speculator.as_mut()
+            && args.mtp_prime > 0
+            && let [chunk] = batch.prefill.as_slice()
+        {
+            let prompt = &prompts[&chunk.id];
+            let row = layout
+                .seq_ids
+                .iter()
+                .position(|&id| id == chunk.id)
+                .ok_or("prefill chunk is missing from the layout")?;
+            let row_begin = layout.token_offsets[row] as usize;
+            let window_start = prompt.len().saturating_sub(args.mtp_prime);
+            let begin = chunk.offset.max(window_start);
+            let end = chunk.offset + chunk.tokens;
+            if begin < end {
+                // Пара строки t — (h_t, токен t+1). Для последней позиции
+                // промпта токен t+1 — тот, что шаг только что выдал.
+                let mut next = Vec::with_capacity(end - begin);
+                for t in begin..end {
+                    next.push(match prompt.get(t + 1) {
+                        Some(&token) => token,
+                        None => sampled
+                            .iter()
+                            .find(|(id, _)| *id == chunk.id)
+                            .map(|&(_, token)| token)
+                            .ok_or("prefill produced no token")?,
+                    });
+                }
+                if spec.bind(chunk.id)? {
+                    spec.set_context(prompt);
+                }
+                let prime_started = Instant::now();
+                spec.prime(&weights, &executor, row_begin + begin - chunk.offset, &next, begin + 1)?;
+                prime_ms += prime_started.elapsed().as_secs_f64() * 1e3;
+            }
+        }
+        for (id, token) in sampled {
             let now = Instant::now();
             first_token_ms
                 .entry(id)
@@ -311,6 +365,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             executor.copy_decode_hidden_row(0, spec.hidden_mut())?;
             hidden_for = Some(batch.decode[0]);
+            head_tokens.clear();
+            head_tokens.push(*pending.get(&batch.decode[0]).ok_or("decode token is missing")?);
         }
 
         // A step is one forward pass now, mixed or not.
@@ -329,7 +385,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\"load_seconds\":{:.3},\"cache_gb\":{:.2},\"kv_pool_blocks\":{},\"engine_steps\":{},\"weight_passes\":{},",
             "\"speculative\":{},\"speculative_steps\":{},\"speculative_tokens\":{},",
             "\"accept_histogram\":{:?},",
-            "\"draft_ms_total\":{:.1},\"verify_ms_total\":{:.1},",
+            "\"draft_ms_total\":{:.1},\"verify_ms_total\":{:.1},\"prime_ms_total\":{:.1},",
+            "\"mtp_prime\":\"{}\",",
             "\"prompts\":\"{}\",\"memory_limit_gb\":{:.2},\"shortlist\":{},",
             "\"prefill_chunk\":{},\"delta_state\":\"{}\",\"cuda_graphs\":true,",
             "\"wall_seconds\":{:.4},\"output_tokens\":{},",
@@ -355,6 +412,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         accept_histogram,
         draft_ms,
         verify_ms,
+        prime_ms,
+        match args.mtp_prime {
+            0 => "off".to_string(),
+            usize::MAX => "all".to_string(),
+            window => window.to_string(),
+        },
         args.corpus
             .as_deref()
             .map(|path| path.display().to_string())
@@ -470,6 +533,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     // 0 — полная проекция в словарь; иначе столько первых строк словаря
     // держатся в шортлисте всегда, сверх токенов контекста.
     let mut shortlist = 0usize;
+    let mut mtp_prime = usize::MAX;
     let mut delta_state = DeltaStateMode::Wy;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -480,6 +544,13 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
                 shortlist = args.next().ok_or("--shortlist")?.parse()?;
                 if shortlist > VOCAB_SIZE {
                     return Err("--shortlist не может быть больше словаря".into());
+                }
+            }
+            "--mtp-prime" => {
+                mtp_prime = match args.next().ok_or("--mtp-prime needs all, off or N")?.as_str() {
+                    "all" => usize::MAX,
+                    "off" => 0,
+                    window => window.parse()?,
                 }
             }
             "--requests" => requests = args.next().ok_or("--requests")?.parse()?,
@@ -561,6 +632,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
         kv_cache_bytes,
         speculative,
         shortlist,
+        mtp_prime,
         kv_cache,
         delta_state,
         corpus,

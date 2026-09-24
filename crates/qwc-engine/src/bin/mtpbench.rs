@@ -53,6 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut corpus = PathBuf::from("bench/corpus/core.jsonl");
     let mut max_new = 128usize;
     let mut context = 4096usize;
+    // Прогонять голову по промпту до первого черновика: без этого её KV на
+    // промпте пустой. `--no-prime` возвращает прежний замер для A/B.
+    let mut prime = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -60,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--corpus" => corpus = PathBuf::from(args.next().ok_or("--corpus")?),
             "--max-new" => max_new = args.next().ok_or("--max-new")?.parse()?,
             "--context" => context = args.next().ok_or("--context")?.parse()?,
+            "--no-prime" => prime = false,
             other => return Err(format!("неизвестный аргумент: {other}").into()),
         }
     }
@@ -73,9 +77,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_context: context,
     })?;
     let stream = Stream::new()?;
-    let mut scratch = MtpScratch::new(1, context, KvCacheDtype::Fp8)?;
-    let mut hidden = DeviceBuffer::<u16>::zeroed(HIDDEN_SIZE)?;
-    let mut draft_hidden = DeviceBuffer::<u16>::zeroed(HIDDEN_SIZE)?;
+    let rows = qwc_cuda::mtp::MAX_ROWS;
+    let mut scratch = MtpScratch::new(rows, context, KvCacheDtype::Fp8)?;
+    let mut hidden = DeviceBuffer::<u16>::zeroed(rows * HIDDEN_SIZE)?;
+    let mut draft_hidden = DeviceBuffer::<u16>::zeroed(rows * HIDDEN_SIZE)?;
     let mut draft_logits = DeviceBuffer::<f32>::zeroed(VOCAB_SIZE)?;
     let mut argmax = qwc_cuda::sampling::Argmax::new(1, VOCAB_SIZE)?;
     println!(
@@ -93,8 +98,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert!(prompt.len() <= PREFILL_CHUNK_SIZE, "{id}: промпт длиннее чанка");
         assert!(prompt.len() + max_new <= context);
         // Новый прогон — своя история у головы: KV-кэш черновика обнуляется.
-        scratch = MtpScratch::new(1, context, KvCacheDtype::Fp8)?;
+        scratch = MtpScratch::new(rows, context, KvCacheDtype::Fp8)?;
         executor.prefill_sequence(&weights, prompt, 0, 0)?;
+        if prime {
+            // Пары (h_t, токен t+1) для всех позиций промпта, кроме последней:
+            // её токен t+1 модель ещё не выдала, это первый черновик ниже.
+            let pairs = prompt.len() - 1;
+            for begin in (0..pairs).step_by(rows) {
+                let count = rows.min(pairs - begin);
+                executor.copy_prefill_hidden_rows(begin, count, &mut hidden)?;
+                let positions: Vec<u32> = (begin..begin + count).map(|t| t as u32).collect();
+                mtp::draft(&head, &weights, &mut scratch, &hidden,
+                           &prompt[begin + 1..begin + 1 + count], &positions,
+                           &mut draft_hidden, &stream)?;
+                stream.synchronize()?;
+            }
+        }
         let mut next = executor.argmax_to_host(1)?;
         let (mut case_hits, mut case_total) = (0usize, 0usize);
         let mut predicted: Option<u32> = None;

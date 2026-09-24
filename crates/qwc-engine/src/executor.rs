@@ -1954,6 +1954,28 @@ impl Executor {
         copy_hidden_row(&self.prefill.normed, row, destination, &self.stream)
     }
 
+    /// Строки `[first, first + count)` последнего prefill-шага подряд в
+    /// `destination`. Ими MTP-голова заполняет свой KV по промпту и по
+    /// принятым позициям проверки. Копия ждёт завершения: читать её будет
+    /// поток спекулятора, а не этот.
+    pub fn copy_prefill_hidden_rows(
+        &self,
+        first: usize,
+        count: usize,
+        destination: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        assert!((first + count) * HIDDEN_SIZE <= self.prefill.normed.len());
+        assert!(destination.len() >= count * HIDDEN_SIZE);
+        destination.copy_from_device_at(
+            0,
+            &self.prefill.normed,
+            first * HIDDEN_SIZE,
+            count * HIDDEN_SIZE,
+            &self.stream,
+        )?;
+        self.stream.synchronize()
+    }
+
     /// Скрытые состояния после финальной нормы — ровно тот тензор, который
     /// уходит в `lm_head`, и ровно тот, который MTP-голова ждёт на входе.
     ///

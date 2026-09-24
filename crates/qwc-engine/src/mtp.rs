@@ -454,9 +454,9 @@ impl Speculator {
     ) -> Result<Self, crate::weights::LoadError> {
         Ok(Self {
             head: load(checkpoint)?,
-            scratch: MtpScratch::new(1, max_context, cache_dtype)?,
-            hidden: DeviceBuffer::zeroed(HIDDEN_SIZE)?,
-            draft_hidden: DeviceBuffer::zeroed(HIDDEN_SIZE)?,
+            scratch: MtpScratch::new(kernels::MAX_ROWS, max_context, cache_dtype)?,
+            hidden: DeviceBuffer::zeroed(kernels::MAX_ROWS * HIDDEN_SIZE)?,
+            draft_hidden: DeviceBuffer::zeroed(kernels::MAX_ROWS * HIDDEN_SIZE)?,
             logits: DeviceBuffer::zeroed(VOCAB_SIZE)?,
             argmax: qwc_cuda::sampling::Argmax::new(1, VOCAB_SIZE)?,
             stream: Stream::new()?,
@@ -498,8 +498,8 @@ impl Speculator {
         self.head.resident_bytes() + self.scratch.resident_bytes()
     }
 
-    /// Буфер под скрытое состояние основной модели: исполнитель копирует
-    /// в него строку перед вызовом `draft_chain`.
+    /// Буфер под скрытые состояния основной модели, до `MAX_ROWS` строк:
+    /// исполнитель копирует их сюда перед `draft_chain`.
     pub fn hidden_mut(&mut self) -> &mut DeviceBuffer<u16> {
         &mut self.hidden
     }
@@ -515,17 +515,66 @@ impl Speculator {
         Ok(true)
     }
 
-    /// Цепочка из `depth` черновиков: первый идёт по скрытому состоянию
-    /// основной модели, дальше голова продолжает по собственному выходу.
+    /// Заполняет KV головы по строкам prefill-шага: строка `first_row + i`
+    /// несёт h_t, `tokens[i]` — токен t+1, а `first_position` — позиция
+    /// `tokens[0]`. Выход головы выбрасывается, нужен только её KV.
+    ///
+    /// Без этого голова видит на промпте нули: `bind` обнуляет кэш, а
+    /// черновики пишут только свои позиции. Оффлайн-эталон с полным KV даёт
+    /// 0.913 на первом черновике, голова с пустым — 0.850. vLLM прогоняет
+    /// MTP-слой по всему промпту на префилле.
+    pub fn prime(
+        &mut self,
+        weights: &ModelWeights,
+        executor: &crate::Executor,
+        first_row: usize,
+        tokens: &[u32],
+        first_position: usize,
+    ) -> qwc_cuda::Result<()> {
+        for (chunk, part) in tokens.chunks(kernels::MAX_ROWS).enumerate() {
+            let offset = chunk * kernels::MAX_ROWS;
+            executor
+                .copy_prefill_hidden_rows(first_row + offset, part.len(), &mut self.hidden)?;
+            let positions: Vec<u32> = (0..part.len())
+                .map(|i| (first_position + offset + i) as u32)
+                .collect();
+            draft(
+                &self.head,
+                weights,
+                &mut self.scratch,
+                &self.hidden,
+                part,
+                &positions,
+                &mut self.draft_hidden,
+                &self.stream,
+            )?;
+            // Следующая порция перепишет `hidden` с чужого потока.
+            self.stream.synchronize()?;
+        }
+        Ok(())
+    }
+
+    /// Цепочка из `depth` черновиков.
+    ///
+    /// `tokens` — токены, чьи пары (h, токен) голова ещё не видела с
+    /// настоящими h: строки `hidden` лежат для них подряд, `position` —
+    /// позиция `tokens[0]`. После обычного шага это один ожидающий токен,
+    /// после проверки — все принятые плюс исправленный: их KV черновики
+    /// писали по собственному выходу головы, и первый проход переписывает его
+    /// настоящими состояниями основной модели. Строки идут одним проходом по
+    /// весам головы, поэтому переписывание почти бесплатно. Дальше голова
+    /// продолжает по собственному выходу.
     pub fn draft_chain(
         &mut self,
         weights: &ModelWeights,
-        token: u32,
+        tokens: &[u32],
         position: usize,
         depth: usize,
     ) -> qwc_cuda::Result<Vec<u32>> {
+        assert!((1..=kernels::MAX_ROWS).contains(&tokens.len()));
+        let last = tokens.len() - 1;
         let mut drafts = Vec::with_capacity(depth);
-        let mut input = token;
+        let mut input = tokens[last];
         for step in 0..depth {
             let source: *const DeviceBuffer<u16> = if step == 0 {
                 &self.hidden
@@ -534,16 +583,34 @@ impl Speculator {
             };
             // SAFETY: оба буфера живут в self и не пересекаются с выходом.
             let source = unsafe { &*source };
-            draft(
-                &self.head,
-                weights,
-                &mut self.scratch,
-                source,
-                &[input],
-                &[(position + step) as u32],
-                &mut self.draft_hidden,
-                &self.stream,
-            )?;
+            if step == 0 {
+                let positions: Vec<u32> =
+                    (0..tokens.len()).map(|i| (position + i) as u32).collect();
+                draft(
+                    &self.head,
+                    weights,
+                    &mut self.scratch,
+                    source,
+                    tokens,
+                    &positions,
+                    &mut self.draft_hidden,
+                    &self.stream,
+                )?;
+                // Словарь и следующий шаг читают строку 0.
+                self.draft_hidden
+                    .copy_within(0, last * HIDDEN_SIZE, HIDDEN_SIZE, &self.stream)?;
+            } else {
+                draft(
+                    &self.head,
+                    weights,
+                    &mut self.scratch,
+                    source,
+                    &[input],
+                    &[(position + last + step) as u32],
+                    &mut self.draft_hidden,
+                    &self.stream,
+                )?;
+            }
             let shortlisted = match self.shortlist.as_mut() {
                 Some(shortlist) => {
                     let count = shortlist.upload()?;
