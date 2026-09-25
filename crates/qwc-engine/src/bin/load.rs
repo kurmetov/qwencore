@@ -1,5 +1,8 @@
 //! Подъём весов модели в VRAM: время, реальная VRAM и потолок host-RAM.
-//! `cargo run --release -p qwc-engine --bin load -- [каталог] [--vram-gb N]`
+//! `cargo run --release -p qwc-engine --bin load -- [каталог] [--vram-gb N] [--mtp]`
+//!
+//! `--mtp` дополнительно поднимает draft-голову: обычный decode её не читает,
+//! но спекулятивный путь держит её в той же VRAM, и бюджет надо считать с ней.
 
 use qwc_core::arch::{HIDDEN_SIZE, NUM_FULL_LAYERS, NUM_LAYERS, NUM_LINEAR_LAYERS, VOCAB_SIZE};
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
@@ -16,9 +19,11 @@ const DEFAULT_VRAM_GB: f64 = 24.0;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut dir: Option<PathBuf> = None;
     let mut vram_gb = DEFAULT_VRAM_GB;
+    let mut with_mtp = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--mtp" => with_mtp = true,
             "--vram-gb" => {
                 vram_gb = args
                     .next()
@@ -66,6 +71,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let elapsed = started.elapsed().as_secs_f64();
 
+    let mtp = if with_mtp {
+        let started = Instant::now();
+        let head = qwc_engine::mtp::load(&checkpoint)?;
+        println!(
+            "  MTP-голова     {:>6.2} GB  {:>6.1} s",
+            head.resident_bytes() as f64 / 1e9,
+            started.elapsed().as_secs_f64()
+        );
+        Some(head)
+    } else {
+        None
+    };
+
     let stats = weights.stats();
     let usage = qwc_cuda::memory_usage();
     let (free_after, _) = qwc_cuda::Device::mem_info()?;
@@ -99,6 +117,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "  всего в VRAM          {:>7.2} GB",
         stats.resident_bytes() as f64 / 1e9
     );
+    match &mtp {
+        Some(head) => println!(
+            "  + MTP-голова          {:>7.2} GB  -> {:.2} GB с ней",
+            head.resident_bytes() as f64 / 1e9,
+            (stats.resident_bytes() + head.resident_bytes()) as f64 / 1e9
+        ),
+        None => println!("  MTP-голова            не грузилась (--mtp)"),
+    }
 
     println!("\nПамять");
     println!(
