@@ -7,6 +7,7 @@
 // row instead of per element.
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
@@ -354,14 +355,25 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_kernel(
   }
 }
 
-constexpr int kMmaK = 32;
-constexpr int kMmaRows = 128;
+// Широкий batch идёт через тензорные ядра, и упирается он не в них, а в то,
+// сколько байт таблицы висит в полёте. Веса грузятся прямо в регистры
+// фрагментов по 16 байт на поток и подкачиваются на кусок вперёд, пока
+// считается текущий; через shared идёт только hidden. Прежний вариант ставил
+// тайл 128x32 в shared побайтно, с двумя барьерами на тайл, и держал
+// 380-450 ГБ/с на любом batch.
+//
+// Внутри куска в kMmaK столбцов порядок по K переставлен: поток (group,
+// position) берёт 16 подряд идущих байт строки, а шаг s раздаёт из них
+// столбцы 4s..4s+3 на логические k = 2p, 2p+1, 2p+8, 2p+9. Фрагмент B читает
+// hidden по той же перестановке, так что скалярное произведение не меняется.
+constexpr int kMmaK = 64;
+constexpr int kMmaRowTiles = 1;
 constexpr int kMmaWarps = kThreads / kWarpSize;
-
-__device__ __forceinline__ uint32_t pack_bf16_pair(
-    const __nv_bfloat16* source) {
-  return *reinterpret_cast<const uint32_t*>(source);
-}
+constexpr int kMmaRows = kMmaWarps * 16 * kMmaRowTiles;
+constexpr int kHiddenChunk = 128;
+// Четыре лишних bf16 сдвигают строку hidden на два банка: чтение фрагмента B
+// по восемь байт идёт без конфликтов.
+constexpr int kHiddenStride = kHiddenChunk + 4;
 
 __device__ __forceinline__ void mma_m16n8k16(
     float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
@@ -373,10 +385,16 @@ __device__ __forceinline__ void mma_m16n8k16(
         "r"(b[0]), "r"(b[1]));
 }
 
-// Tensor-core path for the wide decode batch.  The checkpoint keeps weights
-// in row-scaled E4M3 while activations are BF16, so each 128x32 weight tile is
-// converted to BF16 in shared memory and then reused by all batch columns.
-// One warp owns 16 vocabulary rows; every MMA covers another eight requests.
+// Два E4M3 из младших 16 бит в пару BF16. Оба перехода точные: E4M3
+// укладывается и в f16, и в bf16 без округления.
+__device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t pair) {
+  const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(
+      static_cast<__nv_fp8x2_storage_t>(pair & 0xffffu), __NV_E4M3);
+  const float2 value = __half22float2(*reinterpret_cast<const __half2*>(&raw));
+  const __nv_bfloat162 packed = __float22bfloat162_rn(value);
+  return *reinterpret_cast<const uint32_t*>(&packed);
+}
+
 template <int BATCH_TILE>
 __global__ __launch_bounds__(kThreads) void lm_head_batched_mma_kernel(
     const uint8_t* __restrict__ weights,
@@ -388,69 +406,125 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_mma_kernel(
     int batch) {
   static_assert(BATCH_TILE % 8 == 0);
   constexpr int kBatchTiles = BATCH_TILE / 8;
-  __shared__ __nv_bfloat16 weight_tile[kMmaRows][kMmaK];
-  __shared__ __nv_bfloat16 hidden_tile[BATCH_TILE][kMmaK];
+  __shared__ __align__(16) __nv_bfloat16 hidden_tile[BATCH_TILE][kHiddenStride];
 
-  const int row_block = blockIdx.x * kMmaRows;
   const int warp = threadIdx.x / kWarpSize;
   const int lane = threadIdx.x % kWarpSize;
   const int group = lane / 4;
   const int position = lane % 4;
-  const int warp_row = warp * 16;
-  float accumulator[kBatchTiles][4] = {};
+  const int warp_row = blockIdx.x * kMmaRows + warp * 16 * kMmaRowTiles;
 
-  for (int base = 0; base < hidden_size; base += kMmaK) {
-    const int width = min(kMmaK, hidden_size - base);
-    for (int index = threadIdx.x; index < kMmaRows * kMmaK;
-         index += kThreads) {
-      const int row = index / kMmaK;
-      const int column = index % kMmaK;
-      float value = 0.0f;
-      if (row_block + row < vocab && column < width) {
-        value = fp8_to_float(weights[
-            static_cast<size_t>(row_block + row) * hidden_size + base + column]);
-      }
-      weight_tile[row][column] = __float2bfloat16(value);
+  // Строка r = warp_row + 16t + group + 8h; за словарём — нули.
+  const uint8_t* row_base[kMmaRowTiles][2];
+  bool row_valid[kMmaRowTiles][2];
+#pragma unroll
+  for (int t = 0; t < kMmaRowTiles; ++t) {
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const int row = warp_row + t * 16 + group + h * 8;
+      row_valid[t][h] = row < vocab;
+      row_base[t][h] = weights + static_cast<size_t>(row_valid[t][h] ? row : 0) *
+                                     hidden_size + position * 16;
     }
-    for (int index = threadIdx.x; index < BATCH_TILE * kMmaK;
-         index += kThreads) {
-      const int column_batch = index / kMmaK;
-      const int column = index % kMmaK;
-      __nv_bfloat16 value = __float2bfloat16(0.0f);
-      if (column_batch < batch && column < width) {
-        value = hidden[static_cast<size_t>(column_batch) * hidden_size + base + column];
+  }
+
+  // Шаг цикла — kHiddenChunk столбцов, kMmaSteps кусков по kMmaK: следующий
+  // шаг целиком в полёте, пока считается текущий.
+  constexpr int kMmaSteps = kHiddenChunk / kMmaK;
+  uint4 current[kMmaSteps][kMmaRowTiles][2];
+  uint4 next[kMmaSteps][kMmaRowTiles][2];
+  auto load = [&](uint4 (&into)[kMmaSteps][kMmaRowTiles][2], int k) {
+#pragma unroll
+    for (int u = 0; u < kMmaSteps; ++u) {
+#pragma unroll
+      for (int t = 0; t < kMmaRowTiles; ++t) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          into[u][t][h] =
+              row_valid[t][h]
+                  ? __ldcs(reinterpret_cast<const uint4*>(row_base[t][h] + k + u * kMmaK))
+                  : make_uint4(0, 0, 0, 0);
+        }
       }
-      hidden_tile[column_batch][column] = value;
+    }
+  };
+
+  float accumulator[kMmaRowTiles][kBatchTiles][4] = {};
+  load(current, 0);
+
+  for (int k = 0; k < hidden_size; k += kHiddenChunk) {
+    // Следующий шаг уходит в полёт до барьера и до математики текущего.
+    if (k + kHiddenChunk < hidden_size) {
+      load(next, k + kHiddenChunk);
+    }
+    __syncthreads();
+    constexpr int kVectors = kHiddenChunk / 4;
+    for (int index = threadIdx.x; index < BATCH_TILE * kVectors;
+         index += kThreads) {
+      const int b = index / kVectors;
+      const int column = (index % kVectors) * 4;
+      uint2 value = make_uint2(0, 0);
+      if (b < batch) {
+        value = *reinterpret_cast<const uint2*>(
+            hidden + static_cast<size_t>(b) * hidden_size + k + column);
+      }
+      *reinterpret_cast<uint2*>(&hidden_tile[b][column]) = value;
     }
     __syncthreads();
 
 #pragma unroll
-    for (int k0 = 0; k0 < kMmaK; k0 += 16) {
-      uint32_t af[4];
-      af[0] = pack_bf16_pair(&weight_tile[warp_row + group][k0 + position * 2]);
-      af[1] = pack_bf16_pair(&weight_tile[warp_row + group + 8][k0 + position * 2]);
-      af[2] = pack_bf16_pair(&weight_tile[warp_row + group][k0 + position * 2 + 8]);
-      af[3] = pack_bf16_pair(&weight_tile[warp_row + group + 8][k0 + position * 2 + 8]);
+    for (int u = 0; u < kMmaSteps; ++u) {
 #pragma unroll
-      for (int tile = 0; tile < kBatchTiles; ++tile) {
-        uint32_t bf[2];
-        bf[0] = pack_bf16_pair(&hidden_tile[tile * 8 + group][k0 + position * 2]);
-        bf[1] = pack_bf16_pair(&hidden_tile[tile * 8 + group][k0 + position * 2 + 8]);
-        mma_m16n8k16(accumulator[tile], af, bf);
+      for (int s = 0; s < 4; ++s) {
+        uint32_t af[kMmaRowTiles][4];
+#pragma unroll
+        for (int t = 0; t < kMmaRowTiles; ++t) {
+          const uint32_t low = (&current[u][t][0].x)[s];
+          const uint32_t high = (&current[u][t][1].x)[s];
+          af[t][0] = e4m3x2_to_bf16x2(low);
+          af[t][1] = e4m3x2_to_bf16x2(high);
+          af[t][2] = e4m3x2_to_bf16x2(low >> 16);
+          af[t][3] = e4m3x2_to_bf16x2(high >> 16);
+        }
+#pragma unroll
+        for (int tile = 0; tile < kBatchTiles; ++tile) {
+          const uint2 pair = *reinterpret_cast<const uint2*>(
+              &hidden_tile[tile * 8 + group][u * kMmaK + position * 16 + s * 4]);
+          const uint32_t bf[2] = {pair.x, pair.y};
+#pragma unroll
+          for (int t = 0; t < kMmaRowTiles; ++t) {
+            mma_m16n8k16(accumulator[t][tile], af[t], bf);
+          }
+        }
       }
     }
-    __syncthreads();
+
+#pragma unroll
+    for (int u = 0; u < kMmaSteps; ++u) {
+#pragma unroll
+      for (int t = 0; t < kMmaRowTiles; ++t) {
+        current[u][t][0] = next[u][t][0];
+        current[u][t][1] = next[u][t][1];
+      }
+    }
   }
 
 #pragma unroll
-  for (int tile = 0; tile < kBatchTiles; ++tile) {
+  for (int t = 0; t < kMmaRowTiles; ++t) {
 #pragma unroll
     for (int index = 0; index < 4; ++index) {
-      const int row = row_block + warp_row + group + (index >= 2 ? 8 : 0);
-      const int column_batch = tile * 8 + position * 2 + (index & 1);
-      if (row < vocab && column_batch < batch) {
-        logits[static_cast<size_t>(column_batch) * vocab + row] =
-            accumulator[tile][index] * row_scales[row];
+      const int row = warp_row + t * 16 + group + (index >= 2 ? 8 : 0);
+      if (row >= vocab) {
+        continue;
+      }
+      const float scale = row_scales[row];
+#pragma unroll
+      for (int tile = 0; tile < kBatchTiles; ++tile) {
+        const int column_batch = tile * 8 + position * 2 + (index & 1);
+        if (column_batch < batch) {
+          logits[static_cast<size_t>(column_batch) * vocab + row] =
+              accumulator[t][tile][index] * scale;
+        }
       }
     }
   }
@@ -760,16 +834,25 @@ extern "C" cudaError_t qwc_fp8_lm_head_batched(
       hidden_size <= 0 || hidden_size % 4 != 0 || vocab <= 0) {
     return cudaErrorInvalidValue;
   }
-  const int blocks = (vocab + kRowTile - 1) / kRowTile;
   const uint8_t* w = static_cast<const uint8_t*>(weights);
   const float* s = static_cast<const float*>(row_scales);
   const __nv_bfloat16* h = static_cast<const __nv_bfloat16*>(hidden);
   float* out = static_cast<float*>(logits);
+  // MMA-путь берёт hidden кусками по kHiddenChunk; остальные ширины идут
+  // скалярным кернелом.
+  const bool mma = hidden_size % kHiddenChunk == 0;
+  const int blocks = mma ? (vocab + kMmaRows - 1) / kMmaRows
+                         : (vocab + kRowTile - 1) / kRowTile;
   switch ((batch + kBatchTileStep - 1) / kBatchTileStep) {
 #define QWC_LM_HEAD_TILE(n)                                                  \
   case (n) / kBatchTileStep:                                                 \
-    lm_head_batched_mma_kernel<n><<<blocks, kThreads, 0, stream>>>(          \
-        w, s, h, out, hidden_size, vocab, batch);                            \
+    if (mma) {                                                               \
+      lm_head_batched_mma_kernel<n><<<blocks, kThreads, 0, stream>>>(        \
+          w, s, h, out, hidden_size, vocab, batch);                          \
+    } else {                                                                 \
+      lm_head_batched_kernel<n><<<blocks, kThreads, 0, stream>>>(            \
+          w, s, h, out, hidden_size, vocab, batch);                          \
+    }                                                                        \
     break;
     QWC_LM_HEAD_TILE(16)
     QWC_LM_HEAD_TILE(32)
