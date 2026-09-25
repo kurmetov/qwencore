@@ -189,6 +189,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut produced = HashMap::<SeqId, usize>::new();
     let mut first_token_ms = HashMap::<SeqId, f64>::new();
     let mut last_token_at = HashMap::<SeqId, Instant>::new();
+    // Выданные токены по запросу: для TPOT, (последний − первый)/(n − 1).
+    // `produced` для этого не годится — он считает входы decode-шага.
+    let mut emitted = HashMap::<SeqId, usize>::new();
+    // TTFT без очереди: от шага, взявшего запрос в работу, до первого токена.
+    // Все запросы подаются в t=0, и при c=1 обычный TTFT — почти одна очередь.
+    let mut admitted_at = HashMap::<SeqId, Instant>::new();
     let mut inter_token_ms: Vec<f64> = Vec::with_capacity(args.requests * args.max_new);
 
     let started = Instant::now();
@@ -200,6 +206,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let batch = scheduler
             .next_batch()?
             .ok_or("scheduler made no progress")?;
+        // Запрос взят в работу — шаг с первым чанком его промпта, как
+        // `scheduled_ts` у vLLM.
+        let scheduled_at = Instant::now();
+        for chunk in &batch.prefill {
+            if chunk.offset == 0 {
+                admitted_at.entry(chunk.id).or_insert(scheduled_at);
+            }
+        }
         let layout = BatchLayout::build(&batch, scheduler.cache())?;
 
         // Глубина урезается остатком запроса: шаг выдаёт rows токенов разом,
@@ -273,6 +287,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(previous) = last_token_at.insert(id, now) {
                 inter_token_ms.push((now - previous).as_secs_f64() * 1e3 / rows as f64);
             }
+            *emitted.entry(id).or_insert(0) += rows;
             for token in &truth[..rows] {
                 spec.observe(*token);
             }
@@ -347,6 +362,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         for (id, token) in sampled {
+            pending.insert(id, token);
+            // Сэмпл есть у каждой строки шага, но токен запрос получает только
+            // от decode и от последнего чанка промпта. Сэмпл недопрефилленного
+            // чанка — не токен: иначе TTFT длинного промпта — время первого
+            // чанка, а шаги остальных чанков попадают в ITL и TPOT.
+            let partial = batch
+                .prefill
+                .iter()
+                .any(|chunk| chunk.id == id && chunk.offset + chunk.tokens < prompts[&id].len());
+            if partial {
+                continue;
+            }
             let now = Instant::now();
             first_token_ms
                 .entry(id)
@@ -354,7 +381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(previous) = last_token_at.insert(id, now) {
                 inter_token_ms.push((now - previous).as_secs_f64() * 1e3);
             }
-            pending.insert(id, token);
+            *emitted.entry(id).or_insert(0) += 1;
         }
         // Скрытое состояние для следующего чернового шага берётся отсюда:
         // спекуляции нужен вход головы, а он есть только после прохода.
@@ -378,6 +405,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let output_tokens: usize = produced.values().sum();
     let mut ttft: Vec<f64> = first_token_ms.values().copied().collect();
+    // TPOT — среднее время на токен после первого, по запросу; перцентили —
+    // по запросам. ITL — по промежуткам между выдачами, при спекуляции
+    // промежуток делится на число выданных за шаг токенов.
+    let mut tpot: Vec<f64> = emitted
+        .iter()
+        .filter(|&(_, &count)| count > 1)
+        .filter_map(|(id, &count)| {
+            let last = (*last_token_at.get(id)? - started).as_secs_f64() * 1e3;
+            Some((last - first_token_ms.get(id)?) / (count - 1) as f64)
+        })
+        .collect();
+    let mut ttft_service: Vec<f64> = first_token_ms
+        .iter()
+        .filter_map(|(id, &first)| {
+            Some(first - (*admitted_at.get(id)? - started).as_secs_f64() * 1e3)
+        })
+        .collect();
     println!(
         concat!(
             "{{\"engine\":\"qwc\",\"version\":\"{}\",\"requests\":{},\"concurrency\":{},",
@@ -386,13 +430,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "\"speculative\":{},\"speculative_steps\":{},\"speculative_tokens\":{},",
             "\"accept_histogram\":{:?},",
             "\"draft_ms_total\":{:.1},\"verify_ms_total\":{:.1},\"prime_ms_total\":{:.1},",
-            "\"mtp_prime\":\"{}\",",
+            "\"mtp_prime\":\"{}\",\"resident_weights_gb\":{:.2},",
             "\"prompts\":\"{}\",\"memory_limit_gb\":{:.2},\"shortlist\":{},",
             "\"prefill_chunk\":{},\"delta_state\":\"{}\",\"cuda_graphs\":true,",
             "\"wall_seconds\":{:.4},\"output_tokens\":{},",
             "\"output_tokens_per_second\":{:.2},\"requests_per_second\":{:.3},",
             "\"ttft_ms_p50\":{:.2},\"ttft_ms_p95\":{:.2},",
-            "\"itl_ms_p50\":{:.3},\"itl_ms_p95\":{:.3}}}"
+            "\"itl_ms_p50\":{:.3},\"itl_ms_p95\":{:.3},",
+            "\"tpot_ms_p50\":{:.3},\"tpot_ms_p95\":{:.3},",
+            "\"ttft_service_ms_p50\":{:.2},\"ttft_service_ms_p95\":{:.2}}}"
         ),
         env!("CARGO_PKG_VERSION"),
         args.requests,
@@ -418,6 +464,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             usize::MAX => "all".to_string(),
             window => window.to_string(),
         },
+        weights.stats().resident_bytes() as f64 / 1e9,
         args.corpus
             .as_deref()
             .map(|path| path.display().to_string())
@@ -434,6 +481,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         percentile(&mut ttft, 0.95),
         percentile(&mut inter_token_ms, 0.50),
         percentile(&mut inter_token_ms, 0.95),
+        percentile(&mut tpot, 0.50),
+        percentile(&mut tpot, 0.95),
+        percentile(&mut ttft_service, 0.50),
+        percentile(&mut ttft_service, 0.95),
     );
     Ok(())
 }
@@ -533,7 +584,9 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     // 0 — полная проекция в словарь; иначе столько первых строк словаря
     // держатся в шортлисте всегда, сверх токенов контекста.
     let mut shortlist = 0usize;
-    let mut mtp_prime = usize::MAX;
+    // Как у `serve`: стенд должен мерить тот же прогрев, что работает в
+    // сервере, иначе на длинных промптах он показывает не ту цену TTFT.
+    let mut mtp_prime = 2048usize;
     let mut delta_state = DeltaStateMode::Wy;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {

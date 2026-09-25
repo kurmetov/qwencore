@@ -11,8 +11,8 @@ past the first C requests, which is what a real backlog looks like.
 
 import argparse
 import json
+import math
 import os
-import statistics
 import subprocess
 import sys
 import time
@@ -48,6 +48,47 @@ def corpus_prompts(path: Path, count: int, prompt_tokens: int) -> list[list[int]
     return prompts
 
 
+def percentile(values: list[float], fraction: float) -> float:
+    """Как `percentile` в servebench.rs: элемент с индексом round((n−1)·q)."""
+    ordered = sorted(values)
+    return ordered[int(math.floor((len(ordered) - 1) * fraction + 0.5))]
+
+
+def latency_record(
+    started: float,
+    emissions: dict[str, list[tuple[float, int]]],
+    ttft_service: list[float],
+) -> dict:
+    """TTFT, TPOT и ITL по моментам выдачи токенов — те же определения, что у
+    qwc в servebench.rs. TTFT — от подачи всех запросов (t=0), с очередью;
+    `ttft_service` — от взятия запроса в работу, без очереди. TPOT — по
+    запросу (последний − первый)/(n − 1), перцентили по запросам. ITL — по
+    промежуткам между выдачами; выдача в k токенов (спекуляция) даёт
+    промежуток/k."""
+    ttft, tpot, itl = [], [], []
+    for times in emissions.values():
+        ttft.append((times[0][0] - started) * 1e3)
+        count = sum(tokens for _, tokens in times)
+        if count > 1:
+            tpot.append((times[-1][0] - times[0][0]) * 1e3 / (count - 1))
+        for (previous, _), (now, tokens) in zip(times, times[1:]):
+            itl.append((now - previous) * 1e3 / tokens)
+    record = {
+        "ttft_ms_p50": round(percentile(ttft, 0.50), 2),
+        "ttft_ms_p95": round(percentile(ttft, 0.95), 2),
+    }
+    if itl:
+        record["itl_ms_p50"] = round(percentile(itl, 0.50), 3)
+        record["itl_ms_p95"] = round(percentile(itl, 0.95), 3)
+    if tpot:
+        record["tpot_ms_p50"] = round(percentile(tpot, 0.50), 3)
+        record["tpot_ms_p95"] = round(percentile(tpot, 0.95), 3)
+    if ttft_service:
+        record["ttft_service_ms_p50"] = round(percentile(ttft_service, 0.50), 2)
+        record["ttft_service_ms_p95"] = round(percentile(ttft_service, 0.95), 2)
+    return record
+
+
 def total_gpu_memory_gb() -> float:
     """Ёмкость карты в тех же десятичных ГБ, в которых движок задаёт лимит."""
     out = subprocess.run(
@@ -74,6 +115,7 @@ def run_qwc(args) -> dict:
         "--delta-state", args.delta_state,
         "--speculative", str(args.qwc_speculative),
         "--shortlist", str(args.qwc_shortlist),
+        "--mtp-prime", args.qwc_mtp_prime,
     ]
     # Ширина шага prefill — такой же свипаемый параметр, как
     # max_num_batched_tokens у vLLM: держать его фиксированным значит
@@ -120,6 +162,10 @@ def run_vllm(args) -> dict:
         # Промпты и так уникальны, но фиксируем политику явно: результат не
         # должен зависеть от значения default в конкретной версии vLLM.
         enable_prefix_caching=False,
+        # Чекпоинт мультимодальный, а стенд текстовый. Без этого флага vLLM
+        # поднимает vision tower (0.92 ГБ), и под общим бюджетом мы
+        # сравнивались с соперником, который носит лишний гигабайт.
+        language_model_only=not args.vllm_keep_vision,
         # Голова MTP лежит в том же чекпоинте, и vLLM умеет её грузить как
         # qwen3_5_mtp. Мерить его без неё — мерить недонастроенного соперника.
         speculative_config=(
@@ -133,6 +179,11 @@ def run_vllm(args) -> dict:
         ),
     )
     load_seconds = time.perf_counter() - started
+    # Формат состояния DeltaNet не задаём: "auto" для этой модели — fp32 из
+    # `mamba_ssm_dtype` в config.json. В артефакт идёт итог, а не запрос.
+    engine_config = getattr(llm.llm_engine, "vllm_config", None)
+    cache_config = getattr(engine_config, "cache_config", None)
+    mamba_ssm_dtype = str(getattr(cache_config, "mamba_ssm_cache_dtype", "auto"))
 
     params = SamplingParams(
         temperature=0.0,
@@ -163,30 +214,40 @@ def run_vllm(args) -> dict:
     ]
     llm.generate(warmup, params, use_tqdm=False)
 
+    # Тот же цикл, что внутри `LLM.generate`, но с выдачей по шагам (DELTA):
+    # generate просит FINAL_ONLY, и у запроса остаются только первый и
+    # последний моменты — ITL по промежуткам из них не собрать.
+    from vllm.sampling_params import RequestOutputKind
+
+    stepped = params.clone()
+    stepped.output_kind = RequestOutputKind.DELTA
+    engine = llm.llm_engine
+    emissions: dict[str, list[tuple[float, int]]] = {}
+    ttft_service: list[float] = []
     started = time.perf_counter()
-    outputs = llm.generate(requests, params, use_tqdm=False)
+    for index, request in enumerate(requests):
+        engine.add_request(f"bench-{index}", request, stepped)
+    while engine.has_unfinished_requests():
+        step_outputs = engine.step()
+        now = time.perf_counter()
+        for output in step_outputs:
+            tokens = len(output.outputs[0].token_ids)
+            if tokens:
+                emissions.setdefault(output.request_id, []).append((now, tokens))
+            # Моменты ядра движка монотонные и годятся только как промежуток:
+            # взят в работу -> первый токен.
+            metrics = getattr(output, "metrics", None)
+            if output.finished and metrics is not None and metrics.scheduled_ts:
+                ttft_service.append((metrics.first_token_ts - metrics.scheduled_ts) * 1e3)
     elapsed = time.perf_counter() - started
 
-    output_tokens = sum(len(output.outputs[0].token_ids) for output in outputs)
+    output_tokens = sum(tokens for times in emissions.values() for _, tokens in times)
     expected = args.requests * args.max_new
-    if output_tokens != expected:
-        raise SystemExit(f"vLLM produced {output_tokens} tokens, expected {expected}")
-
-    # vLLM 0.28 reports RequestStateStats: `first_token_latency` is already
-    # wall-clock since arrival, so it includes queueing exactly like qwc's TTFT.
-    # The token timestamps are engine-core monotonic and only valid as a span.
-    ttft = []
-    itl = []
-    for output in outputs:
-        metrics = getattr(output, "metrics", None)
-        if metrics is None:
-            continue
-        if getattr(metrics, "first_token_latency", 0.0):
-            ttft.append(metrics.first_token_latency * 1e3)
-        produced = len(output.outputs[0].token_ids)
-        span = getattr(metrics, "last_token_ts", 0.0) - getattr(metrics, "first_token_ts", 0.0)
-        if produced > 1 and span > 0:
-            itl.append(span * 1e3 / (produced - 1))
+    if output_tokens != expected or len(emissions) != args.requests:
+        raise SystemExit(
+            f"vLLM produced {output_tokens} tokens in {len(emissions)} requests, "
+            f"expected {expected} in {args.requests}"
+        )
     import vllm
 
     record = {
@@ -204,6 +265,8 @@ def run_vllm(args) -> dict:
         "kv_cache": args.kv_cache_dtype,
         "cuda_graphs": True,
         "prefix_caching": False,
+        "language_model_only": not args.vllm_keep_vision,
+        "mamba_ssm_cache_dtype": mamba_ssm_dtype,
         "prompts": str(args.corpus) if args.corpus else "synthetic",
         "max_batched_tokens": args.max_batched_tokens or max(args.context, args.concurrency),
         "load_seconds": round(load_seconds, 3),
@@ -211,15 +274,8 @@ def run_vllm(args) -> dict:
         "output_tokens": output_tokens,
         "output_tokens_per_second": round(output_tokens / elapsed, 2),
         "requests_per_second": round(args.requests / elapsed, 3),
+        **latency_record(started, emissions, ttft_service),
     }
-    if ttft:
-        ttft.sort()
-        record["ttft_ms_p50"] = round(statistics.median(ttft), 2)
-        record["ttft_ms_p95"] = round(ttft[int((len(ttft) - 1) * 0.95)], 2)
-    if itl:
-        itl.sort()
-        record["itl_ms_p50"] = round(statistics.median(itl), 3)
-        record["itl_ms_p95"] = round(itl[int((len(itl) - 1) * 0.95)], 3)
     return record
 
 
@@ -258,6 +314,17 @@ def main() -> int:
         type=int,
         default=0,
         help="частотная часть shortlist словаря QwenCore (0 — полный lm_head)",
+    )
+    parser.add_argument(
+        "--qwc-mtp-prime",
+        default="2048",
+        help="окно прогрева MTP-головы QwenCore: N, all или off; 2048 — как у serve",
+    )
+    parser.add_argument(
+        "--vllm-keep-vision",
+        action="store_true",
+        help="не передавать language_model_only: vLLM поднимет vision tower "
+             "(так шли замеры до 24.09)",
     )
     parser.add_argument("--max-batched-tokens", type=int, default=0)
     parser.add_argument("--prefill-chunk", type=int, default=0)
