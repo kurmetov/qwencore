@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Chat with the model in one command; the server starts itself in the right mode.
+#
+#   qwencore                        # exact mode: no speculation, no prefix cache
+#   qwencore -think                 # with reasoning (xhigh) — and the server reasons by default
+#   qwencore -speculative           # MTP speculation and prefix cache: ~2x faster
+#   qwencore -think -speculative
+#   qwencore -think "question"      # one question instead of a dialogue
+#   qwencore stop                   # shut down the server, free VRAM
+#   qwencore status
+#
+# Exact mode matches eval bit for bit; speculation and the prefix cache change
+# greedy output on near-tied tokens (README, "Speculation and prefix cache").
+# Switching mode restarts the server, that's ~20 seconds.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+
+case "${1:-}" in
+stop | -stop | --stop)
+    exec "$ROOT/scripts/llm-server.sh" stop
+    ;;
+status | -status | --status)
+    exec "$ROOT/scripts/llm-server.sh" status
+    ;;
+esac
+think=()
+# The launch mode decides for other clients too (prompter etc.): the server reasons
+# only if started with -think.
+server_think=off
+speculative=0
+prompt=()
+for arg in "$@"; do
+    case "$arg" in
+    -think | --think) think=(--think); server_think=on ;;
+    -speculative | --speculative) speculative=1 ;;
+    -h | --help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) prompt+=("$arg") ;;
+    esac
+done
+
+if ((speculative)); then
+    "$ROOT/scripts/llm-server.sh" start --speculative 3 --prefix-cache 8 --thinking "$server_think" >&2
+else
+    "$ROOT/scripts/llm-server.sh" start --speculative 0 --prefix-cache 0 --thinking "$server_think" >&2
+fi
+exec "$ROOT/scripts/ask.py" "${think[@]}" "${prompt[@]}"

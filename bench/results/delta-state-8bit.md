@@ -1,76 +1,76 @@
-# Восьмибитное состояние DeltaNet: выбор формата — 2026-09-18
+# Eight-bit DeltaNet state: choosing the format — 2026-09-18
 
-Состояние DeltaNet — 48 слоёв по [48 голов, 128, 128] — стоит 75.5 МБ на
-последовательность в bf16 и даёт 21% трафика decode-шага при c=32. Один байт
-на элемент снимает пол памяти с 19 до ~17.8 ГБ и половину этого трафика.
-Вопрос ровно один: сколько бит переживает рекуррентность.
+The DeltaNet state — 48 layers of [48 heads, 128, 128] — costs 75.5 MB per
+sequence in bf16 and is 21% of decode-step traffic at c=32. One byte
+per element lowers the memory floor from 19 to ~17.8 GB and removes half of that traffic.
+There is exactly one question: how many bits survive the recurrence.
 
-## Формат: int8, а не fp8
+## Format: int8, not fp8
 
-Симуляция одной головы на CPU, 512 токенов, состояние округляется после
-каждого токена, эталон — та же рекуррентность в fp32. Относительная L2 по
-выходу:
+A simulation of one head on CPU, 512 tokens, the state is rounded after
+every token, the reference is the same recurrence in fp32. Relative L2 of the
+output:
 
-| alpha | bf16 | e4m3/строка | int8/строка | int8/голова |
+| alpha | bf16 | e4m3/row | int8/row | int8/head |
 |---|---:|---:|---:|---:|
 | 0.20..0.60 | 7.4e-4 | 1.2e-2 | **2.9e-3** | 7.9e-3 |
 | 0.70..0.95 | 2.4e-3 | 3.8e-2 | **9.4e-3** | 2.1e-2 |
 | 0.90..0.999 | 4.8e-3 | 7.7e-2 | **1.9e-2** | 3.3e-2 |
 | 0.995..1.0 | 1.4e-2 | 2.2e-1 | **5.5e-2** | 8.5e-2 |
 
-Три вывода, каждый меняет решение:
+Three conclusions, each changes the decision:
 
-1. **int8 бьёт e4m3 вчетверо при том же байте.** Построчный и поголовный
-   масштаб у e4m3 дали одинаковый результат — значит строки состояния
-   плоские, и четыре бита экспоненты им не нужны. int8 отдаёт их мантиссе:
-   7 бит против 3.
-2. **Масштаб по максимуму строки почти оптимален.** Обрезка на 3, 4 и 5 RMS
-   оказалась хуже максимума везде (напр. 2.6e-2 против 1.9e-2 при 4 RMS на
-   строке 0.90..0.999). Пик строки лежит ближе к RMS, чем у гауссианы, и
-   обрезать нечего.
-3. **Стохастическое округление не помогает, а вредит в √2** (1.1e-1 против
-   7.7e-2 у e4m3). Ошибка и так независима по шагам, усреднять нечего:
-   рекуррентность не копит много мелких приращений в одну ячейку, а
-   перемасштабирует всю строку.
+1. **int8 beats e4m3 fourfold at the same byte.** Per-row and per-head
+   scales gave e4m3 the same result — so state rows are
+   flat, and they don't need four exponent bits. int8 gives them to the mantissa:
+   7 bits vs 3.
+2. **Scaling by the row max is nearly optimal.** Clipping at 3, 4 and 5 RMS
+   turned out worse than the max everywhere (e.g. 2.6e-2 vs 1.9e-2 at 4 RMS on
+   the 0.90..0.999 row). A row's peak sits closer to RMS than a Gaussian's, and
+   there's nothing to clip.
+3. **Stochastic rounding doesn't help, it hurts by √2** (1.1e-1 vs
+   7.7e-2 for e4m3). The error is already independent across steps, there's nothing to average:
+   the recurrence doesn't accumulate many small increments into one cell, it
+   rescales the whole row.
 
-Масштаб — на строку состояния (128 элементов по dk): вдоль строки идут оба
-скалярных произведения S k и S q, поэтому вся сумма делит один масштаб.
+The scale is per state row (128 elements along dk): both dot products
+S k and S q run along a row, so the whole sum shares one scale.
 
-Ошибка растёт с alpha: и сигнал, и ошибка копятся как 1/(1-a²), так что
-относительная величина держится, но длинное удержание — худший случай.
-Остаток до bf16 — ровно 4x, и закрыть его одним байтом нечем.
+The error grows with alpha: both signal and error accumulate as 1/(1-a²), so
+the relative value holds, but long retention is the worst case.
+The remaining gap to bf16 is exactly 4x, and there's nothing to close it with one byte.
 
-## Что уже сделано
+## What's already done
 
-`qwc_delta_state_requantize` (`cuda/delta_net.cu`) сажает состояние на
-8-битную сетку прямо в bf16-пуле, не трогая раскладку: биты теряются те же.
-Это отвязывает вопрос о точности от перекладки трёх кернелов, пулов и
-бюджета — diff-eval отвечает до неё, а не после.
+`qwc_delta_state_requantize` (`cuda/delta_net.cu`) snaps the state onto
+an 8-bit grid right in the bf16 pool, without touching the layout: the same bits are lost.
+This decouples the accuracy question from reworking three kernels, the pools and the
+budget — diff-eval answers before that, not after.
 
-Обратная запись в bf16 добавляет собственное округление 2^-9 поверх
-8-битного, поэтому замер через этот кернел — **оценка сверху**: настоящее
-хранение деквантует в fp32-регистры и этой надбавки не имеет.
+Writing back to bf16 adds its own 2^-9 rounding on top of the
+8-bit one, so a measurement through this kernel is **an upper bound**: real
+storage dequantizes into fp32 registers and doesn't have this extra.
 
-Кернел сверен с эталоном на CPU поэлементно
-(`state_requantize_matches_host_and_beats_e4m3`), на живых данных теста:
-int8 4.4e-3 против e4m3 2.5e-2 относительной ошибки за одно применение.
+The kernel is checked element-wise against a CPU reference
+(`state_requantize_matches_host_and_beats_e4m3`), on the test's live data:
+int8 4.4e-3 vs e4m3 2.5e-2 relative error per application.
 
-Ключ к совпадению с эталоном: кернел умножает на обратный шаг и округляет
-к чётному (`rintf`). Деление с округлением от нуля (`f32::round` в Rust)
-даёт другую ступень на полушаге — эталон обязан повторять операции, а не
-формулу.
+The key to matching the reference: the kernel multiplies by the inverse step and rounds
+to even (`rintf`). Division with round-half-away-from-zero (`f32::round` in Rust)
+gives a different step at the half point — the reference must repeat the operations, not
+the formula.
 
-## Diff-eval: 8 бит проходит, но не в лоб
+## Diff-eval: 8 bits pass, but not head-on
 
-Эталон — наш же прогон с bf16-состоянием: сравнение с vLLM здесь бесполезно,
-там доминирует своя ошибка эталона (все три кандидата дали MAE 0.38-0.39,
-неразличимо).
+The reference is our own run with bf16 state: comparison with vLLM is useless here,
+the reference's own error dominates there (all three candidates gave MAE 0.38-0.39,
+indistinguishable).
 
-Корпус `bench/corpus/state-length.jsonl`: **один и тот же текст**, обрезанный
-по каждой длине. Это важно — первый заход брал разные длины из разных
-документов, и скачок в кривой мог оказаться текстом, а не длиной.
+Corpus `bench/corpus/state-length.jsonl`: **the same text**, truncated
+at each length. This matters — the first attempt took different lengths from different
+documents, and a jump in the curve could have been the text, not the length.
 
-| контекст | сегментов префилла | int8 везде | int8 только на decode |
+| context | prefill segments | int8 everywhere | int8 on decode only |
 |---:|---:|---|---|
 | | | MAE / Jaccard / greedy | MAE / Jaccard / greedy |
 | 1024 | 1 | 0.041 / 0.961 / 1.00 | 0.039 / 0.957 / 1.00 |
@@ -80,125 +80,125 @@ int8 4.4e-3 против e4m3 2.5e-2 относительной ошибки з�
 | 8192 | 4 | 0.676 / 0.706 / 1.00 | 0.034 / 0.972 / 1.00 |
 | 16384 | 8 | 0.702 / 0.666 / 1.00 | 0.099 / 0.934 / 1.00 |
 
-**Урон наносит не decode, а граница сегмента префилла.** Скачок в 11 раз
-между 2048 и 3072 совпадает ровно с `PREFILL_CHUNK_SIZE = 2048`: промпт
-длиннее одного сегмента идёт вторым заходом уже с 8-битного состояния, и
-весь остаток промпта — тысячи токенов — считается с испорченного S_0. Их
-скрытые состояния уходят и в KV шестнадцати full-attention слоёв, так что
-одна перекладка состояния пачкает представление всего хвоста промпта.
+**The damage is done not by decode but by the prefill segment boundary.** The 11x jump
+between 2048 and 3072 coincides exactly with `PREFILL_CHUNK_SIZE = 2048`: a prompt
+longer than one segment goes into a second pass already from the 8-bit state, and
+the whole rest of the prompt — thousands of tokens — is computed from a spoiled S_0. Their
+hidden states also go into the KV of the sixteen full-attention layers, so
+one state requantization dirties the representation of the whole prompt tail.
 
-Контроль, который это отделяет: 2048 токенов промпта, но 64 токена генерации
-вместо 8. Если бы копил decode, ошибка росла бы с номером шага. Она
-выходит на плато:
+The control that separates this: 2048 prompt tokens, but 64 generated tokens
+instead of 8. If decode were accumulating, the error would grow with the step number. It
+plateaus:
 
-| шаги decode | 0..7 | 8..15 | 16..23 | 24..31 | 32..39 | 40..47 | 48..55 | 56..63 |
+| decode steps | 0..7 | 8..15 | 16..23 | 24..31 | 32..39 | 40..47 | 48..55 | 56..63 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | MAE | 0.037 | 0.084 | 0.136 | 0.074 | 0.118 | 0.100 | 0.084 | 0.125 |
 
-Decode читает и пишет 8-битное состояние шестьдесят четыре раза подряд и
-остаётся на MAE ~0.1. Дело не в числе перекладок, а в том, **сколько токенов
-читают испорченное состояние после неё**.
+Decode reads and writes the 8-bit state sixty-four times in a row and
+stays at MAE ~0.1. It's not the number of requantizations, but **how many tokens
+read the spoiled state after it**.
 
-Ещё одно следствие: end-to-end int8 и e4m3 почти сравнялись (0.70 против
-0.73 на 16k) при пятикратной разнице на самом кернеле. Значит на длинном
-контексте мы упираемся не в шаг сетки, а в насыщение — модель
-расходится одинаково от любого возмущения выше некоторого порога. Выбор
-int8 всё равно верен: на коротком контексте и по хвосту (max Δ 2.69 против
-5.11 на 4k) он лучше, а стоит столько же.
+One more consequence: end-to-end int8 and e4m3 nearly converged (0.70 vs
+0.73 at 16k) with a fivefold difference on the kernel itself. So on long
+context we're bound not by the grid step but by saturation — the model
+diverges the same way from any perturbation above some threshold. Choosing
+int8 is still right: on short context and in the tail (max Δ 2.69 vs
+5.11 at 4k) it's better, and costs the same.
 
-## Что это значит для раскладки
+## What this means for the layout
 
-8 бит на состояние проходит с запасом — MAE 0.03..0.10 и Jaccard >= 0.93 на
-всех длинах до 16k, greedy-выход не меняется нигде — **при условии, что
-префилл одной последовательности не перезапускается с квантованного
-состояния**.
+8 bits for the state pass with margin — MAE 0.03..0.10 and Jaccard >= 0.93 at
+all lengths up to 16k, greedy output doesn't change anywhere — **provided that
+a single sequence's prefill is not restarted from a quantized
+state**.
 
-Отсюда раскладка, которая была неочевидна до замера:
+Hence a layout that wasn't obvious before measuring:
 
-* 8 бит — формат **хранения покоящихся слотов**. Там и живёт выигрыш: слотов
-  33 при batch 32, и каждый дешевеет с 75.5 МБ до 37.8 МБ плюс 1.2 МБ
-  построчных масштабов.
-* Префилл одной последовательности идёт по **расквантованной рабочей копии**
-  в bf16 и квантуется один раз в конце промпта. Копия нужна одна на движок
-  (75.5 МБ), а не на слот: в шаге сегментов может быть несколько, но
-  незавершённым остаётся не больше одного. Чанк выходит частичным только
-  когда исчерпал token budget шага (`tokens = remaining.min(budget)`), а это
-  сразу обрывает цикл набора — значит в каждый момент недопрефилленной может
-  быть ровно одна последовательность (`scheduler.rs:251`).
-* Decode читает и пишет 8 бит на каждом шаге — это и есть экономия трафика,
-  и MAE ~0.1 она стоит.
+* 8 bits is the **storage format for resting slots**. That's where the gain lives: there are 33
+  slots at batch 32, and each gets cheaper from 75.5 MB to 37.8 MB plus 1.2 MB
+  of per-row scales.
+* A single sequence's prefill runs on a **dequantized working copy**
+  in bf16 and is quantized once at the end of the prompt. One copy is needed per engine
+  (75.5 MB), not per slot: a step may contain several segments, but
+  at most one stays unfinished. A chunk comes out partial only
+  when it has exhausted the step's token budget (`tokens = remaining.min(budget)`), and that
+  immediately breaks the gathering loop — so at any moment exactly one
+  sequence can be partially prefilled (`scheduler.rs:251`).
+* Decode reads and writes 8 bits on every step — that is the traffic saving,
+  and it costs MAE ~0.1.
 
-Итог по памяти: 33 слота с 2.57 ГБ до 1.28 ГБ плюс рабочая копия 75.5 МБ,
-то есть минус ~1.2 ГБ, пол 19 -> ~17.8 ГБ. По трафику decode-шага доля
-состояния при c=32 падает с 21% до ~10.5%.
+Memory result: 33 slots from 2.57 GB to 1.28 GB plus a 75.5 MB working copy,
+i.e. minus ~1.2 GB, floor 19 -> ~17.8 GB. In decode-step traffic the state's
+share at c=32 drops from 21% to ~10.5%.
 
-## Раскладка: что получилось
+## Layout: what came out
 
-Реализовано по схеме выше. Замеры — `stepprofile`, одна и та же машина
-подряд, база собрана из worktree на HEAD тем же компилятором.
+Implemented per the scheme above. Measurements — `stepprofile`, the same machine
+back to back, the baseline built from a worktree at HEAD with the same compiler.
 
-| c=32, контекст 2048 | bf16 | int8 |
+| c=32, context 2048 | bf16 | int8 |
 |---|---:|---:|
-| кэш и состояние | 4.92 ГБ | **3.79 ГБ** |
-| `delta.scan` | 1.963 мс | **1.786 мс** |
-| шаг с графом | 25.721 мс | **24.667 мс** |
+| cache and state | 4.92 GB | **3.79 GB** |
+| `delta.scan` | 1.963 ms | **1.786 ms** |
+| step with graph | 25.721 ms | **24.667 ms** |
 
 | c=1 | bf16 | int8 |
 |---|---:|---:|
-| кэш и состояние | 0.31 ГБ | 0.32 ГБ |
-| `delta.scan` | 0.261 мс | 0.295 мс |
-| шаг с графом | 12.507 мс | 12.500 мс |
+| cache and state | 0.31 GB | 0.32 GB |
+| `delta.scan` | 0.261 ms | 0.295 ms |
+| step with graph | 12.507 ms | 12.500 ms |
 
-Экономия 1.13 ГБ при c=32 сходится со счётом: 33 слота по 37.2 МБ минус
-рабочая копия 75.5 МБ. **На batch 1 выигрыша нет и быть не может**: копия
-стоит фиксированные 75.5 МБ, а два слота экономят 75 МБ. Порог окупаемости —
-около трёх слотов.
+The 1.13 GB saving at c=32 agrees with the calculation: 33 slots of 37.2 MB minus
+the 75.5 MB working copy. **At batch 1 there's no gain and can't be**: the copy
+costs a fixed 75.5 MB, and two slots save 75 MB. The break-even point is
+about three slots.
 
-Точность настоящей раскладки совпала с моделью один в один (эталон — прогон
-с bf16-состоянием на том же корпусе):
+The accuracy of the real layout matched the model exactly (the reference is a run
+with bf16 state on the same corpus):
 
-| контекст | 1024 | 2048 | 3072 | 4096 | 8192 | 16384 |
+| context | 1024 | 2048 | 3072 | 4096 | 8192 | 16384 |
 |---|---:|---:|---:|---:|---:|---:|
 | MAE | 0.044 | 0.043 | 0.050 | 0.029 | 0.044 | 0.110 |
 | Jaccard | 0.952 | 0.964 | 0.980 | 0.984 | 0.965 | 0.947 |
 | greedy | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
 
-Ступеньки на 2048 нет: рабочая копия делает ровно то, ради чего заведена.
+There's no step at 2048: the working copy does exactly what it was introduced for.
 
-## Масштабы стоили дороже, чем всё остальное вместе
+## Scales cost more than everything else combined
 
-Первая версия 8-битного decode оказалась **в 2.3 раза медленнее** bf16
-(4.529 против 1.963 мс) — при вдвое меньшем трафике, тех же 40 регистрах и
-без единого выброса в локальную память. Разбор по частям:
+The first version of 8-bit decode turned out **2.3x slower** than bf16
+(4.529 vs 1.963 ms) — with half the traffic, the same 40 registers and
+not a single spill to local memory. Breakdown by parts:
 
-| вариант | `delta.scan` |
+| variant | `delta.scan` |
 |---|---:|
-| только раскладка обращений, без масштабов и квантизации | 1.208 мс |
-| + вся квантизация (деление, `rintf`, редукция максимума) | 1.563 мс |
-| + чтение и запись массива масштабов построчно | 4.529 мс |
-| + масштабы через shared, одним слитным обращением на блок | **1.786 мс** |
+| access layout only, no scales or quantization | 1.208 ms |
+| + all quantization (division, `rintf`, max reduction) | 1.563 ms |
+| + reading and writing the scale array per row | 4.529 ms |
+| + scales via shared, one coalesced access per block | **1.786 ms** |
 
-Цену создавала запись `if (lane == 0) scales[row] = scale;`: четыре байта
-одной дорожкой — это частичная транзакция на каждую строку состояния,
-196608 штук на слой. 2.97 мс из 3.3 мс накладных, то есть дороже и всей
-арифметики квантизации, и всего трафика самого состояния.
+The cost came from the write `if (lane == 0) scales[row] = scale;`: four bytes
+from one lane is a partial transaction for every state row,
+196608 of them per layer. 2.97 ms of the 3.3 ms overhead, i.e. more than all
+the quantization arithmetic and all the traffic of the state itself.
 
-Первая гипотеза была другая — латентность варповой редукции максимума перед
-записью. Она не подтвердилась: без редукции те же 4.538 мс. Разбор по частям
-занял три сборки и сразу показал виноватого; гадать по одной цифре было
-бесполезно.
+The first hypothesis was different — the latency of the warp max reduction before
+the write. It wasn't confirmed: without the reduction it's the same 4.538 ms. The breakdown by parts
+took three builds and immediately showed the culprit; guessing from one number was
+pointless.
 
-Починка — собирать масштабы блока в shared и писать их одним слитным
-обращением после цикла. Те же 512 байт на блок, но одной транзакцией вместо
+The fix is to collect the block's scales in shared and write them in one coalesced
+access after the loop. The same 512 bytes per block, but in one transaction instead of
 128.
 
-## Чего нет
+## What's missing
 
-* **Переключателя bf16/int8 в рантайме.** Пулы теперь безусловно 8-битные,
-  и снять bf16-базу можно только сборкой из git. Для A/B этого хватило, для
-  отката в бою — нет.
-* **Серверного замера.** `servebench` живой (спекуляция k=3 даёт 1.556
-  токена на шаг), но флаги `--corpus` и `--speculative` появились в этом же
-  незакоммиченном дереве, поэтому сравнить с HEAD через него нельзя. Нужна
-  отдельная сессия на тихой карте: сейчас 4.9 ГБ держат чужие процессы, и на
-  бюджете 19 ГБ падают обе сборки одинаково.
+* **A runtime bf16/int8 switch.** The pools are now unconditionally 8-bit,
+  and the bf16 baseline can only be measured with a build from git. That was enough for the A/B, but not for
+  a rollback in production.
+* **A server measurement.** `servebench` works (speculation k=3 gives 1.556
+  tokens per step), but the `--corpus` and `--speculative` flags appeared in this same
+  uncommitted tree, so it can't be used to compare with HEAD. It needs
+  a separate session on a quiet card: right now other processes hold 4.9 GB, and with
+  a 19 GB budget both builds fail the same way.

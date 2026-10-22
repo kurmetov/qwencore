@@ -1,10 +1,10 @@
-# Qwen3.8-27B — архитектура и следствия для inference engine
+# Qwen3.8-27B — architecture and implications for the inference engine
 
-Источник: `Qwen/Qwen3.8-27B/config.json` (`Qwen3_5ForConditionalGeneration`, transformers 5.8.0.dev0).
+Source: `Qwen/Qwen3.8-27B/config.json` (`Qwen3_5ForConditionalGeneration`, transformers 5.8.0.dev0).
 
-## 1. Что это за модель
+## 1. What this model is
 
-Dense 27B, **нативно vision-language**, с **гибридным attention** и **встроенной MTP-головой**.
+Dense 27B, **natively vision-language**, with **hybrid attention** and a **built-in MTP head**.
 
 ```
 model_type            qwen3_5
@@ -13,39 +13,39 @@ hidden_size           5120
 intermediate_size     17408      (SwiGLU, silu)
 vocab_size            248320
 rms_norm_eps          1e-6
-tie_word_embeddings   false      <- lm_head отдельный, 1.27B параметров
+tie_word_embeddings   false      <- separate lm_head, 1.27B parameters
 max_position_embeddings 262144
 ```
 
-### 1.1 Гибридный стек слоёв (3:1)
+### 1.1 Hybrid layer stack (3:1)
 
-`full_attention_interval = 4` → паттерн `[L, L, L, F] × 16`:
+`full_attention_interval = 4` → pattern `[L, L, L, F] × 16`:
 
-* **48 слоёв** — `linear_attention` = **Gated DeltaNet** (рекуррентное состояние константного размера)
-* **16 слоёв** — `full_attention` (индексы 3, 7, 11, ..., 63)
+* **48 layers** — `linear_attention` = **Gated DeltaNet** (constant-size recurrent state)
+* **16 layers** — `full_attention` (indices 3, 7, 11, ..., 63)
 
-### 1.2 Full attention (16 слоёв)
+### 1.2 Full attention (16 layers)
 
 ```
 num_attention_heads     24
-num_key_value_heads     4       (GQA, группа 6)
-head_dim                256     <- НЕ 128
-attn_output_gate        true    <- дополнительный gate-проекшн на выходе
-partial_rotary_factor   0.25    <- RoPE только на первых 64 из 256 dims
+num_key_value_heads     4       (GQA, group of 6)
+head_dim                256     <- NOT 128
+attn_output_gate        true    <- extra gate projection on the output
+partial_rotary_factor   0.25    <- RoPE only on the first 64 of 256 dims
 rope_theta              1e7
 rope: mrope_interleaved, mrope_section [11, 11, 10]
 ```
 
-### 1.3 Linear attention / Gated DeltaNet (48 слоёв)
+### 1.3 Linear attention / Gated DeltaNet (48 layers)
 
 ```
 linear_num_key_heads    16   (q, k)
 linear_key_head_dim     128
-linear_num_value_heads  48   (v)   <- broadcast k/q 1:3 на v-головы
+linear_num_value_heads  48   (v)   <- k/q broadcast 1:3 onto v heads
 linear_value_head_dim   128
-linear_conv_kernel_dim  4         <- короткая causal conv1d перед рекуррентностью
+linear_conv_kernel_dim  4         <- short causal conv1d before the recurrence
 output_gate_type        swish
-mamba_ssm_dtype         float32   <- состояние в fp32
+mamba_ssm_dtype         float32   <- state in fp32
 ```
 
 ### 1.4 MTP
@@ -54,106 +54,106 @@ mamba_ssm_dtype         float32   <- состояние в fp32
 mtp_num_hidden_layers        1
 mtp_use_dedicated_embeddings false
 ```
-Draft-голова **уже в чекпоинте**. Speculative decoding не требует отдельной draft-модели.
-Замеренный acceptance rate в vLLM: **0.77–0.90** при `num_speculative_tokens=3`.
+The draft head is **already in the checkpoint**. Speculative decoding needs no separate draft model.
+Measured acceptance rate in vLLM: **0.77–0.90** with `num_speculative_tokens=3`.
 
-### 1.5 Vision tower (выбрасываем)
+### 1.5 Vision tower (dropped)
 
-27 слоёв, hidden 1152, patch 16, spatial_merge 2, out_hidden 5120 (~0.5B параметров).
-В text-only режиме **не грузится вообще** — экономия ~0.5–1 GB VRAM и весь препроцессинг.
+27 layers, hidden 1152, patch 16, spatial_merge 2, out_hidden 5120 (~0.5B parameters).
+In text-only mode it is **not loaded at all** — saves ~0.5–1 GB VRAM and all the preprocessing.
 
 ---
 
-## 2. Разбор параметров (26.90B)
+## 2. Parameter breakdown (26.90B)
 
-| Компонент | Параметров |
+| Component | Parameters |
 |---|---:|
 | MLP × 64 (3 × 5120 × 17408) | 17.11 B |
 | Linear-attn × 48 (q,k,v,out,gate) | 5.56 B |
 | Full-attn × 16 (q,k,v,o,gate) | 1.68 B |
 | embed_tokens (248320 × 5120) | 1.27 B |
 | lm_head (untied) | 1.27 B |
-| **Итого** | **26.90 B** |
+| **Total** | **26.90 B** |
 
-MLP = 64% всех весов → именно они дают выигрыш от NVFP4.
-Эмбеддинги + lm_head = 2.54B (9.4%) — заметная доля, их точность/формат надо решать отдельно.
+MLP = 64% of all weights → this is where NVFP4 pays off.
+Embeddings + lm_head = 2.54B (9.4%) — a noticeable share; their precision/format needs a separate decision.
 
 ---
 
-## 3. Память: главное открытие проекта
+## 3. Memory: the project's main finding
 
-### 3.1 Веса (NVFP4 = 4 бита + FP8 e4m3 scale на блок 16 → 4.5 бита эфф.)
+### 3.1 Weights (NVFP4 = 4 bits + FP8 e4m3 scale per block of 16 → 4.5 bits effective)
 
-| Чекпоинт | Рецепт | Размер |
+| Checkpoint | Recipe | Size |
 |---|---|---:|
 | `nvidia/Qwen3.8-27B-NVFP4` | NVFP4: MLP + lm_head; **FP8: attn + linear-attn**; BF16 embed | **≈ 20.1 GB** |
-| `QUASAR-QAT/...-QUASAR-NVFP4` | NVFP4: все linear-слои; BF16 embed | **≈ 17.0 GB** |
-| то же + FP8 embed | | **≈ 15.7 GB** |
+| `QUASAR-QAT/...-QUASAR-NVFP4` | NVFP4: all linear layers; BF16 embed | **≈ 17.0 GB** |
+| same + FP8 embed | | **≈ 15.7 GB** |
 
-На 31.4 GiB usable это разница между **11 GB** и **15.7 GB** свободных под кэш — т.е. напрямую задаёт max concurrency.
+Out of 31.4 GiB usable, that is the difference between **11 GB** and **15.7 GB** free for cache — i.e. it directly sets max concurrency.
 
-### 3.2 Per-sequence состояние (константное, НЕ растёт с контекстом)
+### 3.2 Per-sequence state (constant, does NOT grow with context)
 
-Рекуррентное состояние DeltaNet: `48 слоёв × 48 v-голов × 128 × 128`
-
-```
-= 37.75 M элементов на последовательность
-= 151 MB  @ fp32   (как в конфиге)
-=  75 MB  @ bf16   (наш ablation-эксперимент)
-```
-+ conv-состояние (kernel 4): ~6 MB fp32 — пренебрежимо.
-
-### 3.3 KV cache (только 16 full-attn слоёв)
-
-`16 × 4 kv-головы × 256 × 2 (K,V)` = 32 768 элементов на токен:
+DeltaNet recurrent state: `48 layers × 48 v heads × 128 × 128`
 
 ```
-BF16   64 KB / токен
-FP8    32 KB / токен
-NVFP4  18 KB / токен
+= 37.75 M elements per sequence
+= 151 MB  @ fp32   (as in the config)
+=  75 MB  @ bf16   (our ablation experiment)
 ```
++ conv state (kernel 4): ~6 MB fp32 — negligible.
 
-### 3.4 Точка пересечения — то, чего нет ни в одном обычном движке
+### 3.3 KV cache (only the 16 full-attn layers)
 
-При FP8 KV состояние DeltaNet «стоит» столько же, сколько KV-кэш при:
-
-```
-bf16 state (75 MB)  ->  ~2 360 токенов контекста
-fp32 state (151 MB) ->  ~4 700 токенов контекста
-```
-
-**Ниже ~2.4K–4.7K контекста доминирует не KV-кэш, а рекуррентное состояние.**
-Т.е. на коротких запросах concurrency упирается в фиксированные слоты состояний,
-а не в paged KV. Это принципиально другой аллокатор и другой scheduler.
-
-### 3.5 Бюджет 32 GB (считается кодом)
-
-`cargo run -p qwc-core --bin plan` — единственный источник истины по этим числам.
-Валидация модели памяти: расчёт «чекпоинт как есть» даёт **20.50 GB** против
-реальных **20.6 GB** файлов в репозитории QUASAR, т.е. разбор параметров по слоям верен.
+`16 × 4 kv heads × 256 × 2 (K,V)` = 32 768 elements per token:
 
 ```
-Веса
-  чекпоинт как есть (грузит vLLM):            20.50 GB
-  наша загрузка (text-only, fp8 head/embed):  17.08 GB
-  фора:                                        3.42 GB
+BF16   64 KB / token
+FP8    32 KB / token
+NVFP4  18 KB / token
+```
 
-Кэш (kv fp8_e4m3, state bf16)
-  KV на токен (16 слоёв):        32768 B
-  состояние на слот (48 слоёв):   81.4 MB
-  точка пересечения:              2484 токенов
+### 3.4 The crossover point — something no ordinary engine has
 
-Бюджет
-  всего VRAM       34.19 GB   (32607 MiB)
-  зарезервировано   2.20 GB   (десктоп gnome-shell ~1.2 GB + CUDA-контекст)
-  веса             17.08 GB
+With FP8 KV, the DeltaNet state "costs" as much as the KV cache at:
+
+```
+bf16 state (75 MB)  ->  ~2 360 tokens of context
+fp32 state (151 MB) ->  ~4 700 tokens of context
+```
+
+**Below ~2.4K–4.7K context, memory is dominated not by the KV cache but by the recurrent state.**
+I.e. on short requests concurrency is limited by fixed state slots,
+not by paged KV. That is a fundamentally different allocator and a different scheduler.
+
+### 3.5 32 GB budget (computed by code)
+
+`cargo run -p qwc-core --bin plan` is the single source of truth for these numbers.
+Memory model validation: the "checkpoint as is" estimate gives **20.50 GB** against
+the actual **20.6 GB** of files in the QUASAR repo, i.e. the per-layer parameter breakdown is correct.
+
+```
+Weights
+  checkpoint as is (vLLM loads):              20.50 GB
+  our load (text-only, fp8 head/embed):       17.08 GB
+  headroom:                                    3.42 GB
+
+Cache (kv fp8_e4m3, state bf16)
+  KV per token (16 layers):      32768 B
+  state per slot (48 layers):     81.4 MB
+  crossover point:                2484 tokens
+
+Budget
+  total VRAM       34.19 GB   (32607 MiB)
+  reserved          2.20 GB   (gnome-shell desktop ~1.2 GB + CUDA context)
+  weights          17.08 GB
   workspace         2.00 GB
-  под кэш          12.91 GB
+  for cache        12.91 GB
 ```
 
-Максимальный concurrency:
+Maximum concurrency:
 
-| контекст | fp8 KV | nvfp4 KV | vLLM-like (fp8 KV, веса как на диске) |
+| context | fp8 KV | nvfp4 KV | vLLM-like (fp8 KV, weights as on disk) |
 |---:|---:|---:|---:|
 | 4K | 59 | 82 | 44 |
 | 8K | 36 | 55 | 27 |
@@ -162,98 +162,98 @@ fp32 state (151 MB) ->  ~4 700 токенов контекста
 | 64K | 5 | 10 | 4 |
 | 128K | 2 | 5 | 2 |
 
-Вся целевая матрица бенчмарков (вплоть до 32 seq x 2.5K = 5.29 GB) помещается с запасом
-в 12.91 GB — упор в производительность, а не в память. Память становится узким местом
-начиная с 16K контекста.
+The whole target benchmark matrix (up to 32 seq x 2.5K = 5.29 GB) fits with room to spare
+in 12.91 GB — the bottleneck is performance, not memory. Memory becomes the bottleneck
+starting at 16K context.
 
-Два вывода:
-* **NVFP4 KV-кэш даёт +64% concurrency на 32K** — это отдельная крупная оптимизация,
-  которой нет в baseline на потребительском Blackwell.
-* **3.42 GB экономии на весах = +3 последовательности на 32K** (11 против 8),
-  то есть +37% ещё до единой строчки кернелов.
-
----
-
-## 4. Следствия для дизайна движка
-
-1. **KV-кэш ≠ вся память.** Нужны две подсистемы: paged KV (16 слоёв) + пул фиксированных
-   state-слотов (48 слоёв). Admission control должен считать обе.
-2. **Prefix caching почти не работает «как обычно».** Для linear-слоёв нельзя переиспользовать
-   часть префикса — только снапшот состояния на границе, а это 75–151 MB на снапшот.
-   Отдельный исследовательский вопрос: окупается ли snapshot-кэш префиксов.
-3. **head_dim = 256** — почти все готовые paged-attention кернелы заточены под ≤128.
-   На SM120 всего **99 KB shared memory на SM** (против 228 KB на SM100) → тайлинг придётся
-   проектировать вручную, это главный кернельный риск.
-4. **attn_output_gate** — лишний GEMM 5120×6144 на каждом full-attn слое, фьюзится с o_proj.
-5. **partial RoPE 25%** — RoPE только на 64 из 256 dims; остальное passthrough.
-   В **text-only** mrope вырождается в обычный RoPE (все три позиции равны) → выкидываем mrope целиком.
-6. **MTP встроен** → адаптивный speculative decoding доступен «из коробки», без второй модели.
-   Верификация дешёвая: draft = 1 слой.
-7. **Chunked prefill естественен** для DeltaNet (состояние переносится между чанками),
-   но требует chunk-wise parallel scan, а не наивной рекуррентности.
+Two conclusions:
+* **NVFP4 KV cache gives +64% concurrency at 32K** — a separate major optimization
+  that the baseline on consumer Blackwell lacks.
+* **3.42 GB saved on weights = +3 sequences at 32K** (11 vs 8),
+  i.e. +37% before a single line of kernel code.
 
 ---
 
-## 5. Целевое железо: RTX 5090 (GB202, SM120)
+## 4. Implications for engine design
+
+1. **KV cache ≠ all memory.** Two subsystems are needed: paged KV (16 layers) + a pool of fixed
+   state slots (48 layers). Admission control must account for both.
+2. **Prefix caching barely works "the usual way".** For linear layers you can't reuse
+   part of a prefix — only a state snapshot at a boundary, and that is 75–151 MB per snapshot.
+   A separate research question: does a snapshot prefix cache pay off.
+3. **head_dim = 256** — almost all off-the-shelf paged-attention kernels are tuned for ≤128.
+   SM120 has only **99 KB of shared memory per SM** (vs 228 KB on SM100) → tiling has to be
+   designed by hand; this is the main kernel risk.
+4. **attn_output_gate** — an extra 5120×6144 GEMM on every full-attn layer, fused with o_proj.
+5. **partial RoPE 25%** — RoPE only on 64 of 256 dims; the rest is passthrough.
+   In **text-only** mode mrope degenerates into plain RoPE (all three positions are equal) → drop mrope entirely.
+6. **MTP is built in** → adaptive speculative decoding is available out of the box, without a second model.
+   Verification is cheap: draft = 1 layer.
+7. **Chunked prefill is natural** for DeltaNet (state carries over between chunks),
+   but it requires a chunk-wise parallel scan, not a naive recurrence.
+
+---
+
+## 5. Target hardware: RTX 5090 (GB202, SM120)
 
 ```
 VRAM             32 GB GDDR7, ~1792 GB/s
-Compute cap      12.0  -> nvcc -arch=sm_120a (или compute_120f, CUDA 13.x)
-Driver (тут)     595.84, CUDA 13.2
+Compute cap      12.0  -> nvcc -arch=sm_120a (or compute_120f, CUDA 13.x)
+Driver (here)    595.84, CUDA 13.2
 Shared mem/SM    99 KB   (SM100: 228 KB)
 ```
 
-**Критично:** SM120 использует SM80-style `mma.sync` с block-scaling
-(`mma.sync.aligned.m16n8k64...kind::mxf4nvf4.block_scale`), а **не** `tcgen05.mma` датацентрового
-Blackwell. Всё, что построено на tcgen05 (DeepGEMM, часть CUTLASS SM100 collective builders),
-на 5090 не собирается и не работает. Нужны CUTLASS-схемы под SM120 с ручным тайлингом под 99 KB.
+**Critical:** SM120 uses SM80-style `mma.sync` with block scaling
+(`mma.sync.aligned.m16n8k64...kind::mxf4nvf4.block_scale`), **not** the datacenter
+Blackwell `tcgen05.mma`. Anything built on tcgen05 (DeepGEMM, some CUTLASS SM100 collective builders)
+does not build or run on the 5090. We need CUTLASS SM120 schemes with hand tiling for 99 KB.
 
-## 6. Известная слабость baseline (наш целевой выигрыш)
+## 6. Known baseline weakness (our target win)
 
-vLLM на одной RTX 5090 с NVFP4 требует `--enforce-eager` — при захвате CUDA-графов случается OOM.
-То есть **baseline работает без CUDA Graphs**. Статическое планирование памяти в
-специализированном рантайме позволяет графы захватить — это прямой, измеримый выигрыш по ITL.
+vLLM on a single RTX 5090 with NVFP4 requires `--enforce-eager` — capturing CUDA graphs OOMs.
+So **the baseline runs without CUDA Graphs**. Static memory planning in a
+specialized runtime lets us capture graphs — a direct, measurable ITL win.
 
 ---
 
-## 7. Целевой чекпоинт: QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4
+## 7. Target checkpoint: QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4
 
 ```
 format          nvfp4-pack-quantized  (compressed-tensors)
 group_size      16
-weight scale    float8_e4m3   (per-16 блок)
-act scale       float8_e4m3, local dynamic  -> W4A4, квантизация активаций на лету
+weight scale    float8_e4m3   (per-16 block)
+act scale       float8_e4m3, local dynamic  -> W4A4, activations quantized on the fly
 symmetric       true
 ignored         lm_head, .*visual.*, .*mtp.*, .*embed_vision.*, .*embed_audio.*
 ```
 
-Шарды: 5 × safetensors, **20.6 GB на диске**. Раскладка:
+Shards: 5 × safetensors, **20.6 GB on disk**. Layout:
 
-| | размер |
+| | size |
 |---|---:|
-| Все linear-слои (24.35B @ 4.5 бит) | 13.7 GB |
-| `lm_head` BF16 (не квантован) | 2.54 GB |
+| All linear layers (24.35B @ 4.5 bits) | 13.7 GB |
+| `lm_head` BF16 (not quantized) | 2.54 GB |
 | `embed_tokens` BF16 | 2.54 GB |
 | vision tower BF16 | ~1.0 GB |
-| MTP-голова BF16 | ~0.8 GB |
-| **итого** | **20.6 GB** |
+| MTP head BF16 | ~0.8 GB |
+| **total** | **20.6 GB** |
 
-### Наши преобразования при загрузке (то, чего vLLM не делает)
+### Our load-time transformations (what vLLM doesn't do)
 
-| Шаг | Экономия |
+| Step | Savings |
 |---|---:|
-| Не грузим vision tower (text-only) | −1.0 GB |
+| Skip the vision tower (text-only) | −1.0 GB |
 | `lm_head` → FP8 | −1.27 GB |
-| `embed_tokens` → FP8 (lookup, точность некритична) | −1.27 GB |
-| **VRAM под веса** | **≈ 17.0 GB** |
+| `embed_tokens` → FP8 (lookup, precision is not critical) | −1.27 GB |
+| **VRAM for weights** | **≈ 17.0 GB** |
 
-vLLM грузит все 20.6 GB. **3.6 GB форы = +3-4 последовательности на 32K контекста.**
+vLLM loads all 20.6 GB. **3.6 GB of headroom = +3-4 sequences at 32K context.**
 
-### Следствие для кернелов
+### Implications for kernels
 
-`local dynamic activation quantization` означает, что перед каждым GEMM нужно квантовать
-активации в FP4 с FP8-шкалой на блок 16 **в рантайме, на каждом токене**.
-Фьюз `RMSNorm -> amax(block16) -> quant_fp4` обязателен, иначе три лишних прохода по VRAM
-на каждом из 64 слоёв на каждом токене.
+`local dynamic activation quantization` means that before every GEMM the activations must be
+quantized to FP4 with an FP8 scale per block of 16 **at runtime, on every token**.
+Fusing `RMSNorm -> amax(block16) -> quant_fp4` is mandatory, otherwise that's three extra passes over VRAM
+on each of the 64 layers for every token.
 
-MTP-голова и `lm_head` остаются в BF16/FP8 -> нужен второй GEMM-путь помимо NVFP4.
+The MTP head and `lm_head` stay in BF16/FP8 -> a second GEMM path besides NVFP4 is needed.

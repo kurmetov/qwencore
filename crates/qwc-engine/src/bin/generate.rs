@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--prompt-ids" => {
                 prompt = args
                     .next()
-                    .ok_or("--prompt-ids требует список")?
+                    .ok_or("--prompt-ids needs a list")?
                     .split(',')
                     .map(|id| id.trim().parse::<u32>())
                     .collect::<Result<_, _>>()?;
@@ -31,12 +31,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let dir = dir.unwrap_or_else(|| home().join("models/Qwen3.8-27B-QUASAR-NVFP4"));
-    assert!(!prompt.is_empty(), "промпт пуст");
+    assert!(!prompt.is_empty(), "prompt is empty");
     assert!((1..=qwc_engine::executor::MAX_BATCH).contains(&batch));
     assert!(prompt.iter().all(|&id| (id as usize) < VOCAB_SIZE));
     assert!(
         prompt.len() + max_new <= context,
-        "промпт + генерация > контекста"
+        "prompt + generation > context"
     );
 
     qwc_cuda::Device::init(0)?;
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let weights = ModelWeights::load(&checkpoint)?;
     println!(
-        "веса: {:.2} GB за {:.1} s",
+        "weights: {:.2} GB in {:.1} s",
         weights.stats().resident_bytes() as f64 / 1e9,
         started.elapsed().as_secs_f64()
     );
@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_context: context,
     })?;
     println!(
-        "кэш и состояние: {:.2} GB на {batch} x {context} токенов\n",
+        "cache and state: {:.2} GB for {batch} x {context} tokens\n",
         executor.cache_bytes() as f64 / 1e9
     );
 
@@ -84,16 +84,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sampling.push(sample_started.elapsed().as_secs_f64() * 1e3);
     }
 
-    println!("промпт: {prompt:?}");
-    println!("выдано (sequence 0): {:?}", generated[0]);
+    println!("prompt: {prompt:?}");
+    println!("output (sequence 0): {:?}", generated[0]);
     if batch > 1 {
         println!(
-            "все {batch} одинаковых промптов совпали: {}",
+            "all {batch} identical prompts matched: {}",
             generated.windows(2).all(|pair| pair[0] == pair[1])
         );
     }
     println!(
-        "\nпромпт {} токенов за {:.1} ms ({:.3} ms/токен)",
+        "\nprompt {} tokens in {:.1} ms ({:.3} ms/token)",
         prompt.len() * batch,
         prompt_seconds * 1e3,
         prompt_seconds * 1e3 / (prompt.len() * batch) as f64
@@ -103,14 +103,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let median = latencies[latencies.len() / 2];
     let sample_median = sampling[sampling.len() / 2];
     println!(
-        "шаг decode: медиана {:.2} ms ({:.1} tok/s goodput), мин {:.2}, макс {:.2}",
+        "decode step: median {:.2} ms ({:.1} tok/s goodput), min {:.2}, max {:.2}",
         median,
         batch as f64 * 1000.0 / median,
         latencies[0],
         latencies[latencies.len() - 1]
     );
     println!(
-        "argmax на GPU: медиана {:.2} ms  =>  полный такт {:.2} ms ({:.1} tok/s goodput)",
+        "GPU argmax: median {:.2} ms  =>  full cycle {:.2} ms ({:.1} tok/s goodput)",
         sample_median,
         median + sample_median,
         batch as f64 * 1000.0 / (median + sample_median)
@@ -119,13 +119,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logits = executor.logits_to_host(0)?;
     let finite = logits.iter().filter(|value| value.is_finite()).count();
     println!(
-        "\nлогиты: конечных {finite} из {VOCAB_SIZE}, размах [{:.2}, {:.2}]",
+        "\nlogits: {finite} finite of {VOCAB_SIZE}, range [{:.2}, {:.2}]",
         logits.iter().cloned().fold(f32::INFINITY, f32::min),
         logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
     );
     let mut top: Vec<(usize, f32)> = logits.iter().cloned().enumerate().collect();
     top.sort_by(|a, b| b.1.total_cmp(&a.1));
-    println!("топ-5 последнего шага: {:?}", &top[..5]);
+    println!("top-5 of the last step: {:?}", &top[..5]);
     Ok(())
 }
 

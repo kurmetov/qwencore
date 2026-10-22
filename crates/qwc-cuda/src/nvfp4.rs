@@ -1,21 +1,21 @@
-//! NVFP4 decode-проекции.
+//! NVFP4 decode projections.
 //!
-//! Первый production-кандидат — W4A16 для batch 1..4: checkpoint-веса
-//! используются напрямую, активация остаётся BF16. Это сохраняет качество
-//! относительно W4A4 и убирает activation-quantization launch.
+//! The first production candidate is W4A16 for batch 1..4: checkpoint weights
+//! are used directly, the activation stays BF16. This preserves quality
+//! relative to W4A4 and removes the activation-quantization launch.
 
 use crate::error::{Result, check};
 use crate::{DeviceBuffer, Stream, bf16, ffi};
 
 pub const GROUP_SIZE: usize = 16;
 pub const MAX_W4A16_BATCH: usize = 6;
-/// Сколько строк ядро вообще умеет: `kMaxBatch` в `cuda/nvfp4.cu`. Политика
-/// (`MAX_W4A16_BATCH`) стоит ниже — там, где замер шага перестал выигрывать.
-/// Свипу нужен именно этот потолок, чтобы видеть, что за границей.
+/// How many rows the kernel can handle at all: `kMaxBatch` in `cuda/nvfp4.cu`. The policy
+/// (`MAX_W4A16_BATCH`) is set lower — where the step measurement stopped winning.
+/// The sweep needs exactly this cap, to see what's beyond the boundary.
 pub const MAX_W4A16_KERNEL_BATCH: usize = 8;
 pub const MAX_W4A4_BATCH: usize = 128;
-/// Потолок строк одного W4A4-вызова: ёмкость арены префилла
-/// (`PREFILL_CHUNK_SIZE`). Ограничение не кернела, а разметки буферов.
+/// Row cap of one W4A4 call: the prefill arena capacity
+/// (`PREFILL_CHUNK_SIZE`). A limit of buffer sizing, not of the kernel.
 pub const MAX_W4A4_ROWS: usize = crate::MAX_STEP_ROWS;
 const K_ALIGNMENT: usize = 256;
 
@@ -25,17 +25,17 @@ pub enum DecodeKernel {
     W4A4,
 }
 
-/// Измеренная на RTX 5090 граница для форм Qwen3.8.
+/// The boundary measured on the RTX 5090 for Qwen3.8 shapes.
 ///
-/// До batch 6 включительно берётся W4A16: он не квантует активации, и после
-/// амортизации shared-загрузок по двум строкам весов он уже не проигрывает
-/// тензорным ядрам даже на широких проекциях (`nvfp4bench`, batch 4:
-/// q+gate 958 против 953 ГБ/с у W4A4, gate/up 1156 против 980, down 1108
-/// против 1100).
+/// Up to and including batch 6, W4A16 is used: it doesn't quantize activations, and after
+/// amortizing shared loads over two weight rows it no longer loses to
+/// tensor cores even on wide projections (`nvfp4bench`, batch 4:
+/// q+gate 958 vs 953 GB/s for W4A4, gate/up 1156 vs 980, down 1108
+/// vs 1100).
 ///
-/// Граница стояла на 4, пока ядро не было инстанцировано выше. Замер шага
-/// (`stepprofile`, чистый decode, мс на шаг) показал, что переход в W4A4
-/// обходится дороже самого ядра:
+/// The boundary sat at 4 until the kernel was instantiated above that. A step measurement
+/// (`stepprofile`, pure decode, ms per step) showed that switching to W4A4
+/// costs more than the kernel itself:
 ///
 /// | concurrency | W4A16 | W4A4 |
 /// |---:|---:|---:|
@@ -44,30 +44,30 @@ pub enum DecodeKernel {
 /// | 7 | 24.94 | **22.39** |
 /// | 8 | 30.52 | **22.27** |
 ///
-/// До правки пятая последовательность **снижала** пропускную: 4 строки за
-/// 16.3 мс это 245 tok/s, а 5 за 21.7 — 231. Выше шести W4A16 упирается в
-/// регистры и shared, и выигрывают тензорные ядра.
+/// Before the fix the fifth sequence **reduced** throughput: 4 rows in
+/// 16.3 ms is 245 tok/s, while 5 in 21.7 is 231. Above six W4A16 is bound by
+/// registers and shared, and tensor cores win.
 ///
-/// Граница важна не только по скорости: W4A4 квантует активации, и строка 0
-/// спекулятивной проверки расходится с обычным decode на 0.64 по логитам
-/// против 0.11 у W4A16. На близких логитах это переворачивает argmax.
-/// Форма на границу влияет: у `down` длинный K и W4A4 обгоняет уже с пятой
-/// строки, а у `k`/`v` выход слишком узкий, чтобы занять тензорный тайл, и
-/// W4A4 проигрывает на любом batch. Таблица — в теле функции.
+/// The boundary matters not only for speed: W4A4 quantizes activations, and row 0
+/// of speculative verification diverges from regular decode by 0.64 in logits
+/// vs 0.11 for W4A16. On close logits this flips the argmax.
+/// Shape affects the boundary: `down` has a long K and W4A4 wins already from the fifth
+/// row, while for `k`/`v` the output is too narrow to fill a tensor tile, and
+/// W4A4 loses at any batch. The table is in the function body.
 pub fn select_decode_kernel(batch: usize, out_features: usize, in_features: usize) -> DecodeKernel {
     assert!((1..=MAX_W4A4_BATCH).contains(&batch));
-    // Узкий выход — k и v [1024, 5120]. Тензорным ядрам там нечем занять
-    // тайл 128x128, и W4A4 держит 157 ГБ/с на любом batch против 206..578 у
-    // W4A16. Граница здесь не в batch, а в том, что выход слишком узкий.
+    // Narrow output — k and v [1024, 5120]. Tensor cores have nothing to fill
+    // a 128x128 tile with there, and W4A4 holds 157 GB/s at any batch vs 206..578 for
+    // W4A16. The boundary here isn't in batch, but in the output being too narrow.
     if out_features <= 2048 {
         return match batch <= MAX_W4A16_KERNEL_BATCH {
             true => DecodeKernel::W4A16,
             false => DecodeKernel::W4A4,
         };
     }
-    // Длинный K — down [5120, 17408]. На нём W4A16 обгоняет только до
-    // четырёх строк (b=5: 976 против 1083 ГБ/с, b=6: 901 против 1098),
-    // потому что k-тайл приходится проходить втрое чаще остальных форм.
+    // Long K — down [5120, 17408]. On it W4A16 wins only up to
+    // four rows (b=5: 976 vs 1083 GB/s, b=6: 901 vs 1098),
+    // because the k tile has to be traversed three times as often as for other shapes.
     if in_features >= 3 * out_features {
         return match batch <= 4 {
             true => DecodeKernel::W4A16,
@@ -80,7 +80,7 @@ pub fn select_decode_kernel(batch: usize, out_features: usize, in_features: usiz
     }
 }
 
-/// NVFP4-матрица в исходной раскладке compressed-tensors.
+/// An NVFP4 matrix in the original compressed-tensors layout.
 pub struct Linear {
     packed: DeviceBuffer<u8>,
     cutlass_scales: DeviceBuffer<u8>,
@@ -90,8 +90,8 @@ pub struct Linear {
 }
 
 impl Linear {
-    /// Загружает матрицу без репака 4-битных весов и scale-матрицы.
-    /// `weight_global_scale` — значение из checkpoint; там это делитель.
+    /// Loads the matrix without repacking the 4-bit weights and the scale matrix.
+    /// `weight_global_scale` is the value from the checkpoint; there it's a divisor.
     pub fn from_host(
         packed: &[u8],
         scales: &[u8],
@@ -116,7 +116,7 @@ impl Linear {
         })
     }
 
-    /// Матрица с нулевыми данными для bandwidth-бенчмарка реальных форм.
+    /// A matrix with zero data for a bandwidth benchmark of real shapes.
     pub fn zeroed(out_features: usize, in_features: usize) -> Result<Self> {
         assert_shape(
             out_features * in_features / 2,
@@ -137,7 +137,7 @@ impl Linear {
         })
     }
 
-    /// Shared-weight W4A16 GEMV для decode batch 1..4.
+    /// Shared-weight W4A16 GEMV for decode batch 1..4.
     pub fn forward_w4a16(
         &self,
         input: &DeviceBuffer<u16>,
@@ -145,8 +145,8 @@ impl Linear {
         batch: usize,
         stream: &Stream,
     ) -> Result<()> {
-        // Потолок здесь кернельный, а не политический: на узких формах
-        // `select_decode_kernel` выбирает W4A16 и выше `MAX_W4A16_BATCH`.
+        // The cap here is the kernel's, not the policy's: on narrow shapes
+        // `select_decode_kernel` picks W4A16 even above `MAX_W4A16_BATCH`.
         assert!((1..=MAX_W4A16_KERNEL_BATCH).contains(&batch));
         assert!(input.len() >= batch * self.in_features);
         assert!(output.len() >= batch * self.out_features);
@@ -165,8 +165,8 @@ impl Linear {
         })
     }
 
-    /// Тот же W4A16, но с геометрией и раскладкой снаружи — для свипа форм.
-    /// Движок ходит через `forward_w4a16`, где всё выбирается по форме.
+    /// The same W4A16, but with geometry and layout from outside — for a shape sweep.
+    /// The engine goes through `forward_w4a16`, where everything is chosen by shape.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_w4a16_tuned(
         &self,
@@ -209,24 +209,24 @@ impl Linear {
         self.in_features
     }
 
-    /// Полный DRAM-трафик весов, без активаций и выхода.
+    /// Full DRAM traffic of the weights, without activations and output.
     pub fn weight_bytes(&self) -> usize {
         self.packed.bytes() + self.out_features * self.in_features / GROUP_SIZE
     }
 
-    /// Реальная постоянная VRAM с учётом padding scale-layout.
+    /// Actual persistent VRAM including scale-layout padding.
     pub fn resident_bytes(&self) -> usize {
         self.packed.bytes() + self.cutlass_scales.bytes()
     }
 
-    /// Копия упакованных весов обратно на хост — сверка загрузки с чекпоинтом
-    /// без доступа к внутреннему буферу.
+    /// A copy of the packed weights back to host — to check the load against the checkpoint
+    /// without access to the internal buffer.
     pub fn packed_to_host(&self) -> Result<Vec<u8>> {
         self.packed.to_vec()
     }
 
-    /// SM120 W4A4 tensor-core GEMM. Веса остаются в checkpoint layout;
-    /// переставленная копия требуется только для 8-битных scale-факторов.
+    /// SM120 W4A4 tensor-core GEMM. Weights stay in the checkpoint layout;
+    /// a permuted copy is needed only for the 8-bit scale factors.
     pub fn forward_w4a4_quantized(
         &self,
         input: &QuantizedActivation,
@@ -260,8 +260,8 @@ impl Linear {
     }
 }
 
-/// Уже квантованная decode-активация. Конструктор нужен также для тестирования
-/// GEMM независимо от будущего fused BF16->NVFP4 quantizer.
+/// An already quantized decode activation. The constructor is also needed for testing
+/// the GEMM independently of the future fused BF16->NVFP4 quantizer.
 pub struct QuantizedActivation {
     pub(crate) packed: DeviceBuffer<u8>,
     pub(crate) cutlass_scales: DeviceBuffer<u8>,
@@ -272,7 +272,7 @@ pub struct QuantizedActivation {
 }
 
 impl QuantizedActivation {
-    /// `scales` передаются в логическом row-major `[batch, K/16]` порядке.
+    /// `scales` are passed in logical row-major `[batch, K/16]` order.
     pub fn from_host(
         packed: &[u8],
         scales: &[u8],
@@ -296,8 +296,8 @@ impl QuantizedActivation {
         })
     }
 
-    /// Создаёт переиспользуемые output-буферы quantizer. Padded scale slots
-    /// обнуляются здесь один раз и остаются нулевыми между decode-шагами.
+    /// Creates reusable quantizer output buffers. Padded scale slots
+    /// are zeroed here once and stay zero between decode steps.
     pub fn zeroed(global_scale: f32, batch: usize, in_features: usize) -> Result<Self> {
         assert!((1..=MAX_W4A4_ROWS).contains(&batch));
         assert!(in_features > 0 && in_features.is_multiple_of(K_ALIGNMENT));
@@ -312,7 +312,7 @@ impl QuantizedActivation {
         })
     }
 
-    /// Квантует BF16 `[batch,K]` прямо в формат SM120 GEMM.
+    /// Quantizes BF16 `[batch,K]` directly into the SM120 GEMM format.
     pub fn quantize_bf16(&mut self, input: &DeviceBuffer<u16>, stream: &Stream) -> Result<()> {
         self.quantize_bf16_with_scale(input, self.global_scale, stream)
     }
@@ -369,7 +369,7 @@ impl QuantizedActivation {
         })
     }
 
-    /// Диагностический readback в логическом `[batch,K/16]` порядке.
+    /// Diagnostic readback in logical `[batch,K/16]` order.
     pub fn to_host_logical(&self) -> Result<(Vec<u8>, Vec<u8>)> {
         let packed = self.packed.to_vec()?;
         let swizzled = self.cutlass_scales.to_vec()?;
@@ -378,7 +378,7 @@ impl QuantizedActivation {
     }
 }
 
-/// Предвыделенный scratch CUTLASS. На decode hot path аллокаций нет.
+/// Preallocated CUTLASS scratch. No allocations on the decode hot path.
 pub struct W4A4Workspace {
     storage: DeviceBuffer<u8>,
     bytes: usize,
@@ -397,9 +397,9 @@ impl W4A4Workspace {
     pub fn for_shapes(batch: usize, shapes: &[(usize, usize)]) -> Result<Self> {
         assert!(batch > 0);
         assert!(!shapes.is_empty());
-        // Требование не монотонно по числу строк: узкая задача режется по K,
-        // и чем меньше M, тем больше блоков участвует в редукции. Арена
-        // предъявляет любое M до `batch`, поэтому берётся максимум по всем.
+        // The requirement isn't monotonic in the number of rows: a narrow problem is split along K,
+        // and the smaller M, the more blocks take part in the reduction. The arena
+        // presents any M up to `batch`, so the max over all of them is taken.
         let mut bytes = 0usize;
         for &(out_features, in_features) in shapes {
             for rows in 1..=batch {
@@ -416,8 +416,8 @@ impl W4A4Workspace {
             }
         }
         Ok(Self {
-            // cudaMalloc(0) не имеет переносимой семантики; указатель при
-            // нулевом workspace всё равно не разыменовывается CUTLASS.
+            // cudaMalloc(0) has no portable semantics; with a zero workspace
+            // CUTLASS doesn't dereference the pointer anyway.
             storage: DeviceBuffer::zeroed(bytes.max(1))?,
             bytes,
             max_batch: batch,
@@ -521,7 +521,7 @@ fn unswizzle_block_scales(scales: &[u8], rows: usize, in_features: usize) -> Vec
     output
 }
 
-/// Fused `silu(gate(x)) * up(x)` для Qwen MLP decode.
+/// Fused `silu(gate(x)) * up(x)` for Qwen MLP decode.
 pub fn swiglu_w4a16(
     gate: &Linear,
     up: &Linear,
@@ -567,7 +567,7 @@ fn assert_shape(
     assert!(weight_global_scale.is_finite() && weight_global_scale > 0.0);
 }
 
-/// CPU-oracle для bit-exact проверки layout и численной проверки GPU.
+/// CPU oracle for bit-exact layout checks and numeric GPU checks.
 pub mod reference {
     use super::*;
 
@@ -579,7 +579,7 @@ pub mod reference {
         E2M1[(raw & 0x0f) as usize]
     }
 
-    /// NVIDIA E4M3 finite (без infinity; 0x7f/0xff — NaN).
+    /// NVIDIA E4M3 finite (no infinity; 0x7f/0xff are NaN).
     pub fn e4m3(raw: u8) -> f32 {
         let sign = if raw & 0x80 == 0 { 1.0 } else { -1.0 };
         let exponent = (raw >> 3) & 0x0f;
@@ -749,12 +749,12 @@ mod tests {
             super::select_decode_kernel(4, 5_120, 17_408),
             super::DecodeKernel::W4A16
         );
-        // down [5120, 17408]: длинный K, W4A4 обгоняет уже с пятой строки.
+        // down [5120, 17408]: long K, W4A4 wins already from the fifth row.
         assert_eq!(
             super::select_decode_kernel(5, 5_120, 17_408),
             super::DecodeKernel::W4A4
         );
-        // la_out [5120, 6144]: общая граница — шесть строк.
+        // la_out [5120, 6144]: the common boundary is six rows.
         assert_eq!(
             super::select_decode_kernel(6, 5_120, 6_144),
             super::DecodeKernel::W4A16
@@ -763,7 +763,7 @@ mod tests {
             super::select_decode_kernel(7, 5_120, 6_144),
             super::DecodeKernel::W4A4
         );
-        // k и v [1024, 5120]: W4A4 проигрывает на любом batch.
+        // k and v [1024, 5120]: W4A4 loses at any batch.
         assert_eq!(
             super::select_decode_kernel(8, 1_024, 5_120),
             super::DecodeKernel::W4A16

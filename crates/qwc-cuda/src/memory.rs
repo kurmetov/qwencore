@@ -1,8 +1,8 @@
-//! Device-память с RAII.
+//! Device memory with RAII.
 //!
-//! Движок работает на преаллоцированных буферах: аллокации во время инференса
-//! не допускаются. Этот тип — фундамент для статического плана памяти, а не
-//! аллокатор общего назначения.
+//! The engine runs on preallocated buffers: allocations during inference
+//! are not allowed. This type is the foundation of a static memory plan, not
+//! a general-purpose allocator.
 
 use crate::error::{Result, check};
 use crate::ffi;
@@ -26,18 +26,18 @@ impl MemoryUsage {
     }
 }
 
-/// Запас на то, что наш учёт не видит: cudaMalloc округляет каждую аллокацию
-/// вверх, и на сотнях буферов разница набегает в сотни мегабайт.
+/// Headroom for what our accounting doesn't see: cudaMalloc rounds every allocation
+/// up, and across hundreds of buffers the difference adds up to hundreds of megabytes.
 const FREE_MARGIN: usize = 512 * 1024 * 1024;
 
 /// Sets a hard ceiling for allocations owned by this engine process. Configure
 /// it after creating the CUDA context and before allocating any model buffer.
 ///
-/// Потолок урезается по фактически свободной памяти карты: рядом живут чужие
-/// процессы, и запрошенный бюджет может просто не существовать. Без этого
-/// движок доходит до середины загрузки и падает на cudaMalloc, тогда как vLLM
-/// в той же точке профилирует свободную память и берёт меньше номинала.
-/// Возвращает лимит, который реально установлен.
+/// The ceiling is clipped to the card's actually free memory: other processes
+/// live alongside, and the requested budget may simply not exist. Without this
+/// the engine gets halfway through loading and fails on cudaMalloc, whereas vLLM
+/// at the same point profiles free memory and takes less than nominal.
+/// Returns the limit actually set.
 pub fn set_memory_limit(bytes: usize) -> std::result::Result<usize, &'static str> {
     if bytes == 0 {
         return Err("VRAM limit must be positive");
@@ -50,21 +50,21 @@ pub fn set_memory_limit(bytes: usize) -> std::result::Result<usize, &'static str
         None => bytes,
     };
     if effective == 0 {
-        return Err("на карте нет свободной памяти под запрошенный бюджет");
+        return Err("no free memory on the card for the requested budget");
     }
     MEMORY_LIMIT.store(effective, Ordering::Release);
     Ok(effective)
 }
 
-/// Свободно байт на устройстве, или `None`, если контекст ещё не создан и
-/// спрашивать некого — тогда лимит остаётся тем, что задал вызывающий.
+/// Free bytes on the device, or `None` if the context isn't created yet and
+/// there's nobody to ask — then the limit stays what the caller set.
 ///
-/// Это единственная честная величина при делёжке карты: наш собственный учёт
-/// считает запрошенные байты, а не то, во что их округлил драйвер, и не видит
-/// ни контекст, ни графы, ни чужие процессы.
+/// This is the only honest quantity when sharing the card: our own accounting
+/// counts requested bytes, not what the driver rounded them to, and doesn't see
+/// the context, graphs, or other processes.
 pub fn device_free_bytes() -> Option<usize> {
     let (mut free, mut total) = (0usize, 0usize);
-    // SAFETY: обе ссылки валидны; вызов не трогает наши буферы.
+    // SAFETY: both references are valid; the call doesn't touch our buffers.
     let status = unsafe { ffi::cudaMemGetInfo(&mut free, &mut total) };
     (status == 0 && total > 0).then_some(free)
 }
@@ -97,8 +97,8 @@ pub struct DeviceBuffer<T> {
     _marker: PhantomData<T>,
 }
 
-// Device-указатель можно передавать между потоками: он принадлежит контексту,
-// а не потоку. Синхронизацию доступа обеспечивают потоки CUDA.
+// A device pointer can be sent between threads: it belongs to the context,
+// not the thread. Access synchronization is provided by CUDA streams.
 unsafe impl<T: Send> Send for DeviceBuffer<T> {}
 unsafe impl<T: Sync> Sync for DeviceBuffer<T> {}
 
@@ -155,21 +155,21 @@ impl<T> DeviceBuffer<T> {
         })
     }
 
-    /// Копирует срез хоста в начало буфера, не пересоздавая аллокацию:
-    /// на пути загрузки один staging-буфер переиспользуется десятки раз.
+    /// Copies a host slice to the start of the buffer without recreating the allocation:
+    /// on the load path one staging buffer is reused dozens of times.
     pub fn copy_from_slice(&mut self, data: &[T]) -> Result<()> {
         self.copy_from_slice_at(0, data)
     }
 
-    /// Копирует срез хоста в заданное смещение без промежуточной
-    /// host-копии. Это позволяет потоково загружать большие mmap-тензоры.
+    /// Copies a host slice to the given offset without an intermediate
+    /// host copy. This allows streaming large mmap tensors.
     pub fn copy_from_slice_at(&mut self, offset: usize, data: &[T]) -> Result<()> {
         assert!(offset <= self.len && data.len() <= self.len - offset);
         if data.is_empty() {
             return Ok(());
         }
         let byte_offset = offset * std::mem::size_of::<T>();
-        // SAFETY: диапазон элементов проверен assertion выше.
+        // SAFETY: element range checked by the assertion above.
         let destination = unsafe { (self.ptr as *mut u8).add(byte_offset).cast() };
         check(unsafe {
             ffi::cudaMemcpy(
@@ -181,11 +181,11 @@ impl<T> DeviceBuffer<T> {
         })
     }
 
-    /// Копия диапазона элементов из другого буфера, не выходя на хост.
+    /// A copy of an element range from another buffer, without going through the host.
     ///
-    /// Нужна там, где кернелу нужен отдельный буфер, а данные уже лежат
-    /// строкой внутри чужой арены: строка скрытых состояний под MTP-черновик,
-    /// снимок состояния DeltaNet под откат спекуляции.
+    /// Needed where a kernel needs a separate buffer, but the data already sits
+    /// as a row inside someone else's arena: the hidden-state row for the MTP draft,
+    /// the DeltaNet state snapshot for speculation rollback.
     pub fn copy_from_device_at(
         &mut self,
         offset: usize,
@@ -199,7 +199,7 @@ impl<T> DeviceBuffer<T> {
             return Ok(());
         }
         let size = std::mem::size_of::<T>();
-        // SAFETY: оба диапазона проверены assertion выше.
+        // SAFETY: both ranges checked by the assertion above.
         let destination = unsafe { (self.ptr as *mut u8).add(offset * size).cast() };
         let from = unsafe { (source.ptr as *const u8).add(source_offset * size).cast() };
         check(unsafe {
@@ -213,8 +213,8 @@ impl<T> DeviceBuffer<T> {
         })
     }
 
-    /// Копия диапазона внутри одного буфера: снимок слота состояния под
-    /// откат спекуляции и возврат принятого состояния на место.
+    /// A copy of a range within one buffer: a state-slot snapshot for
+    /// speculation rollback and putting the accepted state back.
     pub fn copy_within(
         &mut self,
         destination_offset: usize,
@@ -227,7 +227,7 @@ impl<T> DeviceBuffer<T> {
             return Ok(());
         }
         let size = std::mem::size_of::<T>();
-        // SAFETY: оба диапазона внутри аллокации, проверено выше.
+        // SAFETY: both ranges are inside the allocation, checked above.
         let destination = unsafe { (self.ptr as *mut u8).add(destination_offset * size).cast() };
         let from = unsafe { (self.ptr as *const u8).add(source_offset * size).cast() };
         check(unsafe {
@@ -270,7 +270,7 @@ impl<T> DeviceBuffer<T> {
         Ok(host)
     }
 
-    /// Элементы `[start, start + len)` на хост.
+    /// Elements `[start, start + len)` to host.
     pub fn to_vec_range(&self, start: usize, len: usize) -> Result<Vec<T>>
     where
         T: Copy + Default,

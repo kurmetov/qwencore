@@ -1,184 +1,184 @@
-# Где мы стоим и куда бить — 2026-09-16
+# Where we stand and where to hit — 2026-09-16
 
-> **Одиночные точки одной сессии, без доверительных интервалов.** Сравнение с
-> vLLM здесь снято до появления протокола
-> [`docs/11-experiments.md`](../../docs/11-experiments.md): один-два прогона на
-> точку, без ротации порядка вариантов и без bootstrap CI, на частично занятой
-> карте. Эти множители отменяются прогоном comparison suite и не должны
-> цитироваться как результат проекта. Условия каждой точки — ниже по тексту.
+> **Single points from one session, without confidence intervals.** The comparison with
+> vLLM here was taken before the protocol
+> [`docs/11-experiments.md`](../../docs/11-experiments.md) existed: one or two runs per
+> point, no variant order rotation and no bootstrap CI, on a partially busy
+> card. These multipliers are superseded by a comparison suite run and must not
+> be quoted as a project result. The conditions of each point are given below.
 
-Все числа ниже сняты в одной сессии, подряд, на одной карте. Между сессиями
-машина дрейфует на 5%, поэтому с таблицами прошлых дней их сравнивать нельзя.
+All numbers below were taken in one session, back to back, on one card. Between sessions
+the machine drifts by 5%, so they can't be compared with tables from previous days.
 
-## 1. Счёт против vLLM 0.28
+## 1. Score against vLLM 0.28
 
-Условия одинаковые у обоих: контекст 8192, **bf16 KV**, уникальный промпт на
-запрос, всё подано в t=0, `bench/servebench.py`. Ширина шага свипнута с обеих
-сторон (у нас `--prefill-chunk`, у vLLM `--max-batched-tokens`), в таблице —
-лучшая. Медиана двух прогонов.
+Conditions are the same for both: context 8192, **bf16 KV**, a unique prompt per
+request, everything submitted at t=0, `bench/servebench.py`. Step width swept on both
+sides (`--prefill-chunk` for us, `--max-batched-tokens` for vLLM), the table shows
+the best. Median of two runs.
 
-| точка | qwencore | vLLM 0.28 | |
+| point | qwencore | vLLM 0.28 | |
 |---|---:|---:|---|
-| batch-1 decode, ITL | **12.66 мс** (79.0 tok/s) | 19.83 мс (50.4 tok/s) | **мы 1.57x** |
-| 256/128, c=32, 160 запросов | **1154 tok/s** | 496 tok/s | **мы 2.33x** |
-| 4096/512, c=16 | **414 tok/s** (39.6 с) | 176 tok/s (92.9 с) | **мы 2.34x** |
-| 4096/8, c=16 — чистый prefill | 11 731 tok/s | **13 100 tok/s** | vLLM 1.12x |
+| batch-1 decode, ITL | **12.66 ms** (79.0 tok/s) | 19.83 ms (50.4 tok/s) | **us 1.57x** |
+| 256/128, c=32, 160 requests | **1154 tok/s** | 496 tok/s | **us 2.33x** |
+| 4096/512, c=16 | **414 tok/s** (39.6 s) | 176 tok/s (92.9 s) | **us 2.34x** |
+| 4096/8, c=16 — pure prefill | 11 731 tok/s | **13 100 tok/s** | vLLM 1.12x |
 
-**Оговорка, без которой таблица врёт.** Карту частично держит чужой сервис,
-свободно около 27 ГБ из 32.6. Мы жили под `--memory-limit-gb 26`, vLLM — под
-`--gpu-memory-utilization 0.75` (24.5 ГБ). vLLM грузит 20.5 ГБ весов против
-наших 17.08 (text-only, fp8 head и embed), поэтому под KV ему осталось около
-4 ГБ, и на длинной точке он голодает по кэшу: его ITL лучше нашего (21.7
-против 28.6 мс), а сквозная пропускная вдвое хуже — он просто держит меньше
-последовательностей разом. Часть разрыва 2.3x на смешанных точках — это наша
-фора по весам, а не скорость ядер. Фора настоящая и никуда не денется на
-32-гигабайтной карте, но называть её кернельным преимуществом нечестно.
+**A caveat without which the table lies.** The card is partially held by someone else's service,
+about 27 GB of 32.6 is free. We lived under `--memory-limit-gb 26`, vLLM under
+`--gpu-memory-utilization 0.75` (24.5 GB). vLLM loads 20.5 GB of weights vs
+our 17.08 (text-only, fp8 head and embed), so it had about 4 GB left for KV,
+and on the long point it starves for cache: its ITL is better than ours (21.7
+vs 28.6 ms), but end-to-end throughput is half — it simply holds fewer
+sequences at once. Part of the 2.3x gap on mixed points is our
+weight headroom, not kernel speed. The headroom is real and won't go away on a
+32 GB card, but calling it a kernel advantage is dishonest.
 
-Чистая точка одна — prefill: там память почти не при чём, и там мы **позади
-на 12%**. Утром 12.09 было отставание в 3.9 раза.
+There is only one clean point — prefill: memory is barely involved there, and there we are **behind
+by 12%**. On the morning of 12.09 the lag was 3.9x.
 
-## 2. Что прошли за четыре дня
+## 2. What we covered in four days
 
 | | 11.09 | 12.09 | 14.09 | 16.09 |
 |---|---:|---:|---:|---:|
-| batch-1 ITL | 13.11 мс | | | **12.66 мс** |
-| c=64/80, чат | 1026 tok/s | 1498 | | **1154 @ c=32** |
-| чистый prefill | | 3763 tok/s | 7488 | **11 731** |
+| batch-1 ITL | 13.11 ms | | | **12.66 ms** |
+| c=64/80, chat | 1026 tok/s | 1498 | | **1154 @ c=32** |
+| pure prefill | | 3763 tok/s | 7488 | **11 731** |
 
-Крупное по порядку: слитый шаг вместо прохода на последовательность (+27%),
-батчевый `lm_head` (восемь проходов по словарю -> один, +20% на c=64),
-рекуррентный decode DeltaNet на 84-95% полосы, stream-K для узких NVFP4-форм,
-слитая входная проекция миксера (+9%), MMA-внимание на префилле (2x),
-чанк префилла 512 -> 2048 (+21%), чанковый WY-скан DeltaNet (2.19x на фазе),
-тайл внимания в 64 строки (1.89x на ядре).
+The big items in order: a fused step instead of a pass per sequence (+27%),
+batched `lm_head` (eight passes over the vocab -> one, +20% at c=64),
+recurrent DeltaNet decode at 84-95% of bandwidth, stream-K for narrow NVFP4 shapes,
+fused mixer input projection (+9%), MMA attention in prefill (2x),
+prefill chunk 512 -> 2048 (+21%), chunked DeltaNet WY scan (2.19x on the phase),
+64-row attention tile (1.89x on the kernel).
 
-## 3. Что перепробовано и отвергнуто замером
+## 3. What was tried and rejected by measurement
 
-Чтобы не ходить второй раз:
+So we don't go there twice:
 
-- тайловое prefill-внимание (8 строк на тайл, варп на строку) — **медленнее**
-  построчного decode-пути: 13.2 против 9.3 мс;
-- `kMmaGroups` — обслуживать несколько голов группы одним KV-тайлом: 3-5% на
-  длинном контексте и ноль на коротком, регистровое давление съедает трафик;
-- shared под alpha/beta/k.q в скане, 8 строк состояния на варп, блоки по 256
-  потоков — все три медленнее базы;
-- склейка gate+up в одну матрицу на M=2048 — 1% (на M=511 давала 12%, но
-  выигрывал там узкий M, а не склейка);
-- `ldmatrix.x4` вместо `.x2` во внимании — ничего (49.7 против 50.1 мс);
-- KV-тайл в 16 ключей вместо 32 — хуже, лишние барьеры дороже занятости;
-- транспонирование значений внутри слитого скана вместо отдельного ядра —
-  11.2 -> 11.8 мкс/токен;
-- форсированный W4A4 на batch 1 — хуже и по скорости, и по точности
-  (top-1 0.991 против 1.000).
+- tiled prefill attention (8 rows per tile, warp per row) — **slower**
+  than the row-wise decode path: 13.2 vs 9.3 ms;
+- `kMmaGroups` — serving several heads of a group with one KV tile: 3-5% on
+  long context and zero on short, register pressure eats the traffic gain;
+- shared for alpha/beta/k.q in the scan, 8 state rows per warp, blocks of 256
+  threads — all three slower than the baseline;
+- merging gate+up into one matrix at M=2048 — 1% (at M=511 it gave 12%, but
+  what won there was the narrow M, not the merge);
+- `ldmatrix.x4` instead of `.x2` in attention — nothing (49.7 vs 50.1 ms);
+- a 16-key KV tile instead of 32 — worse, the extra barriers cost more than occupancy gains;
+- transposing values inside the fused scan instead of a separate kernel —
+  11.2 -> 11.8 µs/token;
+- forced W4A4 at batch 1 — worse in both speed and accuracy
+  (top-1 0.991 vs 1.000).
 
-## 4. Физика: сколько осталось в каждом режиме
+## 4. Physics: how much is left in each mode
 
-**Decode упирается в память.** Шаг читает все веса (17.08 ГБ) плюс состояние
-DeltaNet плюс KV. Аналитический потолок batch-1 — 10.78 мс; мы на 12.66, то
-есть **84% потолка**, vLLM на 54%. Кернельными правками здесь осталось 18%, и
-ни одна из них не даст больше пары процентов.
+**Decode is memory-bound.** A step reads all the weights (17.08 GB) plus the DeltaNet
+state plus KV. The analytical batch-1 ceiling is 10.78 ms; we're at 12.66, i.e.
+**84% of the ceiling**, vLLM at 54%. Kernel changes have 18% left here, and
+none of them will give more than a couple of percent.
 
-**Prefill упирается в тензорные ядра.** 2 x 26.87e9 FLOP на токен: наши
-11 731 tok/s — это 630 TFLOP/s, **37.6% пика NVFP4** (1676). vLLM на 13 100 —
-42.1%. Разбивка нашего шага на позиции 3584: внимание 27.0%, `gemm.mlp_gate_up`
-20.8%, `mlp_down` 11.3%, скан 11.1%. Даже если обнулить внимание целиком,
-выйдет +37%; реалистичный кернельный остаток — 15-25%.
+**Prefill is tensor-core-bound.** 2 x 26.87e9 FLOP per token: our
+11 731 tok/s is 630 TFLOP/s, **37.6% of NVFP4 peak** (1676). vLLM at 13 100 —
+42.1%. Breakdown of our step at position 3584: attention 27.0%, `gemm.mlp_gate_up`
+20.8%, `mlp_down` 11.3%, scan 11.1%. Even zeroing attention entirely
+would give +37%; the realistic kernel remainder is 15-25%.
 
-Вывод, который и определяет план: **кернельными правками мы вытянем префилл до
-паритета, но не «разъебём». Разрыв создаётся не там.**
+The conclusion that defines the plan: **with kernel changes we'll pull prefill up to
+parity, but we won't crush it. The gap is created elsewhere.**
 
-## 5. Куда бить
+## 5. Where to hit
 
-### 5.1 MTP-спекуляция — главное
+### 5.1 MTP speculation — the main thing
 
-В чекпоинте лежит draft-голова: `mtp.*`, один слой внимания плюс fc, **849 МБ
-в BF16**. Мы её не грузим — `checkpoint.rs` только считает её байты и кладёт в
-`unused`. `docs/01-model-architecture.md` с самого начала записал: acceptance
-rate этой головы, замеренный в vLLM, — **0.77-0.90 при трёх спекулятивных
-токенах**.
+The checkpoint contains a draft head: `mtp.*`, one attention layer plus fc, **849 MB
+in BF16**. We don't load it — `checkpoint.rs` only counts its bytes and puts them in
+`unused`. `docs/01-model-architecture.md` recorded from the very start: the acceptance
+rate of this head, measured in vLLM, is **0.77-0.90 with three speculative
+tokens**.
 
-Экономика на наших числах (полоса 1.79 ТБ/с):
+Economics on our numbers (bandwidth 1.79 TB/s):
 
-- черновой шаг = чтение 849 МБ = **475 мкс**, это 5% веса основного шага;
-- откат состояния DeltaNet = снимок 81.4 МБ туда-обратно = **91 мкс**;
-- верификация k+1 токенов — один проход основной модели, ровно тот же путь,
-  что уже есть у чанка префилла.
+- a draft step = reading 849 MB = **475 µs**, that's 5% of the main step's weight;
+- rolling back DeltaNet state = an 81.4 MB snapshot there and back = **91 µs**;
+- verifying k+1 tokens is one pass of the main model, exactly the same path
+  the prefill chunk already has.
 
-| k | acceptance | E[токенов] | шаг | tok/s | к нам | к vLLM |
+| k | acceptance | E[tokens] | step | tok/s | vs us | vs vLLM |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 0.77 | 1.77 | 13.2 мс | 134 | 1.69x | 2.65x |
-| 2 | 0.77 | 2.36 | 13.7 мс | 172 | 2.18x | 3.42x |
-| 3 | 0.77 | 2.82 | 14.2 мс | 199 | 2.52x | 3.94x |
-| 3 | 0.90 | 3.44 | 14.2 мс | 243 | 3.07x | 4.81x |
+| 1 | 0.77 | 1.77 | 13.2 ms | 134 | 1.69x | 2.65x |
+| 2 | 0.77 | 2.36 | 13.7 ms | 172 | 2.18x | 3.42x |
+| 3 | 0.77 | 2.82 | 14.2 ms | 199 | 2.52x | 3.94x |
+| 3 | 0.90 | 3.44 | 14.2 ms | 243 | 3.07x | 4.81x |
 
-То есть batch-1 уходит с 79 к 170-240 tok/s. Потолок памяти (92.8 tok/s) это
-не нарушает — он перестаёт быть потолком, потому что за один проход весов
-выходит больше одного токена.
+So batch 1 goes from 79 to 170-240 tok/s. This doesn't violate the memory ceiling (92.8 tok/s)
+— it stops being a ceiling, because one pass over the weights
+yields more than one token.
 
-**Почему это именно наш ход, а не общий.** Гибридная модель: 48 слоёв из 64
-несут рекуррентное состояние, и спекуляция требует его отката. У нас откат
-стоит 91 мкс на последовательность, потому что слот состояния — наш
-собственный пул, и снимок делается одним копированием. Плюс наш шаг идёт на
-84% потолка против 54% у vLLM: даже если они включат MTP, множитель ляжет на
-худшую базу.
+**Why this is specifically our move, not a general one.** A hybrid model: 48 of 64 layers
+carry recurrent state, and speculation requires rolling it back. For us rollback
+costs 91 µs per sequence, because the state slot is our
+own pool, and a snapshot is a single copy. Plus our step runs at
+84% of the ceiling vs 54% for vLLM: even if they enable MTP, the multiplier lands on
+a worse base.
 
-**Первый шаг стоит полдня и отвечает на весь вопрос.** Загрузить голову и
-прогнать её оффлайн на корпусе `bench/corpus/core.jsonl`: посчитать, как часто
-argmax MTP совпадает со следующим токеном основной модели. Ни верификации, ни
-отката, ни планировщика — только acceptance. Если он подтвердит 0.77+, дальше
-строить всю машинерию; если нет — мы сэкономили неделю.
+**The first step costs half a day and answers the whole question.** Load the head and
+run it offline on the `bench/corpus/core.jsonl` corpus: count how often the
+MTP argmax matches the main model's next token. No verification, no
+rollback, no scheduler — only acceptance. If it confirms 0.77+, build
+all the machinery next; if not, we've saved a week.
 
-### 5.2 Состояние DeltaNet в FP8 — вторая по величине
+### 5.2 DeltaNet state in FP8 — the second biggest
 
-Слот состояния — 81.4 МБ на последовательность, читается и переписывается
-каждый шаг. Доля в трафике шага: 21% при c=32, 33% при c=64, 37% при c=80.
+A state slot is 81.4 MB per sequence, read and rewritten
+every step. Its share of step traffic: 21% at c=32, 33% at c=64, 37% at c=80.
 
-| c | трафик шага сейчас | в fp8 | потолок tok/s сейчас | в fp8 |
+| c | step traffic now | in fp8 | tok/s ceiling now | in fp8 |
 |---:|---:|---:|---:|---:|
-| 32 | 24.4 ГБ | 21.8 ГБ | 2344 | 2624 (+12%) |
-| 64 | 31.8 ГБ | 26.6 ГБ | 3603 | 4309 (+20%) |
-| 80 | 35.5 ГБ | 29.0 ГБ | 4037 | 4945 (+23%) |
+| 32 | 24.4 GB | 21.8 GB | 2344 | 2624 (+12%) |
+| 64 | 31.8 GB | 26.6 GB | 3603 | 4309 (+20%) |
+| 80 | 35.5 GB | 29.0 GB | 4037 | 4945 (+23%) |
 
-Второй эффект важнее первого: слот вдвое меньше — значит **вдвое больше
-слотов**. При контексте 2048 узкое место сейчас именно слот состояния, а не
-KV (точка пересечения — 2484 токена): 87 последовательностей против 120.
+The second effect matters more than the first: a slot half the size means **twice as many
+slots**. At context 2048 the bottleneck right now is exactly the state slot, not
+KV (the crossover point is 2484 tokens): 87 sequences vs 120.
 
-Риск — точность: состояние рекуррентное, ошибка накапливается по всей длине.
-Проверяется ровно тем же дифф-eval, что и все прошлые A/B по типам; переключатель
-`--delta-state` уже есть.
+The risk is accuracy: the state is recurrent, the error accumulates over the whole length.
+Checked with exactly the same diff-eval as all previous per-type A/Bs; the
+`--delta-state` switch already exists.
 
-### 5.3 Снапшоты префиксов — для агентного сценария
+### 5.3 Prefix snapshots — for the agent scenario
 
-README целит в Pi и Hermes, то есть в диалог, где каждый ход пересылает всю
-историю. Сейчас ход с историей в 8k токенов платит полный префилл (0.7 с);
-при живой сессии он платил бы только за новые токены (~0.03 с).
+The README targets Pi and Hermes, i.e. a dialog where every turn resends the whole
+history. Right now a turn with an 8k-token history pays full prefill (0.7 s);
+with a live session it would pay only for the new tokens (~0.03 s).
 
-Для 16 слоёв внимания это обычный prefix cache поверх нашего страничного пула.
-Для 48 линейных слоёв переиспользовать часть префикса нельзя — только снимок
-состояния на границе, 81.4 МБ на снимок (`docs/01-model-architecture.md` называет
-это «отдельным исследовательским вопросом»). Для одного-двух живых диалогов это
-копейки; для сотни — не влезет. То есть правильная форма — не общий prefix
-cache, а **продолжение сессии**: держать слот последовательности живым между
-ходами и сверять префикс.
+For the 16 attention layers it's an ordinary prefix cache on top of our page pool.
+For the 48 linear layers part of a prefix can't be reused — only a snapshot of
+state at the boundary, 81.4 MB per snapshot (`docs/01-model-architecture.md` calls
+it "a separate research question"). For one or two live dialogs that's
+pennies; for a hundred it won't fit. So the right form is not a general prefix
+cache but **session continuation**: keep the sequence's slot alive between
+turns and check the prefix.
 
-### 5.4 Кернельный остаток префилла — на паритет
+### 5.4 Remaining prefill kernel work — to reach parity
 
-- **FP8-внимание.** Ядро идёт на 75 TFLOP/s при bf16-пике 210; fp8 удваивает
-  пик, а KV у нас и так лежит в fp8 — сейчас мы его разворачиваем в bf16 при
-  укладке. Оценка: фаза −30%, шаг −8%.
-- **Занятость внимания.** 67.8 КБ shared на CTA — один блок и четыре варпа на
-  SM. Xor-swizzle вместо набивки уводит тайлы под 50 КБ и даёт два блока.
-- **`wy_factor`** — блочная инверсия 16x16 на MMA вместо панельной подстановки.
-- **`cp.async`** с двойной буферизацией в обоих тайловых ядрах.
+- **FP8 attention.** The kernel runs at 75 TFLOP/s against a bf16 peak of 210; fp8 doubles
+  the peak, and our KV is already in fp8 — right now we expand it to bf16 when
+  staging. Estimate: phase −30%, step −8%.
+- **Attention occupancy.** 67.8 KB of shared per CTA — one block and four warps per
+  SM. An XOR swizzle instead of padding brings tiles under 50 KB and gives two blocks.
+- **`wy_factor`** — a 16x16 block inversion on MMA instead of panel substitution.
+- **`cp.async`** with double buffering in both tiled kernels.
 
-## 6. Порядок
+## 6. Order
 
-1. Acceptance MTP оффлайн — полдня, решает судьбу всего направления.
-2. MTP-спекуляция целиком, если acceptance подтвердился.
-3. FP8-состояние DeltaNet (A/B по дифф-eval) — и throughput, и ёмкость.
-4. Кернельный остаток префилла до паритета с vLLM.
-5. Продолжение сессии — когда появится агентный сценарий как цель замера.
+1. MTP acceptance offline — half a day, decides the fate of the whole direction.
+2. Full MTP speculation, if acceptance is confirmed.
+3. FP8 DeltaNet state (A/B via diff-eval) — both throughput and capacity.
+4. Remaining prefill kernel work up to parity with vLLM.
+5. Session continuation — once an agent scenario becomes a measurement target.
 
-И одно про методику: сравнение с vLLM нужно повторить на полностью свободной
-карте. Сегодня он жил под 24.5 ГБ, на своих любимых 0.93 (30.3 ГБ) он на
-смешанных точках выглядит иначе.
+And one note on methodology: the comparison with vLLM must be repeated on a completely free
+card. Today it lived under 24.5 GB; at its favorite 0.93 (30.3 GB) it
+looks different on mixed points.

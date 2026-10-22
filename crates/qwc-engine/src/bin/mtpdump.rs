@@ -1,15 +1,15 @@
-//! Выгрузка скрытых состояний под замер acceptance MTP-головы.
+//! Dumps hidden states for measuring MTP head acceptance.
 //!
 //! `cargo run --release -p qwc-engine --bin mtpdump -- --corpus bench/corpus/core.jsonl --max-new 128 --out /tmp/mtp`
 //!
-//! Draft-голова принимает на вход пару (h_t, эмбеддинг токена t+1) и должна
-//! предсказать токен t+2. Здесь снимается левая часть этой пары: финальные
-//! скрытые состояния всех позиций и сами токены. Дальше
-//! `bench/mtp_acceptance.py` считает голову и сверяет её argmax с тем, что
-//! выдала настоящая модель.
+//! The draft head takes the pair (h_t, embedding of token t+1) as input and must
+//! predict token t+2. Here the left part of that pair is captured: the final
+//! hidden states of all positions and the tokens themselves. Then
+//! `bench/mtp_acceptance.py` computes the head and compares its argmax with what
+//! the real model produced.
 //!
-//! Формат файла: "QWCMTP01", четыре u32 (hidden, позиций, длина промпта,
-//! токенов), затем токены u32 и скрытые состояния bf16.
+//! File format: "QWCMTP01", four u32 (hidden, positions, prompt length,
+//! tokens), then u32 tokens and bf16 hidden states.
 
 use qwc_core::arch::{HIDDEN_SIZE, VOCAB_SIZE};
 use qwc_engine::{Executor, ExecutorConfig, ModelWeights, PREFILL_CHUNK_SIZE};
@@ -23,13 +23,13 @@ struct Case {
 }
 
 fn parse_cases(text: &str) -> Vec<Case> {
-    // Корпус — jsonl с полями id и prompt_token_ids. Полноценный парсер json
-    // тут не нужен: формат наш собственный и стабильный.
+    // The corpus is jsonl with id and prompt_token_ids fields. A full json parser
+    // isn't needed here: the format is our own and stable.
     let mut cases = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let id = field(line, "\"id\":").unwrap_or_else(|| "case".into());
-        // Корпус знает две формы промпта: явный список токенов и повтор
-        // короткого куска до заданной длины.
+        // The corpus knows two prompt forms: an explicit token list and a repeat
+        // of a short piece up to a given length.
         let prompt = match (list(line, "\"prompt_token_ids\":"), list(line, "\"token_ids\":")) {
             (Some(ids), _) => ids,
             (None, Some(unit)) => {
@@ -38,10 +38,10 @@ fn parse_cases(text: &str) -> Vec<Case> {
                     .nth(1)
                     .and_then(|rest| rest.split([',', '}']).next())
                     .and_then(|x| x.trim().parse().ok())
-                    .expect("в форме repeat нет length");
+                    .expect("repeat form has no length");
                 unit.iter().cycle().take(length).copied().collect()
             }
-            _ => panic!("в строке корпуса нет ни prompt_token_ids, ни token_ids"),
+            _ => panic!("corpus line has neither prompt_token_ids nor token_ids"),
         };
         cases.push(Case { id, prompt });
     }
@@ -77,12 +77,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--out" => out = PathBuf::from(args.next().ok_or("--out")?),
             "--max-new" => max_new = args.next().ok_or("--max-new")?.parse()?,
             "--context" => context = args.next().ok_or("--context")?.parse()?,
-            other => return Err(format!("неизвестный аргумент: {other}").into()),
+            other => return Err(format!("unknown argument: {other}").into()),
         }
     }
 
     let cases = parse_cases(&std::fs::read_to_string(&corpus)?);
-    assert!(!cases.is_empty(), "корпус пуст");
+    assert!(!cases.is_empty(), "corpus is empty");
     std::fs::create_dir_all(&out)?;
 
     let checkpoint = Checkpoint::open(&model)?;
@@ -95,10 +95,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for case in &cases {
         assert!(
             case.prompt.len() <= PREFILL_CHUNK_SIZE,
-            "{}: промпт длиннее одного чанка, скрытые состояния остались бы только от последнего",
+            "{}: prompt longer than one chunk, hidden states would remain only from the last one",
             case.id
         );
-        assert!(case.prompt.len() + max_new <= context, "{}: не влезает в контекст", case.id);
+        assert!(case.prompt.len() + max_new <= context, "{}: doesn't fit the context", case.id);
         assert!(case.prompt.iter().all(|&t| (t as usize) < VOCAB_SIZE));
 
         let mut tokens = case.prompt.clone();
@@ -140,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         file.flush()?;
         println!(
-            "{:12} промпт {:4}, позиций {:5} -> {}",
+            "{:12} prompt {:4}, positions {:5} -> {}",
             case.id,
             case.prompt.len(),
             positions,

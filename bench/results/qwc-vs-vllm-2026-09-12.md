@@ -1,50 +1,50 @@
 # qwencore vs vLLM 0.28.0 — 2026-09-12
 
-> **Одиночные точки одной сессии, без доверительных интервалов.** Сравнение с
-> vLLM здесь снято до появления протокола
-> [`docs/11-experiments.md`](../../docs/11-experiments.md): один-два прогона на
-> точку, без ротации порядка вариантов и без bootstrap CI, на частично занятой
-> карте. Эти множители отменяются прогоном comparison suite и не должны
-> цитироваться как результат проекта. Условия каждой точки — ниже по тексту.
+> **Single points from one session, without confidence intervals.** The comparison with
+> vLLM here was taken before the protocol
+> [`docs/11-experiments.md`](../../docs/11-experiments.md) existed: one or two runs per
+> point, no variant order rotation and no bootstrap CI, on a partially busy
+> card. These multipliers are superseded by a comparison suite run and must not
+> be quoted as a project result. The conditions of each point are given below.
 
-RTX 5090 (32.6 GB), Qwen3.8-27B-QUASAR-NVFP4, `--context 32768`, greedy, без детокенизации.
+RTX 5090 (32.6 GB), Qwen3.8-27B-QUASAR-NVFP4, `--context 32768`, greedy, no detokenization.
 
-Условия, одинаковые для обоих движков: **bf16 KV**, **уникальный промпт на каждый запрос**
-(одинаковые промпты кормили prefix-кэш vLLM и делали замер бессмысленным), один и тот же
-`bench/servebench.py`, все запросы поданы в t=0.
+Conditions the same for both engines: **bf16 KV**, **a unique prompt for every request**
+(identical prompts fed vLLM's prefix cache and made the measurement meaningless), the same
+`bench/servebench.py`, all requests submitted at t=0.
 
-Бюджет памяти в пользу vLLM: ему `--gpu-memory-utilization 0.93` (~30.3 GB), qwencore жил
-под `--memory-limit-gb 28`. vLLM дополнительно прогревается saturated-прогоном, qwencore — нет.
+The memory budget favors vLLM: it got `--gpu-memory-utilization 0.93` (~30.3 GB), qwencore lived
+under `--memory-limit-gb 28`. vLLM additionally warms up with a saturated run, qwencore doesn't.
 
-## Итог
+## Summary
 
-| Точка (prompt/output, concurrency) | qwencore | vLLM | |
+| Point (prompt/output, concurrency) | qwencore | vLLM | |
 |---|---:|---:|---|
 | 256/128, c=80 | **1498** tok/s | 1340 tok/s | qwc +12% |
 | 256/512, c=16 | 668 tok/s | **748** tok/s | vLLM +12% |
 | 4096/512, c=16 | 265 tok/s | **439** tok/s | vLLM 1.66× |
-| 4096/8, c=16 — чистый prefill | **3763** tok/s prefill | **14656** tok/s prefill | vLLM 3.9× |
+| 4096/8, c=16 — pure prefill | **3763** tok/s prefill | **14656** tok/s prefill | vLLM 3.9× |
 
-Повторы (разброс): qwencore 256/128 — 1496.35 / 1504.34 / 1498.28; vLLM там же при чанке 512 —
+Repeats (spread): qwencore 256/128 — 1496.35 / 1504.34 / 1498.28; vLLM same point with chunk 512 —
 1336.76 / 1340.41 / 1368.11.
 
-## Свип `max_num_batched_tokens` у vLLM, точка 256/128 c=80
+## Sweep of vLLM's `max_num_batched_tokens`, point 256/128 c=80
 
-| чанк | 512 | 1024 | 2048 | 4096 | 8192 | 32768 |
+| chunk | 512 | 1024 | 2048 | 4096 | 8192 | 32768 |
 |---|---:|---:|---:|---:|---:|---:|
 | tok/s | 1337 | 1190 | 1314 | 1161 | 1152 | 896 |
 
-Прежний harness жёстко ставил чанк = контексту (32768) и тем самым занижал vLLM на треть.
-У qwencore ширина шага прибита к `PREFILL_CHUNK_SIZE = 512` (арена активаций скомпилирована
-под 512 строк), но это не помеха: vLLM, зажатый в те же 512, ничего не теряет — на коротких
-промптах это его оптимум. Разрыв в prefill — в самих ядрах, а не в ширине шага.
+The old harness hard-set chunk = context (32768) and thereby understated vLLM by a third.
+qwencore's step width is pinned to `PREFILL_CHUNK_SIZE = 512` (the activation arena is compiled
+for 512 rows), but that's not an obstacle: vLLM squeezed into the same 512 loses nothing — on short
+prompts that's its optimum. The prefill gap is in the kernels themselves, not in step width.
 
-## Что не воспроизводится
+## What doesn't reproduce
 
-- vLLM с `kv_cache_dtype=fp8` в этом venv не стартует: он уходит на FlashInfer-бэкенд,
-  а flashinfer не установлен. Поэтому паритет по типу KV сделан на bf16 с обеих сторон.
-- При util 0.93 и чанке 32768 на уникальных 4096-токенных промптах vLLM падает в CUDA OOM:
-  с prefix-кэшем он настоящий большой prefill ни разу не выполнял, и профилировщик памяти
-  этого не учёл. Рабочий чанк для длинных промптов — 4096.
-- Латентности vLLM harness не пишет: в V1-офлайн `LLM.generate` у `RequestOutput.metrics`
-  нет данных. Сравнивать по TTFT/ITL нечем, только по wall-clock.
+- vLLM with `kv_cache_dtype=fp8` doesn't start in this venv: it goes to the FlashInfer backend,
+  and flashinfer isn't installed. So KV type parity was done with bf16 on both sides.
+- At util 0.93 and chunk 32768 on unique 4096-token prompts vLLM crashes with CUDA OOM:
+  with the prefix cache it never ran a real large prefill, and the memory profiler
+  didn't account for it. The working chunk for long prompts is 4096.
+- The harness doesn't record vLLM latencies: in V1 offline `LLM.generate`, `RequestOutput.metrics`
+  has no data. There's nothing to compare TTFT/ITL with, only wall-clock.

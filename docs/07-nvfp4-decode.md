@@ -1,34 +1,34 @@
-# NVFP4 decode: W4A16, W4A4 и fused MLP
+# NVFP4 decode: W4A16, W4A4 and fused MLP
 
-## Что реализовано
+## What is implemented
 
-В `qwc-cuda` появился первый настоящий projection dataplane:
+`qwc-cuda` got its first real projection dataplane:
 
-* `nvfp4::Linear` загружает `weight_packed` и `weight_scale` прямо из
+* `nvfp4::Linear` loads `weight_packed` and `weight_scale` directly from
   compressed-tensors checkpoint;
-* `forward_w4a16` считает NVFP4-веса × BF16-активации для batch 1..4;
-* `swiglu_w4a16` объединяет `gate_proj + up_proj + SiLU × mul` в один kernel;
-* собственный BF16→NVFP4 quantizer сразу пишет packed E2M1 и SM120 128×4
-  scale-layout без промежуточной row-major копии;
-* `forward_w4a4_quantized` запускает block-scaled tensor-core MMA для batch
-  3..32 с BF16-выходом;
-* `select_decode_kernel` выбирает W4A16/W4A4 по batch и форме проекции;
-* есть CPU-oracle форматов E2M1/E4M3, синтетический GPU-test и проверка на
-  настоящих тензорах QUASAR.
+* `forward_w4a16` computes NVFP4 weights × BF16 activations for batch 1..4;
+* `swiglu_w4a16` merges `gate_proj + up_proj + SiLU × mul` into one kernel;
+* our own BF16→NVFP4 quantizer writes packed E2M1 and the SM120 128×4
+  scale layout directly, without an intermediate row-major copy;
+* `forward_w4a4_quantized` launches block-scaled tensor-core MMA for batch
+  3..32 with BF16 output;
+* `select_decode_kernel` picks W4A16/W4A4 by batch and projection shape;
+* there is a CPU oracle for the E2M1/E4M3 formats, a synthetic GPU test and a check on
+  real QUASAR tensors.
 
-Это пока decode-path малого batch, не полный token loop и не prefill.
+So far this is a small-batch decode path, not a full token loop and not prefill.
 
-## Формат и масштабы
+## Format and scales
 
-Checkpoint хранит:
+The checkpoint stores:
 
 ```text
-weight_packed        u8      [out, in/2]   два E2M1 в байте
-weight_scale         e4m3    [out, in/16]  локальный scale
-weight_global_scale  f32     [1]           глобальный делитель
+weight_packed        u8      [out, in/2]   two E2M1 per byte
+weight_scale         e4m3    [out, in/16]  local scale
+weight_global_scale  f32     [1]           global divisor
 ```
 
-Compressed-tensors хранит глобальный scale как делитель. Поэтому для W4A16:
+Compressed-tensors stores the global scale as a divisor. So for W4A16:
 
 ```text
 W[row, k] = E2M1(weight_packed[row, k])
@@ -38,8 +38,8 @@ W[row, k] = E2M1(weight_packed[row, k])
 Y = X_bf16 * W^T
 ```
 
-`input_global_scale` нужен только для W4A4 activation quantization и в W4A16
-намеренно не используется. Для каждой группы из 16 активаций:
+`input_global_scale` is needed only for W4A4 activation quantization and is intentionally
+unused in W4A16. For each group of 16 activations:
 
 ```text
 SFA = E4M3(input_global_scale * max(abs(X_group)) / 6)
@@ -49,66 +49,66 @@ Y = alpha * MMA(A4 * SFA, W4 * SFW)
 alpha = 1 / (input_global_scale * weight_global_scale)
 ```
 
-Формула и трактовка serialized globals как делителей совпадают с обработкой
-NVFP4 в [vLLM](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py).
+The formula and treating serialized globals as divisors match the handling of
+NVFP4 in [vLLM](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py).
 
-4-битные веса ни в одном тракте не репакуются: checkpoint `[N,K]` row-major
-физически совпадает с требуемым GEMM `B[K,N]` column-major. Scale-матрица один
-раз при загрузке переставляется блоками 128×4 и остаётся единственной копией:
-и W4A4, и самописный W4A16 читают этот layout. Если бы raw и swizzled scales
-хранились одновременно, на всех quantized-параметрах модели это стоило бы ещё
+The 4-bit weights are not repacked on any path: the `[N,K]` row-major checkpoint
+physically matches the required GEMM `B[K,N]` column-major. The scale matrix is
+permuted once at load in 128×4 blocks and stays the only copy:
+both W4A4 and the hand-written W4A16 read this layout. If raw and swizzled scales
+were stored at the same time, across all the model's quantized parameters it would cost another
 1.52 GB VRAM.
 
-## Раскладка kernel
+## Kernel layout
 
-Основной tile считает 16 выходных строк блоком из 128 потоков:
+The main tile computes 16 output rows with a block of 128 threads:
 
 ```text
-threadIdx.x = 8 K-потоков на строку
-threadIdx.y = 16 выходных строк
+threadIdx.x = 8 K threads per row
+threadIdx.y = 16 output rows
 K-tile      = 256
-X tile      = BF16 [batch, 256] в shared memory
-W fragment  = 128 bit на поток
+X tile      = BF16 [batch, 256] in shared memory
+W fragment  = 128 bit per thread
 ```
 
-Activation tile загружается в shared один раз на 16 строк. Фрагмент веса
-читается один раз и используется сразу для всех последовательностей batch.
-Batch 1, 2, 3 и 4 — отдельные compile-time kernels: B=1 не платит регистрами
-и ветвлениями за B=4.
+The activation tile is loaded into shared once per 16 rows. The weight fragment
+is read once and used right away for all sequences in the batch.
+Batch 1, 2, 3 and 4 are separate compile-time kernels: B=1 doesn't pay in registers
+and branches for B=4.
 
-Для узких проекций (`out < 8192`) используется другая раскладка: 32 K-потока
-на строку и K-tile 512. Это удваивает число независимых варпов и вдвое сокращает
-число барьеров на длинной `down_proj [5120, 17408]`.
+For narrow projections (`out < 8192`) a different layout is used: 32 K threads
+per row and a 512 K tile. This doubles the number of independent warps and halves
+the number of barriers on the long `down_proj [5120, 17408]`.
 
-Fused MLP читает две матрицы, но загружает X только один раз и сразу пишет:
+The fused MLP reads two matrices but loads X only once and writes directly:
 
 ```text
 intermediate = silu(gate_proj(X)) * up_proj(X)
 ```
 
-Отдельных буферов gate/up и отдельного elementwise kernel нет.
+There are no separate gate/up buffers and no separate elementwise kernel.
 
-W4A4 использует SM120 block-scaled MMA:
+W4A4 uses SM120 block-scaled MMA:
 
 ```text
 tile             128 × 128 × 256
 schedule         warp-specialized ping-pong
 A                packed E2M1 [batch,K], row-major
-B                checkpoint packed E2M1 [N,K], как column-major [K,N]
+B                checkpoint packed E2M1 [N,K], as column-major [K,N]
 SFA/SFB          E4M3, CUTLASS 128×4 swizzle
 D                BF16 [batch,N]
 workspace        0 bytes
 ```
 
-Стоковый CUTLASS example использует K=128 cooperative. Прямой перебор на RTX
-5090 показал, что K=256 ping-pong лучше; N=64 и K=256 cooperative отброшены
-после отрицательных A/B-замеров.
+The stock CUTLASS example uses K=128 cooperative. A direct sweep on the RTX
+5090 showed K=256 ping-pong is better; N=64 and K=256 cooperative were rejected
+after negative A/B measurements.
 
-## Корректность
+## Correctness
 
-Синтетический тест проверяет batch 1..4, обе аппаратные раскладки и неполный
-последний tile. Отдельный пример загрузил настоящие тензоры
-`layers.0.mlp.gate_proj/up_proj` из `Qwen3.8-27B-QUASAR-NVFP4`.
+The synthetic test checks batch 1..4, both hardware layouts and an incomplete
+last tile. A separate example loaded the real tensors
+`layers.0.mlp.gate_proj/up_proj` from `Qwen3.8-27B-QUASAR-NVFP4`.
 
 ```text
 gate shape                         17408 × 5120
@@ -119,78 +119,78 @@ W4A4 batch=4 max scaled error       0.003887
 CUTLASS workspace                   0 B
 ```
 
-Ошибка включает BF16-округление выхода. Bit layout, порядок nibble и оба уровня
-scale подтверждены реальным checkpoint, а не только синтетикой.
+The error includes BF16 rounding of the output. Bit layout, nibble order and both scale
+levels are confirmed on the real checkpoint, not just on synthetic data.
 
 ## RTX 5090: streaming benchmark
 
-Команда:
+Command:
 
 ```bash
 cargo run --release -p qwc-cuda --bin nvfp4bench
 ```
 
-Бенчмарк циклически проходит четыре разные матрицы, поэтому рабочее множество
-больше 96 MiB L2. Число — медиана семи прогретых серий. На загруженном desktop
-GPU частоты и конкурирующие графические процессы дают заметный разброс, поэтому
-для решений важны прямые A/B-замеры в одной серии.
+The benchmark cycles through four different matrices, so the working set
+exceeds the 96 MiB L2. The number is the median of seven warmed-up series. On a busy desktop
+GPU, clocks and competing graphics processes cause noticeable spread, so
+direct A/B measurements in one series are what matters for decisions.
 
-Fused MLP против двух отдельных projection launches (без отдельного SiLU в
-baseline, то есть сравнение консервативно):
+Fused MLP vs two separate projection launches (without a separate SiLU in the
+baseline, so the comparison is conservative):
 
-| batch | две проекции | fused SwiGLU | ускорение |
+| batch | two projections | fused SwiGLU | speedup |
 |---:|---:|---:|---:|
 | 1 | 103.16 us | 99.19 us | 1.04× |
 | 2 | 105.27 us | 99.61 us | 1.06× |
 | 3 | 152.16 us | 100.38 us | 1.52× |
 | 4 | 192.31 us | 116.86 us | 1.65× |
 
-Главный результат — один и тот же вес обслуживает несколько последовательностей.
-На ранних изолированных сериях отдельные gate/q+gate projections для B=1–2
-достигали 84–88% измеренного DRAM-потолка, а две последовательности часто
-считались практически за время одной. Медианный benchmark намеренно не скрывает
-desktop-contention и печатает текущую долю потолка при каждом запуске.
+The main result is that one weight serves several sequences.
+In early isolated series, separate gate/q+gate projections for B=1–2
+reached 84–88% of the measured DRAM ceiling, and two sequences were often
+computed in practically the time of one. The median benchmark intentionally doesn't hide
+desktop contention and prints the current share of the ceiling on every run.
 
-Для сравнения проверочный CUTLASS `91_fp4_gemv` на четырёх разных gate/up
-матрицах показал 0.135 ms на весь streaming-вызов и 1384 GiB/s. Это сильный
-batch=1 oracle, но его штатный batch дублирует матрицу A, scale layout swizzled,
-а выход снова FP4. Он не заменяет shared-weight server path.
+For comparison, the reference CUTLASS `91_fp4_gemv` on four different gate/up
+matrices showed 0.135 ms for the whole streaming call and 1384 GiB/s. It's a strong
+batch=1 oracle, but its stock batch duplicates matrix A, the scale layout is swizzled,
+and the output is FP4 again. It doesn't replace the shared-weight server path.
 
 ### W4A4 crossover
 
-Quantizer занимает примерно 2.3 us для batch 3..32. Ниже прямой A/B-замер
-K=256 ping-pong; W4A4-числа уже включают quantizer:
+The quantizer takes about 2.3 us for batch 3..32. Below is a direct A/B measurement of
+K=256 ping-pong; the W4A4 numbers already include the quantizer:
 
-| форма | batch | W4A16 | W4A4 total | W4A4 / A16 |
+| shape | batch | W4A16 | W4A4 total | W4A4 / A16 |
 |---|---:|---:|---:|---:|
 | gate/up 17408×5120 | 4 | 91.66 us | 75.60 us | 1.21× |
 | q+gate 12288×5120 | 4 | 43.88 us | 41.10 us | 1.07× |
 | down 5120×17408 | 4 | 50.67 us | 66.60 us | 0.76× |
 
-При batch=32 один W4A4 projection занял 69.34 us для gate/up, 63.62 us для
-down и 36.05 us для q+gate. Desktop-конкуренция заметно меняет абсолютные числа,
-поэтому dispatcher опирается на относительный A/B-результат одной серии.
+At batch=32 one W4A4 projection took 69.34 us for gate/up, 63.62 us for
+down and 36.05 us for q+gate. Desktop contention noticeably changes the absolute numbers,
+so the dispatcher relies on the relative A/B result of one series.
 
-## Что ещё не доказано
+## What is not yet proven
 
-* W4A16 убирает ошибку квантизации активаций, но влияние на качество всей QAT
-  модели надо подтвердить perplexity/task-eval; «больше разрядность» не считается
-  автоматическим доказательством качества.
-* Fused MLP пока не включает `down_proj`, residual и RMSNorm.
-* W4A4 MLP пока запускает gate/up как отдельные GEMM; нужен общий persistent
-  mainloop или fused layout, чтобы одна волна CTA стримила обе матрицы.
-* Влияние W4A4 prefill/decode на perplexity относительно эталонного runtime
-  ещё нужно измерить отдельно.
+* W4A16 removes the activation quantization error, but its effect on the quality of the whole QAT
+  model must be confirmed by perplexity/task-eval; "more bits" doesn't count
+  as automatic proof of quality.
+* The fused MLP doesn't yet include `down_proj`, residual and RMSNorm.
+* The W4A4 MLP still launches gate/up as separate GEMMs; a shared persistent
+  mainloop or fused layout is needed so that one CTA wave streams both matrices.
+* The effect of W4A4 prefill/decode on perplexity relative to the reference runtime
+  still has to be measured separately.
 
-## Целевая диспетчеризация
+## Target dispatch
 
 ```text
-batch 1..3   W4A16 custom GEMV / fused MLP  — качество, низкая latency
-batch 4      N>K: W4A4; N<=K: W4A16         — измеренная граница по форме
-batch 5..32  W4A4 SM120 MMA                 — один проход по весам
+batch 1..3   W4A16 custom GEMV / fused MLP  — quality, low latency
+batch 4      N>K: W4A4; N<=K: W4A16         — measured per-shape boundary
+batch 5..32  W4A4 SM120 MMA                 — one pass over the weights
 prefill      W4A4 SM120 GEMM, M=128          — chunked causal scan
 ```
 
-Граница не зашивается навсегда: финальный autotune выбирает её отдельно для
-каждой формы по goodput и ITL, а quality profile сможет принудительно оставлять
-W4A16 дольше.
+The boundary isn't hardwired forever: the final autotune picks it separately for
+each shape by goodput and ITL, and a quality profile can force
+W4A16 for longer.

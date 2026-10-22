@@ -1,13 +1,13 @@
-//! Пофазная разбивка шага движка на событиях CUDA.
+//! Per-phase breakdown of an engine step using CUDA events.
 //!
-//! Отвечает на один вопрос: куда уходит время шага. Трафик весов и состояния
-//! объясняет только часть, остальное до сих пор приписывалось узким местам по
-//! roofline-арифметике, а не по замеру. Здесь каждая фаза — интервал между
-//! двумя событиями на потоке, и сумма фаз равна шагу целиком.
+//! Answers one question: where the step's time goes. Weight and state traffic
+//! explains only part of it; the rest used to be attributed to bottlenecks by
+//! roofline arithmetic rather than measurement. Here each phase is the interval between
+//! two events on the stream, and the sum of phases equals the whole step.
 //!
-//! Под таймлайном шаг чистого decode идёт мимо CUDA graph: внутри захвата
-//! события времени не дают. Поэтому сначала меряется шаг с графом, потом тот
-//! же шаг с разметкой — разница и есть цена запусков кернелов.
+//! Under the timeline a pure decode step bypasses the CUDA graph: inside a capture
+//! events don't give time. So first the step with the graph is measured, then the
+//! same step with marks — the difference is the cost of kernel launches.
 //!
 //! ```
 //! cargo run --release -p qwc-engine --bin stepprofile -- \
@@ -60,14 +60,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cache_gb = executor.cache_bytes() as f64 / 1e9;
     let usage = qwc_cuda::memory_usage();
     eprintln!(
-        "загружено за {load_seconds:.1} с, кэш и состояние {cache_gb:.2} ГБ, \
-         занято {:.2} ГБ из лимита {:.2} ГБ",
+        "loaded in {load_seconds:.1} s, cache and state {cache_gb:.2} GB, \
+         used {:.2} GB of a {:.2} GB limit",
         usage.used as f64 / 1e9,
         usage.limit as f64 / 1e9,
     );
 
-    // Каждый слот получает свой префикс: и KV-кэш, и рекуррентное состояние
-    // должны быть заполнены, иначе шаг меряется на пустой карте.
+    // Each slot gets its own prefix: both the KV cache and the recurrent state
+    // must be filled, otherwise the step is measured on an empty card.
     let prompt: Vec<u32> = (0..args.prompt_tokens)
         .map(|index| 1000 + (index as u32 % 20000))
         .collect();
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut position = args.prompt_tokens;
 
-    // Шаг с графом: эталон, с которым сверяется сумма фаз.
+    // The step with the graph: the reference the sum of phases is checked against.
     let mut graph_ms = Vec::with_capacity(args.steps);
     for step in 0..args.warmup + args.steps {
         let elapsed = run_step(&mut executor, &weights, &args, decode_rows, position, mixed)?;
@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Тот же шаг с разметкой.
+    // The same step with marks.
     executor.profile_enable();
     let mut timeline_ms = Vec::with_capacity(args.steps);
     let mut totals: Vec<(&'static str, f64)> = Vec::new();
@@ -130,11 +130,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!(
-        "шаг {} на concurrency {} (decode-строк {decode_rows}{}), контекст {}, KV {}, DeltaNet {}",
-        if mixed { "смешанный" } else { "чистый decode" },
+        "step {} at concurrency {} (decode rows {decode_rows}{}), context {}, KV {}, DeltaNet {}",
+        if mixed { "mixed" } else { "pure decode" },
         args.concurrency,
         if mixed {
-            format!(", prefill-токенов {}", args.prefill_tokens)
+            format!(", prefill tokens {}", args.prefill_tokens)
         } else {
             String::new()
         },
@@ -144,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "{:<24} {:>9} {:>7} {:>10} {:>10}",
-        "фаза", "мс", "доля", "трафик ГБ", "ГБ/с"
+        "phase", "ms", "share", "traffic GB", "GB/s"
     );
     println!("{}", "-".repeat(64));
     for (label, ms) in &totals {
@@ -162,29 +162,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{}", "-".repeat(64));
     println!(
         "{:<24} {:>9.3} {:>6.1}% {:>10.2} {:>10.0}",
-        "сумма фаз",
+        "sum of phases",
         phase_sum,
         100.0,
         traffic.total as f64 / 1e9,
         traffic.total as f64 / (phase_sum * 1e-3) / 1e9,
     );
     println!();
-    println!("шаг с графом (стенные часы):     {graph:>8.3} мс");
-    println!("шаг с разметкой (стенные часы):  {with_timeline:>8.3} мс");
-    println!("от первой метки до последней:    {span:>8.3} мс");
+    println!("step with graph (wall clock):    {graph:>8.3} ms");
+    println!("step with marks (wall clock):    {with_timeline:>8.3} ms");
+    println!("from first mark to last:         {span:>8.3} ms");
     println!(
-        "накладные запусков (разметка − граф): {:>+7.3} мс при {marks} метках",
+        "launch overhead (marks − graph): {:>+7.3} ms with {marks} marks",
         with_timeline - graph
     );
     println!(
-        "объяснено трафиком при 1.5 ТБ/с: {:.3} мс из {:.3} мс шага",
+        "explained by traffic at 1.5 TB/s: {:.3} ms of a {:.3} ms step",
         traffic.total as f64 / 1.5e12 * 1e3,
         graph,
     );
     Ok(())
 }
 
-/// Один шаг: чистый decode идёт коротким путём, смешанный — через раскладку.
+/// One step: pure decode takes the short path, mixed goes through the layout.
 fn run_step(
     executor: &mut Executor,
     weights: &ModelWeights,
@@ -207,9 +207,9 @@ fn run_step(
     Ok(started.elapsed().as_secs_f64() * 1e3)
 }
 
-/// Раскладка шага: `decode_rows` однотокеновых строк плюс один prefill-чанк в
-/// последнем слоте. Это форма, которую планировщик выдаёт под нагрузкой, пока
-/// в очереди остаются непрогретые запросы.
+/// Step layout: `decode_rows` single-token rows plus one prefill chunk in
+/// the last slot. This is the shape the scheduler produces under load while
+/// unwarmed requests remain in the queue.
 fn mixed_layout(
     args: &Args,
     decode_rows: usize,
@@ -231,13 +231,13 @@ fn mixed_layout(
         layout.state_slots.push(slot as u32);
         layout.position_starts.push(start as u32);
         layout.context_lens.push((start + tokens) as u32);
-        let offset = *layout.token_offsets.last().expect("непустой CSR");
+        let offset = *layout.token_offsets.last().expect("non-empty CSR");
         layout.token_offsets.push(offset + tokens as u32);
         let blocks = (start + tokens).div_ceil(PAGE_SIZE);
         layout
             .block_ids
             .extend((0..blocks).map(|block| (slot * max_blocks + block) as u32));
-        let bound = *layout.block_table_offsets.last().expect("непустой CSR");
+        let bound = *layout.block_table_offsets.last().expect("non-empty CSR");
         layout
             .block_table_offsets
             .push(bound + blocks as u32);
@@ -249,8 +249,8 @@ fn mixed_layout(
     Ok(layout)
 }
 
-/// Трафик памяти фазы: у GEMM это веса, у скана — состояние DeltaNet.
-/// Делить замер на трафик имеет смысл только там, где фаза упирается в память.
+/// Memory traffic of a phase: for a GEMM it's the weights, for the scan the DeltaNet state.
+/// Dividing the measurement by traffic makes sense only where the phase is memory-bound.
 struct Traffic {
     phases: Vec<(&'static str, u64)>,
     total: u64,
@@ -283,9 +283,9 @@ impl Traffic {
                 (layer.mlp.gate.resident_bytes() + layer.mlp.up.resident_bytes()) as u64;
             mlp_down += layer.mlp.down.resident_bytes() as u64;
         }
-        // Скан рекуррентного состояния: полное чтение и полная перезапись на
-        // каждый слой. Для prefill-сегмента состояние проходится один раз на
-        // чанк, а не на токен.
+        // Recurrent state scan: a full read and a full rewrite for
+        // every layer. For a prefill segment the state is traversed once per
+        // chunk, not per token.
         let scan = delta_net::traffic_bytes(decode_rows) * linear_layers as u64;
         let scan_prefill = if prefill_tokens > 0 {
             delta_net::traffic_bytes(1) * linear_layers as u64
@@ -330,8 +330,8 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     let mut concurrency = 64usize;
     let mut prompt_tokens = 256usize;
     let mut prefill_tokens = 0usize;
-    // Чанк не в нуле, а на своей позиции в промпте: внимание на префилле
-    // читает весь контекст слева, и в нуле его цена не видна.
+    // The chunk isn't at zero but at its position in the prompt: prefill attention
+    // reads the whole context to the left, and at zero its cost isn't visible.
     let mut prefill_start = 0usize;
     let mut steps = 21usize;
     let mut warmup = 3usize;
@@ -354,7 +354,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
                 kv_cache = match args.next().ok_or("--kv-cache needs fp8 or bf16")?.as_str() {
                     "fp8" => KvCacheDtype::Fp8,
                     "bf16" => KvCacheDtype::Bf16,
-                    other => return Err(format!("неизвестное значение --kv-cache: {other}").into()),
+                    other => return Err(format!("unknown --kv-cache value: {other}").into()),
                 };
             }
             "--delta-state" => {
@@ -362,43 +362,43 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
                     "bf16" => DeltaStateMode::Bf16,
                     "fp32" => DeltaStateMode::Fp32,
                     "wy" => DeltaStateMode::Wy,
-                    other => return Err(format!("неизвестное значение --delta-state: {other}").into()),
+                    other => return Err(format!("unknown --delta-state value: {other}").into()),
                 };
             }
             "--memory-limit-gb" => {
                 let gb: f64 = args.next().ok_or("--memory-limit-gb")?.parse()?;
                 memory_limit = (gb * 1e9) as usize;
             }
-            other => return Err(format!("неизвестный аргумент: {other}").into()),
+            other => return Err(format!("unknown argument: {other}").into()),
         }
     }
     if concurrency == 0 || concurrency > qwc_engine::executor::MAX_BATCH {
         return Err(format!(
-            "--concurrency должен быть 1..={}",
+            "--concurrency must be 1..={}",
             qwc_engine::executor::MAX_BATCH
         )
         .into());
     }
     if steps == 0 {
-        return Err("--steps должен быть положительным".into());
+        return Err("--steps must be positive".into());
     }
     if prompt_tokens == 0 || prompt_tokens >= VOCAB_SIZE {
-        return Err("--prompt-tokens вне диапазона".into());
+        return Err("--prompt-tokens out of range".into());
     }
     if prefill_tokens > 0 {
         if concurrency < 2 {
-            return Err("смешанный шаг требует --concurrency не меньше 2".into());
+            return Err("a mixed step requires --concurrency of at least 2".into());
         }
         let live = concurrency - 1 + prefill_tokens;
         if live > PREFILL_CHUNK_SIZE {
-            return Err(format!("шаг несёт {live} токенов, арена держит {PREFILL_CHUNK_SIZE}").into());
+            return Err(format!("the step carries {live} tokens, the arena holds {PREFILL_CHUNK_SIZE}").into());
         }
         if prefill_start + prefill_tokens > context {
-            return Err("--prefill-tokens не помещается в контекст".into());
+            return Err("--prefill-tokens doesn't fit in the context".into());
         }
     }
     if prompt_tokens + warmup + steps > context {
-        return Err("prompt плюс шаги не помещаются в --context".into());
+        return Err("prompt plus steps don't fit in --context".into());
     }
     Ok(Args {
         model,

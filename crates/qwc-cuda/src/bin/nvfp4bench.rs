@@ -1,7 +1,7 @@
-//! Streaming-бенчмарк NVFP4 x BF16 decode-проекции на реальных формах Qwen.
+//! Streaming benchmark of the NVFP4 x BF16 decode projection on real Qwen shapes.
 //! `cargo run --release -p qwc-cuda --bin nvfp4bench`
 //!
-//! Четыре разные матрицы гарантируют working set больше 96 MiB L2.
+//! Four different matrices guarantee a working set larger than the 96 MiB L2.
 
 use qwc_core::arch::{HIDDEN_SIZE, INTERMEDIATE_SIZE, Q_PROJ_DIM};
 use qwc_core::roofline::ACHIEVABLE_BANDWIDTH;
@@ -19,13 +19,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("NVFP4 x BF16 shared-weight decode, RTX 5090");
     println!(
-        "достижимое DRAM-чтение: {:.0} GB/s; SM: {}\n",
+        "achievable DRAM read: {:.0} GB/s; SM: {}\n",
         ACHIEVABLE_BANDWIDTH / 1e9,
         device.sm_count
     );
     println!(
         "  {:>7} | {:>5} | {:>13} | {:>9} | {:>9}",
-        "операция", "batch", "время/слой", "weight BW", "% потолка"
+        "operation", "batch", "time/layer", "weight BW", "% ceiling"
     );
     println!(
         "  {:->7}-+-{:->5}-+-{:->13}-+-{:->9}-+-{:->9}",
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     for (name, out_features, in_features) in shapes {
-        // Даже q+gate: 4 * 35.4 MB > 96 MiB L2.
+        // Even q+gate: 4 * 35.4 MB > 96 MiB L2.
         let linears: Vec<Linear> = (0..4)
             .map(|_| Linear::zeroed(out_features, in_features))
             .collect::<Result<_, _>>()?;
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let input = DeviceBuffer::from_slice(&vec![bf16::from_f32(0.5); batch * in_features])?;
             let mut output = DeviceBuffer::<u16>::zeroed(batch * out_features)?;
 
-            // Короткий kernel иначе попадает в период разгона частот GPU.
+            // Otherwise a short kernel lands in the GPU clock ramp-up period.
             for _ in 0..20 {
                 for linear in &linears {
                     linear.forward_w4a16(&input, &mut output, batch, &stream)?;
@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n  {name}: BF16 -> W4A4 quant + SM120 tensor-core GEMM");
         println!(
             "  {:>5} | {:>10} | {:>10} | {:>10} | {:>9} | {:>9}",
-            "batch", "quant", "GEMM", "итого", "vs A16", "weight BW"
+            "batch", "quant", "GEMM", "total", "vs A16", "weight BW"
         );
         println!(
             "  {:->5}-+-{:->10}-+-{:->10}-+-{:->10}-+-{:->9}-+-{:->9}",
@@ -163,10 +163,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!();
     }
 
-    println!("\nFused MLP gate + up + SwiGLU (время на пару матриц)");
+    println!("\nFused MLP gate + up + SwiGLU (time per pair of matrices)");
     println!(
         "  {:>5} | {:>13} | {:>13} | {:>9} | {:>9}",
-        "batch", "2 projection", "fused", "ускорение", "weight BW"
+        "batch", "2 projection", "fused", "speedup", "weight BW"
     );
     println!(
         "  {:->5}-+-{:->13}-+-{:->13}-+-{:->9}-+-{:->9}",

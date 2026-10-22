@@ -1,8 +1,8 @@
-//! Свип геометрии W4A16 по всем decode-формам Qwen3.8 на batch 1..4.
+//! W4A16 geometry sweep over all Qwen3.8 decode shapes at batch 1..4.
 //!
-//! Прошлый свип (`nvfp4bench`) шёл по gate/up, down и q+gate, а `stepprofile`
-//! показал, что сильнее всех проседают `k/v` и `la_out` — их там не было.
-//! Здесь перебираются и раскладка (`rows_per_thread`), и геометрия блока.
+//! The previous sweep (`nvfp4bench`) covered gate/up, down and q+gate, while `stepprofile`
+//! showed that `k/v` and `la_out` sag the most — and they weren't there.
+//! Here both the layout (`rows_per_thread`) and the block geometry are swept.
 //!
 //! `cargo run --release -p qwc-cuda --bin nvfp4narrow`
 
@@ -11,11 +11,11 @@ use qwc_core::roofline::ACHIEVABLE_BANDWIDTH;
 use qwc_cuda::nvfp4::{Linear, QuantizedActivation, W4A4Workspace};
 use qwc_cuda::{Device, DeviceBuffer, Event, Stream, bf16};
 
-/// Working set обязан быть больше 96 MiB L2, иначе меряется кэш, а не DRAM.
+/// The working set must exceed the 96 MiB L2, otherwise we measure cache, not DRAM.
 const WORKING_SET: usize = 200_000_000;
 
-/// (kRows, kKThreads, kKTile) — те, что пережили первый свип. Остальные
-/// проигрывали на всех формах и только удлиняли прогон.
+/// (kRows, kKThreads, kKTile) — those that survived the first sweep. The rest
+/// lost on every shape and only lengthened the run.
 const GEOMETRIES: [(usize, usize, usize); 5] = [
     (4, 32, 512),
     (4, 32, 1024),
@@ -24,12 +24,12 @@ const GEOMETRIES: [(usize, usize, usize); 5] = [
     (16, 8, 256),
 ];
 
-/// Ширины, на которых сравниваются оба пути. Выше восьми W4A16 не
-/// инстанцирован: `kMaxBatch` в ядре.
+/// Widths at which both paths are compared. W4A16 isn't instantiated above
+/// eight: `kMaxBatch` in the kernel.
 const BATCHES: [usize; 7] = [1, 2, 3, 4, 5, 6, 8];
 
-/// Медиана пяти замеров по четыре прохода: короткий kernel иначе попадает в
-/// период разгона частот.
+/// Median of five measurements of four passes each: otherwise a short kernel lands in
+/// the clock ramp-up period.
 fn time(
     stream: &Stream,
     call: &mut impl FnMut(&Stream) -> qwc_cuda::Result<()>,
@@ -57,18 +57,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Device::init(0)?;
     let stream = Stream::new()?;
 
-    // Формы ровно те, что зовёт исполнитель на decode-шаге.
+    // Exactly the shapes the executor calls on a decode step.
     let shapes = [
         ("la_in", 16480, HIDDEN_SIZE),
         ("down", HIDDEN_SIZE, INTERMEDIATE_SIZE),
         ("q+gate", 2 * Q_PROJ_DIM, HIDDEN_SIZE),
-        ("k или v", KV_PROJ_DIM, HIDDEN_SIZE),
+        ("k or v", KV_PROJ_DIM, HIDDEN_SIZE),
         ("la_out", HIDDEN_SIZE, LA_V_PROJ_DIM),
         ("attn_out", HIDDEN_SIZE, Q_PROJ_DIM),
     ];
 
     println!(
-        "W4A16, свип геометрии по decode-формам; потолок {:.0} ГБ/с\n",
+        "W4A16, geometry sweep over decode shapes; ceiling {:.0} GB/s\n",
         ACHIEVABLE_BANDWIDTH / 1e9
     );
 
@@ -81,15 +81,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|_| Linear::zeroed(out_features, in_features))
             .collect::<Result<_, _>>()?;
 
-        println!("## {name}: [{out_features}, {in_features}], {copies} копий");
+        println!("## {name}: [{out_features}, {in_features}], {copies} copies");
         println!(
             "  {:>5} | {:>9} | {:>22} | {:>9} | {:>9} | {:>6}",
-            "batch", "W4A16", "лучшая геометрия", "W4A4", "W4A4 M=64", "итог"
+            "batch", "W4A16", "best geometry", "W4A4", "W4A4 M=64", "result"
         );
 
         for batch in BATCHES {
-            // W4A4 в исполнителе округляет узкий batch до трёх строк, так что
-            // буферы берутся по этой же мерке и оба пути делят их.
+            // W4A4 in the executor rounds a narrow batch up to three rows, so
+            // buffers are sized the same way and both paths share them.
             let rows = batch.max(3);
             let input = DeviceBuffer::from_slice(&vec![bf16::from_f32(0.5); rows * in_features])?;
             let mut output = DeviceBuffer::<u16>::zeroed(rows * out_features)?;
@@ -126,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // W4A4: активация квантуется один раз на слой, как в исполнителе.
+            // W4A4: activation is quantized once per layer, as in the executor.
             let mut quantized = QuantizedActivation::zeroed(128.0, rows, in_features)?;
             let mut workspace = W4A4Workspace::new(rows, out_features, in_features)?;
             quantized.quantize_bf16(&input, &stream)?;
@@ -144,8 +144,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let w4a4_ms = time(&stream, &mut call)?;
             let w4a4 = weight_bytes as f64 * (4 * copies) as f64 / (w4a4_ms * 1e-3) / 1e9;
 
-            // W4A4 с M, добитым до 64: тайл M у CUTLASS всё равно 128, но
-            // время почему-то падает с ростом M до 64 при том же трафике.
+            // W4A4 with M padded to 64: CUTLASS's M tile is 128 anyway, but
+            // time somehow drops as M grows to 64 with the same traffic.
             let padded_rows = rows.max(64);
             let padded_input =
                 DeviceBuffer::from_slice(&vec![bf16::from_f32(0.5); padded_rows * in_features])?;
@@ -168,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let padded_gbps = weight_bytes as f64 * (4 * copies) as f64 / (padded_ms * 1e-3) / 1e9;
 
             println!(
-                "  {:>5} | {:>6.0} ГБ/с | {:>22} | {:>6.0} ГБ/с | {:>6.0} ГБ/с | {:>6}",
+                "  {:>5} | {:>6.0} GB/s | {:>22} | {:>6.0} GB/s | {:>6.0} GB/s | {:>6}",
                 batch,
                 best.0,
                 best.1,

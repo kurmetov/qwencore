@@ -46,15 +46,15 @@ __device__ __forceinline__ float cache_to_float(const void* cache, size_t offset
   }
 }
 
-// Сколько элементов кладёт в shared один поток за раз. Поэлементная укладка
-// KV стоила больше инструкций, чем все MMA тайла вместе взятые.
+// How many elements one thread puts into shared at a time. Element-wise staging
+// of KV cost more instructions than all the tile's MMAs combined.
 constexpr int kStageVector = 8;
 
-// Восемь элементов кэша за одно обращение.
+// Eight cache elements per access.
 //
-// Поэлементное чтение превращало укладку тайла в 16384 двухбайтовых загрузки
-// на CTA. Выровнено оно всегда: измерение кратно восьми, а шаг ряда в shared
-// кратен 16 байтам.
+// Element-wise reads turned tile staging into 16384 two-byte loads
+// per CTA. It's always aligned: the dimension is a multiple of eight, and the row stride in shared
+// is a multiple of 16 bytes.
 template <bool Bf16Cache>
 __device__ __forceinline__ void stage_eight(
     const void* cache, size_t offset, __nv_bfloat16* destination) {
@@ -290,16 +290,16 @@ __global__ __launch_bounds__(kThreads, 1) void paged_attention_parts_kernel(
   }
 }
 
-// Causal prefill: одно CTA владеет тайлом строк запроса одной последовательности,
-// варп на строку. Decode-ядро делит токены между варпами, поэтому обслуживает
-// одну строку за проход и на чанке префилла перечитывает те же страницы KV
-// столько раз, сколько в чанке токенов. Здесь проход по KV один на тайл, а
-// строки тайла переиспользуют уже прочитанные K и V: трафик падает в kWarps раз
-// при том же регистровом бюджете, потому что варпу по-прежнему принадлежит
-// ровно один онлайн-softmax.
+// Causal prefill: one CTA owns a tile of query rows of one sequence,
+// a warp per row. The decode kernel splits tokens between warps, so it serves
+// one row per pass and on a prefill chunk re-reads the same KV pages
+// as many times as there are tokens in the chunk. Here there's one KV pass per tile, and
+// the tile's rows reuse the already read K and V: traffic drops kWarps times
+// with the same register budget, because a warp still owns
+// exactly one online softmax.
 //
-// Межварповое слияние не нужно: аккумулятор варпа полон для своей строки, и
-// shared_output прежнего ядра (48 KiB) здесь не существует.
+// No inter-warp merge is needed: a warp's accumulator is complete for its row, and
+// the old kernel's shared_output (48 KiB) doesn't exist here.
 template <bool Bf16Cache>
 __global__ __launch_bounds__(kThreads) void paged_attention_prefill_kernel(
     const __nv_bfloat16* __restrict__ query,
@@ -318,8 +318,8 @@ __global__ __launch_bounds__(kThreads) void paged_attention_prefill_kernel(
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
 
-  // Запросы тайла держим в bf16: во float это 48 KiB на блок, а конвертация
-  // при чтении стоит одну инструкцию.
+  // The tile's queries are kept in bf16: in float that's 48 KiB per block, and conversion
+  // on read costs one instruction.
   __shared__ __nv_bfloat16 shared_query[kWarps][kGroup][kHeadDim];
 
   const int tile_first = tile * kWarps;
@@ -337,7 +337,7 @@ __global__ __launch_bounds__(kThreads) void paged_attention_prefill_kernel(
   }
   __syncthreads();
 
-  // Дальше барьеров нет, поэтому лишние варпы просто уходят.
+  // There are no more barriers after this, so extra warps simply leave.
   if (warp >= tile_rows) {
     return;
   }
@@ -426,19 +426,19 @@ __global__ __launch_bounds__(kThreads) void paged_attention_prefill_kernel(
   }
 }
 
-// Causal prefill на тензорных ядрах.
+// Causal prefill on tensor cores.
 //
-// Построчные ядра — и decode-, и тайловое — считают QK^T и PV варповыми
-// редукциями: на пару (строка, токен) приходится шесть проходов по бабочке, и
-// фаза упирается в выдачу инструкций, а не в память. Здесь обе матрицы идут
-// через mma.m16n8k16, то есть одна инструкция на 16x8x16.
+// The row-wise kernels — both the decode one and the tiled one — compute QK^T and PV with warp
+// reductions: each (row, token) pair takes six butterfly passes, and
+// the phase is bound by instruction issue, not memory. Here both matrices go
+// through mma.m16n8k16, i.e. one instruction per 16x8x16.
 //
-// Тайл строк обязан принадлежать одной последовательности: таблица страниц
-// берётся у первой строки тайла. Для чанка префилла это так по построению.
+// A tile of rows must belong to one sequence: the page table
+// is taken from the tile's first row. For a prefill chunk this holds by construction.
 
-// Фрагмент читается дорожкой по адресу (grp * ряд + pos * 2): без набивки
-// grp уходит кратно 32 банкам и весь варп садится на четыре банка. Набивка
-// делает шаг ряда нечётным в банках и разводит дорожки по всем 32.
+// A lane reads a fragment at address (grp * row + pos * 2): without padding
+// grp steps by multiples of 32 banks and the whole warp lands on four banks. Padding
+// makes the row stride odd in banks and spreads the lanes over all 32.
 constexpr int kRowPad = kHeadDim + 8;
 
 __device__ __forceinline__ uint32_t pack_pair(
@@ -456,14 +456,14 @@ __device__ __forceinline__ void mma_m16n8k16(
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-// Загрузка фрагментов одной инструкцией вместо четырёх скалярных чтений.
+// Loading fragments with one instruction instead of four scalar reads.
 //
-// `ldmatrix` читает восемь строк 8x8 сразу и раскладывает их по дорожкам
-// ровно так, как их ждёт `mma.m16n8k16`. Адрес даёт каждая дорожка своя: для
-// .x4 дорожка L задаёт строку L%8 матрицы L/8, для .x2 — то же среди первых
-// шестнадцати. Вариант .trans разворачивает тайл на лету, и операнд V,
-// лежащий в shared как [ключ][измерение], не приходится ни перекладывать,
-// ни собирать по два байта.
+// `ldmatrix` reads eight 8x8 rows at once and distributes them across lanes
+// exactly as `mma.m16n8k16` expects them. Each lane provides its own address: for
+// .x4 lane L gives row L%8 of matrix L/8, for .x2 the same among the first
+// sixteen. The .trans variant transposes the tile on the fly, and operand V,
+// stored in shared as [key][dim], needs neither reshuffling
+// nor assembling two bytes at a time.
 __device__ __forceinline__ uint32_t shared_address(const void* pointer) {
   return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
 }
@@ -493,26 +493,26 @@ __device__ __forceinline__ void ldmatrix_x2_trans(
       : "r"(shared_address(source)));
 }
 
-// Тайл в 64 строки запроса: варп владеет своими шестнадцатью строками и
-// всеми ключами тайла.
+// A 64-query-row tile: a warp owns its sixteen rows and
+// all of the tile's keys.
 //
-// Прежняя форма делила работу поперёк: 16 строк на CTA, четыре варпа резали
-// по ключам в QK^T и по измерениям в PV. Из-за этого счёт шёл через shared —
-// S туда, обратно под softmax, P снова туда, — и на каждые 32 ключа
-// приходилось два барьера. Хуже другое: уложенный тайл KV обслуживал 16
-// строк запроса, и весь контекст перечитывался на каждые 16 строк.
+// The old form split the work crosswise: 16 rows per CTA, four warps cut
+// along keys in QK^T and along dimensions in PV. Because of this the compute went through shared —
+// S there, back for softmax, P there again — and every 32 keys
+// had two barriers. Worse: a staged KV tile served 16
+// query rows, and the whole context was re-read for every 16 rows.
 //
-// Здесь тайл KV общий на 64 строки: укладка та же, а MMA на ней вчетверо
-// больше. Softmax живёт в регистрах варпа (бабочка по четырём дорожкам с
-// одинаковым grp), P из аккумулятора QK^T идёт в операнд A без единой
-// перекладки, и барьеры остались только у стейджинга.
+// Here the KV tile is shared by 64 rows: the staging is the same, but there are four times
+// as many MMAs on it. Softmax lives in the warp's registers (a butterfly over four lanes with
+// the same grp), P goes from the QK^T accumulator into operand A without a single
+// reshuffle, and barriers remain only for staging.
 constexpr int kFlashWarps = 4;
 constexpr int kFlashThreads = kFlashWarps * 32;
 constexpr int kFlashRows = kFlashWarps * 16;
 constexpr int kFlashKeys = 32;
-constexpr int kFlashKeyTiles = kFlashKeys / 8;      // n-тайлов в QK^T
-constexpr int kFlashKeyGroups = kFlashKeys / 16;    // k-групп в PV
-constexpr int kFlashDimTiles = kHeadDim / 8;        // n-тайлов аккумулятора
+constexpr int kFlashKeyTiles = kFlashKeys / 8;      // n-tiles in QK^T
+constexpr int kFlashKeyGroups = kFlashKeys / 16;    // k-groups in PV
+constexpr int kFlashDimTiles = kHeadDim / 8;        // accumulator n-tiles
 
 struct FlashShared {
   __nv_bfloat16 query[kFlashRows * kRowPad];
@@ -523,8 +523,8 @@ struct FlashShared {
 
 constexpr size_t flash_shared_bytes() { return sizeof(FlashShared); }
 
-// Максимум и сумма строки: строка живёт на четырёх дорожках с одинаковым grp,
-// то есть на соседних по младшим двум битам.
+// Row max and sum: a row lives on four lanes with the same grp,
+// i.e. neighbors in the lowest two bits.
 __device__ __forceinline__ float flash_row_max(float value) {
   value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 1));
   return fmaxf(value, __shfl_xor_sync(0xffffffffu, value, 2));
@@ -590,11 +590,11 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
   for (int r = 0; r < kFlashRows; ++r) {
     max_context = max(max_context, shared.row_context[r]);
   }
-  // Таблица страниц общая на тайл: строки чанка принадлежат одной
-  // последовательности.
+  // The page table is shared by the tile: the chunk's rows belong to one
+  // sequence.
   const uint32_t* table =
       block_tables + static_cast<size_t>(row_base + tile_first) * max_blocks;
-  // Причинные префиксы строк варпа: за ними ему в тайле делать нечего.
+  // Causal prefixes of the warp's rows: beyond them it has nothing to do in the tile.
   const int warp_context =
       max(shared.row_context[row0 + 15], shared.row_context[row0]);
 
@@ -624,12 +624,12 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
     }
     __syncthreads();
     if (key_base >= warp_context) {
-      continue;   // барьеры варп отработал, считать ему нечего
+      continue;   // the warp has done its barriers, nothing for it to compute
     }
 
-    // QK^T: строки варпа против всех ключей тайла.
+    // QK^T: the warp's rows against all keys of the tile.
     float scores[kFlashKeyTiles][4] = {};
-    // Адреса для ldmatrix: дорожка задаёт строку своей 8x8 матрицы.
+    // Addresses for ldmatrix: a lane gives a row of its 8x8 matrix.
     const int matrix = lane >> 3;
     const int matrix_row = lane & 7;
     const __nv_bfloat16* query_row =
@@ -648,7 +648,7 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
       }
     }
 
-    // Масштаб и причинная маска. Дорожка держит строки grp и grp+8.
+    // Scale and causal mask. A lane holds rows grp and grp+8.
     const int context_low = shared.row_context[row0 + grp];
     const int context_high = shared.row_context[row0 + grp + 8];
 #pragma unroll
@@ -662,7 +662,7 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
       }
     }
 
-    // Онлайн-softmax: всё в регистрах варпа, ни одного обращения к shared.
+    // Online softmax: all in warp registers, not a single shared access.
     float tile_max[2] = {-CUDART_INF_F, -CUDART_INF_F};
 #pragma unroll
     for (int t = 0; t < kFlashKeyTiles; ++t) {
@@ -676,8 +676,8 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
       const float merged = fmaxf(running_max[half], tile_max[half]);
-      // Строка, у которой в тайле нет ни одного разрешённого ключа: вычитать
-      // из -inf нельзя, это NaN.
+      // A row with no allowed key in the tile: subtracting
+      // from -inf is not allowed, it's NaN.
       const bool empty = merged == -CUDART_INF_F;
       correction[half] = (empty || running_max[half] == -CUDART_INF_F)
           ? (empty ? 1.0f : 0.0f)
@@ -708,8 +708,8 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
       accumulator[t][3] *= correction[1];
     }
 
-    // P из аккумулятора QK^T прямо в операнд A: раскладка m16n8k16 совпадает,
-    // если считать столбец ключа индексом k.
+    // P from the QK^T accumulator straight into operand A: the m16n8k16 layout matches
+    // if the key column is treated as the k index.
     uint32_t probability[kFlashKeyGroups][4];
 #pragma unroll
     for (int g = 0; g < kFlashKeyGroups; ++g) {
@@ -722,8 +722,8 @@ __global__ __launch_bounds__(kFlashThreads, 1) void paged_attention_prefill_flas
       probability[g][3] = pack_pair(__float2bfloat16(scores[2 * g + 1][2]),
                                     __float2bfloat16(scores[2 * g + 1][3]));
     }
-    // V лежит как [ключ][измерение], а операнду B нужен ключ по k: тайл
-    // разворачивает сама инструкция.
+    // V is stored as [key][dim], while operand B needs the key along k: the
+    // instruction itself transposes the tile.
     const __nv_bfloat16* value_row =
         &shared.value[(size_t)(matrix_row + 8 * matrix) * kRowPad];
 #pragma unroll
@@ -1163,35 +1163,35 @@ cudaError_t launch_prefill_attention_mma(
   return cudaGetLastError();
 }
 
-// Внимание с упакованной GQA-группой: CTA на KV-голову, строки MMA-тайла —
-// пары (строка запроса, голова группы).
+// Attention with a packed GQA group: a CTA per KV head, MMA tile rows are
+// (query row, group head) pairs.
 //
-// flash-ядро выше даёт каждой голове запроса свой CTA. KV там читается шесть
-// раз, а на четырёх строках проверки черновиков из 64 строк тайла заняты
-// четыре: 4 строки на 60k стоили 1.47 мс на слой против 90 мкс у xqa
-// FlashInfer. Здесь все шесть голов группы идут строками одного тайла:
-// упакованная строка p — строка запроса p / 6, голова p % 6. Decode —
-// 6 строк из 16, проверка трёх черновиков — 24 из 32, и каждый байт KV
-// читается один раз.
+// The flash kernel above gives each query head its own CTA. KV is read six
+// times there, and with four draft verification rows only four of the tile's 64 rows
+// are occupied: 4 rows at 60k cost 1.47 ms per layer vs 90 µs for FlashInfer's
+// xqa. Here all six heads of a group go as rows of one tile:
+// packed row p is query row p / 6, head p % 6. Decode is
+// 6 rows of 16, verifying three drafts is 24 of 32, and every KV byte
+// is read once.
 //
-// KV лежит в shared как есть, в fp8. Раньше тайл переводился в bf16 при
-// укладке, и загрузка шла синхронно с вычислениями. Теперь страница (64
-// ключа) приезжает через cp.async в двойной буфер, пока считается
-// предыдущая, а в f16 байты переводятся уже во фрагментах.
+// KV sits in shared as is, in fp8. Before, the tile was converted to bf16 during
+// staging, and the load ran synchronously with compute. Now a page (64
+// keys) arrives via cp.async into a double buffer while the previous one is
+// computed, and bytes are converted to f16 already in fragments.
 //
-// Если m-тайлов меньше четырёх, лишние варпы делят ключи стадии: у каждого
-// SMSP свои тензорные ядра, и decode одним варпом на SM упёрся бы в один из
-// четырёх. Частичные суммы варпов сводятся в shared в конце.
-// Варпов на CTA: на тайле в 64 строки по два на m-тайл. Один CTA живёт на
-// SM один, и с одним варпом на планировщик тензорные ядра простаивали, пока
-// варп считал softmax и переводил fp8; второй варп заполняет эти паузы.
+// If there are fewer than four m-tiles, the extra warps split the stage's keys: each
+// SMSP has its own tensor cores, and decode with one warp per SM would be bound by one of
+// the four. The warps' partial sums are reduced in shared at the end.
+// Warps per CTA: on a 64-row tile, two per m-tile. One CTA lives on an
+// SM alone, and with one warp per scheduler the tensor cores sat idle while
+// the warp computed softmax and converted fp8; the second warp fills these gaps.
 template <int MTiles>
 __host__ __device__ constexpr int packed_warps() {
   return MTiles == 4 ? 8 : 4;
 }
 constexpr int kPackedStageKeys = kPageSize;
 constexpr int kPackedStageBytes = kPackedStageKeys * kHeadDim;
-constexpr int kPackedChunks = kHeadDim / 16;   // 16-байтных кусков в ряду fp8
+constexpr int kPackedChunks = kHeadDim / 16;   // 16-byte chunks in an fp8 row
 constexpr int kPackedMaxTileSize = 64;
 
 template <int MTiles, int Warps = packed_warps<MTiles>()>
@@ -1201,7 +1201,7 @@ struct PackedShared {
       uint8_t key[2][kPackedStageBytes];
       uint8_t value[2][kPackedStageBytes];
     } ring;
-    // Аккумуляторы варпов, деливших ключи, — после последней стадии.
+    // Accumulators of the warps that split keys — after the last stage.
     float merge[(Warps / MTiles - 1 > 0 ? Warps - MTiles : 1) *
                 32 * kFlashDimTiles * 4];
   };
@@ -1211,17 +1211,17 @@ struct PackedShared {
   float merge_sum[Warps][16];
 };
 
-// Ряд ключа — 256 байт, 16-байтные куски переставлены по трём младшим битам
-// ключа. ldmatrix читает восемь рядов на одной позиции куска, и без
-// перестановки все восемь легли бы в одни банки.
+// A key row is 256 bytes, 16-byte chunks are permuted by the key's three low
+// bits. ldmatrix reads eight rows at one chunk position, and without
+// the permutation all eight would land in the same banks.
 __device__ __forceinline__ int packed_swizzle(int key, int chunk) {
   return key * kHeadDim + ((chunk ^ (key & 7)) << 4);
 }
 
 __device__ __forceinline__ void cp_async_16(
     void* destination, const void* source, bool valid) {
-  // Недействительный кусок заполняется нулями: хвост последней страницы может
-  // хранить что угодно, в том числе fp8 NaN, а 0 * NaN в PV — NaN.
+  // An invalid chunk is filled with zeros: the tail of the last page may
+  // hold anything, including fp8 NaN, and 0 * NaN in PV is NaN.
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
                :
                : "r"(shared_address(destination)), "l"(source),
@@ -1255,8 +1255,8 @@ __device__ __forceinline__ void ldmatrix_x4_trans_raw(
       : "r"(shared_address(source)));
 }
 
-// Два e4m3 из младших 16 бит в f16x2; младший байт — в младшую половину.
-// Любое e4m3 точно представимо в f16.
+// Two e4m3 from the low 16 bits into f16x2; the low byte goes to the low half.
+// Any e4m3 is exactly representable in f16.
 __device__ __forceinline__ uint32_t fp8x2_to_half2(uint32_t pair) {
   uint32_t result;
   asm("cvt.rn.f16x2.e4m3x2 %0, %1;\n"
@@ -1279,23 +1279,23 @@ __device__ __forceinline__ uint32_t pack_half2(float low, float high) {
   return *reinterpret_cast<const uint32_t*>(&value);
 }
 
-// Тайл — tile_size подряд идущих упакованных строк, не больше MTiles * 16.
-// Таблица страниц у тайла одна, у строки его первой упакованной строки,
-// поэтому тайл не должен пересекать границу последовательности. Для decode
-// tile_size = 6, одна строка запроса; сегмент одной последовательности
-// режется по 64 упакованные строки без оглядки на границы строк: при
-// выравнивании по строкам 64 строки дали бы 7 тайлов по 60 вместо 6 по 64.
+// A tile is tile_size consecutive packed rows, at most MTiles * 16.
+// A tile has one page table, that of the row of its first packed row,
+// so a tile must not cross a sequence boundary. For decode
+// tile_size = 6, one query row; a single-sequence segment
+// is cut into 64 packed rows regardless of row boundaries: with
+// row alignment 64 rows would give 7 tiles of 60 instead of 6 of 64.
 //
-// Раскладки фрагментов.
-// QK^T: operand B — ряды K. ldmatrix над fp8, прочитанным как b16, отдаёт
-// дорожке четыре байта подряд: измерения 4pos..4pos+3 ключа grp. Порядок
-// суммирования по измерениям свободен, если A переставлен так же, поэтому
-// в 16-ке измерений логические k {2pos, 2pos+1, 2pos+8, 2pos+9} — это
-// физические 4pos..4pos+3. Запрос кладётся в shared уже переставленным.
-// PV: operand B — V с ключом по k. ldmatrix.trans над b16 отдаёт дорожке
-// пару ключей 2pos, 2pos+1 для пары измерений 2grp, 2grp+1; prmt разводит
-// байты на два n-тайла: чётные измерения 16-ки и нечётные. В итоге дорожка
-// держит в аккумуляторе четыре измерения подряд, 16c + 4pos..+3.
+// Fragment layouts.
+// QK^T: operand B is K rows. ldmatrix over fp8 read as b16 gives
+// a lane four consecutive bytes: dims 4pos..4pos+3 of key grp. The order of
+// summation over dims is free if A is permuted the same way, so
+// within a 16 of dims the logical k {2pos, 2pos+1, 2pos+8, 2pos+9} are
+// physical 4pos..4pos+3. The query is put into shared already permuted.
+// PV: operand B is V with the key along k. ldmatrix.trans over b16 gives a lane
+// a key pair 2pos, 2pos+1 for a dim pair 2grp, 2grp+1; prmt splits
+// the bytes into two n-tiles: even dims of the 16 and odd ones. As a result a lane
+// holds four consecutive dims in the accumulator, 16c + 4pos..+3.
 template <int MTiles, bool Direct>
 __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attention_packed_kernel(
     const __nv_bfloat16* __restrict__ query,
@@ -1316,7 +1316,7 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
   constexpr int kPackedThreads = packed_warps<MTiles>() * 32;
   constexpr int kSlices = packed_warps<MTiles>() / MTiles;
   constexpr int kSliceKeys = kPackedStageKeys / kSlices;
-  static_assert(kSliceKeys >= 16, "PV берёт ключи группами по 16");
+  static_assert(kSliceKeys >= 16, "PV takes keys in groups of 16");
   constexpr int kChunkKeys = kSliceKeys < 32 ? kSliceKeys : 32;
   constexpr int kKeyTiles = kChunkKeys / 8;
   constexpr int kKeyGroups = kChunkKeys / 16;
@@ -1334,15 +1334,15 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
   const int slice = warp / MTiles;
   const int row0 = m_tile * 16;
 
-  // Упакованная строка g сегмента — строка запроса g / 6, голова g % 6.
+  // Packed row g of a segment is query row g / 6, head g % 6.
   const int tile_first = tile * tile_size;
   const int tile_count = min(tile_size, rows * kGroup - tile_first);
 
   extern __shared__ __align__(16) char packed_shared_raw[];
   auto& shared = *reinterpret_cast<PackedShared<MTiles>*>(packed_shared_raw);
 
-  // Запрос в f16 с перестановкой измерений внутри 16-ки. Восемь физических
-  // измерений 4pp..4pp+3 для двух pp — это логические пары (2pp, 2pp+1) и
+  // The query in f16 with dims permuted within a 16. Eight physical
+  // dims 4pp..4pp+3 for two pp are the logical pairs (2pp, 2pp+1) and
   // (2pp+8, 2pp+9).
   for (int i = threadIdx.x; i < kPackedRows * (kHeadDim / 8);
        i += kPackedThreads) {
@@ -1390,10 +1390,10 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
   const uint32_t* table =
       block_tables + static_cast<size_t>(row_base + tile_first / kGroup) * max_blocks;
 
-  // Отрезок партиции считается здесь, по фактическому контексту тайла, и
-  // кратен странице. Хост выбирает только число партиций: захваченный
-  // CUDA-граф не зависит от длины контекста, а decode-строки разной длины
-  // делят каждая свой.
+  // The partition span is computed here, from the tile's actual context, and
+  // is a multiple of a page. The host picks only the number of partitions: the captured
+  // CUDA graph doesn't depend on context length, and decode rows of different lengths
+  // each split their own.
   const int span =
       (max_context + partitions * kPageSize - 1) / (partitions * kPageSize) * kPageSize;
   const int key_begin = Direct ? 0 : partition * span;
@@ -1420,8 +1420,8 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
     cp_async_commit();
   };
 
-  // Номер страницы следующей стадии читается на стадию вперёд: зависимая
-  // загрузка из таблицы иначе стояла бы перед каждой выдачей cp.async.
+  // The next stage's page number is read one stage ahead: otherwise the dependent
+  // load from the table would stand before every cp.async issue.
   if (stages > 0) {
     issue(0, table[first_page]);
   }
@@ -1438,8 +1438,8 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
                     8 * (matrix >> 1)];
 
   for (int stage = 0; stage < stages; ++stage) {
-    // Буфер следующей стадии читали на предыдущей: все варпы должны её
-    // досчитать, прежде чем его перепишет cp.async.
+    // The next stage's buffer was read in the previous stage: all warps must
+    // finish it before cp.async overwrites it.
     __syncthreads();
     if (stage + 1 < stages) {
       issue(stage + 1, next_block);
@@ -1458,7 +1458,7 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
          chunk_key < (slice + 1) * kSliceKeys; chunk_key += kChunkKeys) {
       const int key_base = stage_base + chunk_key;
       if (key_base >= warp_context) {
-        break;   // барьеры варп отработает, считать ему нечего
+        break;   // the warp will do its barriers, nothing for it to compute
       }
 
       float scores[kKeyTiles][4] = {};
@@ -1471,7 +1471,7 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
         }
 #pragma unroll
         for (int t = 0; t < kKeyTiles; ++t) {
-          // Матрица j — 16-ка измерений k4 + j восьми ключей тайла t.
+          // Matrix j is the 16 of dims k4 + j for eight keys of tile t.
           uint32_t packed[4];
           ldmatrix_x4_raw(
               packed,
@@ -1485,7 +1485,7 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
         }
       }
 
-      // Масштаб и причинная маска. Дорожка держит строки grp и grp+8.
+      // Scale and causal mask. A lane holds rows grp and grp+8.
       const int context_low = shared.row_context[row0 + grp];
       const int context_high = shared.row_context[row0 + grp + 8];
 #pragma unroll
@@ -1553,7 +1553,7 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
 
 #pragma unroll
       for (int g = 0; g < kKeyGroups; ++g) {
-        // Матрицы: ключи 0-7 и 8-15 группы для 16-к измерений c и c+1.
+        // Matrices: keys 0-7 and 8-15 of the group for dim 16s c and c+1.
         const int key = chunk_key + g * 16 + matrix_row + 8 * (matrix & 1);
 #pragma unroll
         for (int c = 0; c < kPackedChunks; c += 2) {
@@ -1576,8 +1576,8 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
   }
 
   if constexpr (kSlices > 1) {
-    // Кольцо свободно: все стадии досчитаны, cp.async дождались. Варпы
-    // срезов 1.. кладут свои суммы, варп среза 0 сводит их к своим.
+    // The ring is free: all stages are computed, cp.async has been waited on. Warps
+    // of slices 1.. put their sums, the slice-0 warp reduces them into its own.
     __syncthreads();
     if (slice > 0) {
       float* dump =
@@ -1611,7 +1611,7 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
         }
       }
       if (merged == -CUDART_INF_F) {
-        continue;   // строка пуста у всех срезов
+        continue;   // the row is empty in all slices
       }
       const float own =
           running_sum[half] > 0.0f ? __expf(running_max[half] - merged) : 0.0f;
@@ -1654,11 +1654,11 @@ __global__ __launch_bounds__(packed_warps<MTiles>() * 32, 1) void paged_attentio
     const int local = (tile_first + r) / kGroup;
     const int query_head = kv_head * kGroup + (tile_first + r) % kGroup;
     if constexpr (!Direct) {
-      // Строки партиций нумеруются от начала сегмента: row_base добавит
-      // редукция, когда будет писать выход. Выход партиции уходит уже
-      // нормированным, в f16: это выпуклая комбинация V, по модулю не больше
-      // 448, и f16 держит её с запасом по диапазону и на три бита точнее
-      // bf16 итогового выхода. Сумма и максимум остаются в fp32.
+      // Partition rows are numbered from the segment start: row_base is added by
+      // the reduction when it writes the output. The partition output goes out already
+      // normalized, in f16: it's a convex combination of V, at most 448 in magnitude,
+      // and f16 holds it with range to spare and three bits more precisely than the
+      // bf16 final output. Sum and max stay in fp32.
       const size_t slot =
           (static_cast<size_t>(local) * kQueryHeads + query_head) *
               partitions +
@@ -1728,11 +1728,11 @@ __device__ __forceinline__ float warp_all_sum(float value) {
   return value;
 }
 
-// Редукция партиций упакованного ядра. Выход партиции лежит нормированным в
-// f16, поэтому вес партиции — её доля знаменателя, sum * exp(max - M) / D.
-// Варп на пару (строка, голова), дорожка — восемь измерений подряд: одно
-// 16-байтное чтение на партицию. У общей reduce_partitions_kernel поток на
-// измерение и последовательный проход нулевого потока по весам.
+// Partition reduction of the packed kernel. A partition's output is stored normalized in
+// f16, so the partition weight is its share of the denominator, sum * exp(max - M) / D.
+// A warp per (row, head) pair, a lane handles eight consecutive dims: one
+// 16-byte read per partition. The shared reduce_partitions_kernel has a thread per
+// dim and a sequential pass of thread zero over the weights.
 __global__ __launch_bounds__(kThreads) void reduce_packed_partitions_kernel(
     const float* __restrict__ partial_max,
     const float* __restrict__ partial_sum,
@@ -1752,9 +1752,9 @@ __global__ __launch_bounds__(kThreads) void reduce_packed_partitions_kernel(
   const int query_head = pair % kQueryHeads;
   const size_t row_offset =
       (static_cast<size_t>(output_row) * kQueryHeads + query_head) * kHeadDim;
-  // Гейт от партиций не зависит, и его чтение идёт вместе с первыми: на
-  // decode редукция — цепочка из пары обращений к L2, и третье в конце
-  // стоило бы заметную долю её времени.
+  // The gate doesn't depend on partitions, and its read goes along with the first ones: on
+  // decode the reduction is a chain of a couple of L2 accesses, and a third at the end
+  // would cost a noticeable share of its time.
   uint4 gate_raw = make_uint4(0u, 0u, 0u, 0u);
   if (query_gate_projection != nullptr) {
     gate_raw = *reinterpret_cast<const uint4*>(
@@ -1787,9 +1787,9 @@ __global__ __launch_bounds__(kThreads) void reduce_packed_partitions_kernel(
           ? sum * __expf(partial_max[first + base + lane] - maximum) * inverse
           : 0.0f;
     }
-    // Без ветки на пустую партицию: она пишет точные нули, а ветка не даёт
-    // компилятору выдать загрузки раскрученного цикла разом, и проверка
-    // черновиков на P=32 ждала 32 чтения цепочкой.
+    // No branch for an empty partition: it writes exact zeros, and the branch prevents
+    // the compiler from issuing the unrolled loop's loads at once, and draft
+    // verification at P=32 waited for 32 chained reads.
     const int count = min(32, partitions - base);
     const __half* source = partial_output + (first + base) * kHeadDim + lane * 8;
 #pragma unroll 16
@@ -1822,8 +1822,8 @@ __global__ __launch_bounds__(kThreads) void reduce_packed_partitions_kernel(
       *reinterpret_cast<const uint4*>(packed);
 }
 
-// Байт частичных сумм на пару (строка запроса x голова, партиция): max и sum
-// в fp32 и нормированный выход в f16.
+// Partial-sum bytes per (query row x head, partition) pair: max and sum
+// in fp32 and the normalized output in f16.
 constexpr size_t kPackedPartialBytes = 2 * sizeof(float) + kHeadDim * sizeof(__half);
 
 template <int MTiles>
@@ -1878,7 +1878,7 @@ cudaError_t launch_packed_attention(
   if (workspace == nullptr || workspace_bytes < required) {
     return cudaErrorInvalidValue;
   }
-  // partials кратно 24, и выход в f16 начинается с 16-байтной границы.
+  // partials is a multiple of 24, and the f16 output starts at a 16-byte boundary.
   auto* partial_max = static_cast<float*>(workspace);
   auto* partial_sum = partial_max + partials;
   auto* partial_output = reinterpret_cast<__half*>(partial_sum + partials);
@@ -1907,9 +1907,9 @@ cudaError_t launch_packed_attention(
 
 }  // namespace
 
-// Упакованное внимание по fp8-кэшу. tile_size — упакованных строк (строка
-// запроса x голова группы) в тайле: 6 для decode-строк разных
-// последовательностей, до 64 для сегмента одной.
+// Packed attention over the fp8 cache. tile_size is the number of packed rows (query
+// row x group head) in a tile: 6 for decode rows of different
+// sequences, up to 64 for a segment of one.
 extern "C" cudaError_t qwc_paged_attention_packed_fp8(
     const void* query,
     const void* query_gate_projection,

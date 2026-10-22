@@ -1,46 +1,46 @@
-//! Аналитическая модель производительности decode-шага.
+//! An analytical performance model of the decode step.
 //!
-//! Decode упирается в пропускную способность памяти, а не в вычисления:
-//! на каждый шаг читаются ВСЕ веса модели. Поэтому потолок tokens/sec
-//! считается заранее, и по нему видно, сколько реально недобирают кернелы.
+//! Decode is bound by memory bandwidth, not compute:
+//! every step reads ALL the model weights. So the tokens/sec ceiling
+//! is computed in advance, and it shows how much the kernels actually fall short.
 //!
-//! Замеры CUTLASS NVFP4 GEMM на RTX 5090 (см. docs/03-roofline.md):
-//! при M=2048 достигается 1400 TFLOPS (84% пика FP4), но при M=1..32 —
-//! только 44-57% пропускной способности памяти. Именно этот разрыв
-//! специализированный GEMV-кернел и должен закрыть.
+//! CUTLASS NVFP4 GEMM measurements on the RTX 5090 (see docs/03-roofline.md):
+//! at M=2048 it reaches 1400 TFLOPS (84% of FP4 peak), but at M=1..32 —
+//! only 44-57% of memory bandwidth. That's exactly the gap
+//! a specialized GEMV kernel is meant to close.
 
 use crate::dtype::Dtype;
 use crate::memory::CacheConfig;
 
-/// Паспортный пик RTX 5090: 512 бит @ 28 Gbps.
+/// The RTX 5090 spec peak: 512 bits @ 28 Gbps.
 pub const PEAK_BANDWIDTH: f64 = 1792e9;
 
-/// Реально достижимое чтение из DRAM, измерено на этой карте
-/// (`cargo run -p qwc-cuda --bin gpuinfo`): 90% паспортного пика.
-/// Все оценки строятся по нему — паспортное число недостижимо в принципе.
+/// Actually achievable DRAM read, measured on this card
+/// (`cargo run -p qwc-cuda --bin gpuinfo`): 90% of the spec peak.
+/// All estimates are based on it — the spec number is unreachable in principle.
 pub const ACHIEVABLE_BANDWIDTH: f64 = 1605e9;
 
-/// Чтение из L2 (96 MiB): в 2.4 раза быстрее DRAM. Рабочие множества движка
-/// на порядки больше, поэтому применимо только внутри одного слоя.
+/// L2 read (96 MiB): 2.4x faster than DRAM. The engine's working sets
+/// are orders of magnitude larger, so it's only applicable within one layer.
 pub const L2_BANDWIDTH: f64 = 3886e9;
-/// Пик плотного FP4 на RTX 5090, FLOP/s.
+/// Dense FP4 peak on the RTX 5090, FLOP/s.
 pub const PEAK_FP4_FLOPS: f64 = 1.676e15;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeStep {
     pub batch: usize,
     pub context_len: usize,
-    /// Доля пиковой пропускной способности, которую реально дают кернелы.
+    /// The share of peak bandwidth the kernels actually deliver.
     pub bandwidth_efficiency: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct StepCost {
-    /// Веса читаются целиком, независимо от batch.
+    /// Weights are read entirely, regardless of batch.
     pub weight_bytes: u64,
-    /// Рекуррентное состояние: чтение + запись на каждую последовательность.
+    /// Recurrent state: read + write for each sequence.
     pub state_bytes: u64,
-    /// KV-кэш: чтение всего контекста на каждую последовательность.
+    /// KV cache: reading the whole context for each sequence.
     pub kv_bytes: u64,
 }
 
@@ -49,7 +49,7 @@ impl StepCost {
         self.weight_bytes + self.state_bytes + self.kv_bytes
     }
 
-    /// `efficiency` — доля достижимой пропускной способности, а не паспортной.
+    /// `efficiency` is the share of achievable bandwidth, not of the spec.
     pub fn seconds(&self, efficiency: f64) -> f64 {
         self.total() as f64 / (ACHIEVABLE_BANDWIDTH * efficiency)
     }
@@ -57,7 +57,7 @@ impl StepCost {
 
 impl DecodeStep {
     pub fn cost(&self, streamed_weights: u64, cache: &CacheConfig) -> StepCost {
-        // Состояние DeltaNet перезаписывается целиком: читаем и пишем.
+        // The DeltaNet state is rewritten entirely: we read and write.
         let state = 2 * cache.state_bytes_per_slot() * self.batch as u64;
         let kv = cache.kv_bytes_per_token() * self.context_len as u64 * self.batch as u64;
         StepCost {
@@ -67,7 +67,7 @@ impl DecodeStep {
         }
     }
 
-    /// Совокупная скорость генерации, токенов в секунду.
+    /// Aggregate generation speed, tokens per second.
     pub fn tokens_per_sec(&self, streamed_weights: u64, cache: &CacheConfig) -> f64 {
         let t = self
             .cost(streamed_weights, cache)
@@ -75,7 +75,7 @@ impl DecodeStep {
         self.batch as f64 / t
     }
 
-    /// Межтокенная задержка, миллисекунды.
+    /// Inter-token latency, milliseconds.
     pub fn itl_ms(&self, streamed_weights: u64, cache: &CacheConfig) -> f64 {
         self.cost(streamed_weights, cache)
             .seconds(self.bandwidth_efficiency)
@@ -83,17 +83,17 @@ impl DecodeStep {
     }
 }
 
-/// Арифметическая интенсивность GEMM при данном batch: FLOP на байт весов.
-/// Точка перехода из memory-bound в compute-bound — там, где она сравнивается
-/// с отношением пика вычислений к пику пропускной способности.
+/// GEMM arithmetic intensity at a given batch: FLOP per weight byte.
+/// The transition point from memory-bound to compute-bound is where it equals
+/// the ratio of peak compute to peak bandwidth.
 pub fn gemm_intensity(m: usize, weight_dtype: Dtype, n: usize, k: usize) -> f64 {
     let flops = 2.0 * m as f64 * n as f64 * k as f64;
     flops / weight_dtype.bytes(n * k) as f64
 }
 
-/// Batch, при котором GEMM перестаёт быть memory-bound.
+/// The batch at which a GEMM stops being memory-bound.
 pub fn compute_bound_batch(weight_dtype: Dtype) -> f64 {
-    // intensity(M) = 2*M / bytes_per_elem; порог = PEAK_FLOPS / PEAK_BW
+    // intensity(M) = 2*M / bytes_per_elem; threshold = PEAK_FLOPS / PEAK_BW
     let bytes_per_elem = weight_dtype.effective_bits() as f64 / 8.0;
     (PEAK_FP4_FLOPS / ACHIEVABLE_BANDWIDTH) * bytes_per_elem / 2.0
 }
@@ -109,7 +109,7 @@ mod tests {
         let w = WeightPlan::default().decode_weight_bytes(1);
         let cache = CacheConfig::default();
 
-        // Идеальный кернел: вся полоса памяти.
+        // An ideal kernel: the whole memory bandwidth.
         let ideal = DecodeStep {
             batch: 1,
             context_len: 2048,
@@ -118,10 +118,10 @@ mod tests {
         let tps = ideal.tokens_per_sec(w, &cache);
         assert!(
             (100.0..112.0).contains(&tps),
-            "потолок batch=1: {tps:.0} tok/s"
+            "batch=1 ceiling: {tps:.0} tok/s"
         );
 
-        // То, что даёт CUTLASS GEMM на M=1 (замерено: 47%).
+        // What CUTLASS GEMM gives at M=1 (measured: 47%).
         let real = DecodeStep {
             bandwidth_efficiency: 0.47,
             ..ideal
@@ -141,20 +141,20 @@ mod tests {
         };
         let c = step.cost(w, &cache);
 
-        // При batch=32 состояние DeltaNet читается и пишется 32 раза, и это
-        // всё ещё больше, чем чтение KV-кэша.
+        // At batch=32 the DeltaNet state is read and written 32 times, and that's
+        // still more than reading the KV cache.
         assert!(
             c.state_bytes > c.kv_bytes,
-            "состояние {} vs KV {}",
+            "state {} vs KV {}",
             c.state_bytes,
             c.kv_bytes
         );
-        // Раньше здесь была пятая часть шага. 8-битное хранение срезало долю
-        // вдвое: измеренный шаг при c=32 подтвердил это отдельно —
-        // `delta.scan` 1.963 -> 1.786 мс при вдвое меньшем трафике
+        // This used to be a fifth of the step. 8-bit storage cut the share
+        // in half: the measured step at c=32 confirmed this separately —
+        // `delta.scan` 1.963 -> 1.786 ms with half the traffic
         // (`bench/results/delta-state-8bit.md`).
         let share = c.state_bytes as f64 / c.total() as f64;
-        assert!((0.08..0.20).contains(&share), "доля состояния {share:.2}");
+        assert!((0.08..0.20).contains(&share), "state share {share:.2}");
 
         let wide = CacheConfig {
             state_dtype: Dtype::Bf16,
@@ -164,7 +164,7 @@ mod tests {
             step.cost(w, &wide).state_bytes as f64 / step.cost(w, &wide).total() as f64;
         assert!(
             wide_share > share * 1.6,
-            "bf16 {wide_share:.2} против {share:.2}"
+            "bf16 {wide_share:.2} vs {share:.2}"
         );
     }
 
@@ -184,16 +184,16 @@ mod tests {
         };
 
         let saved = step.itl_ms(w, &fp32) - step.itl_ms(w, &bf16);
-        // Перевод состояния в bf16 экономит миллисекунды на каждом шаге.
-        assert!(saved > 2.0, "экономия всего {saved:.2} мс");
+        // Converting the state to bf16 saves milliseconds on every step.
+        assert!(saved > 2.0, "only {saved:.2} ms saved");
     }
 
     #[test]
     fn decode_is_memory_bound_until_large_batch() {
         let b = compute_bound_batch(Dtype::Nvfp4);
-        // При NVFP4 переход в compute-bound происходит в районе batch ~260,
-        // то есть весь наш диапазон 1..32 — чисто memory-bound.
-        assert!((200.0..350.0).contains(&b), "переход при batch {b:.0}");
+        // With NVFP4 the transition to compute-bound happens around batch ~260,
+        // i.e. our whole 1..32 range is purely memory-bound.
+        assert!((200.0..350.0).contains(&b), "transition at batch {b:.0}");
 
         let i32 = gemm_intensity(32, Dtype::Nvfp4, INTERMEDIATE_SIZE, HIDDEN_SIZE);
         let threshold = PEAK_FP4_FLOPS / ACHIEVABLE_BANDWIDTH;

@@ -1,7 +1,7 @@
-//! Чтение safetensors через mmap.
+//! Reading safetensors via mmap.
 //!
-//! Формат: [8 байт длины заголовка LE][JSON-заголовок][данные].
-//! Смещения в заголовке отсчитываются от начала блока данных.
+//! Format: [8-byte LE header length][JSON header][data].
+//! Offsets in the header are relative to the start of the data block.
 
 use memmap2::{Advice, Mmap, UncheckedAdvice};
 use std::collections::HashMap;
@@ -49,7 +49,7 @@ impl StDtype {
 pub struct TensorInfo {
     pub dtype: StDtype,
     pub shape: Vec<usize>,
-    /// Смещения внутри блока данных шарда.
+    /// Offsets within the shard's data block.
     pub start: usize,
     pub end: usize,
 }
@@ -73,41 +73,41 @@ pub struct Shard {
 impl Shard {
     pub fn open(path: &Path) -> std::io::Result<Self> {
         let file = File::open(path)?;
-        // SAFETY: файл чекпоинта не изменяется во время работы движка.
+        // SAFETY: the checkpoint file doesn't change while the engine runs.
         let mmap = unsafe { Mmap::map(&file)? };
         mmap.advise(Advice::Sequential)?;
 
         if mmap.len() < 8 {
-            return Err(bad("шард короче заголовка"));
+            return Err(bad("shard shorter than header"));
         }
         let hdr_len = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
         let data_offset = 8 + hdr_len;
         if data_offset > mmap.len() {
-            return Err(bad("длина заголовка выходит за пределы файла"));
+            return Err(bad("header length goes past the end of the file"));
         }
 
         let json: serde_json::Value = serde_json::from_slice(&mmap[8..data_offset])
-            .map_err(|e| bad(&format!("заголовок не разбирается: {e}")))?;
+            .map_err(|e| bad(&format!("header doesn't parse: {e}")))?;
 
         let mut tensors = HashMap::new();
-        for (name, v) in json.as_object().ok_or_else(|| bad("заголовок не объект"))?
+        for (name, v) in json.as_object().ok_or_else(|| bad("header is not an object"))?
         {
             if name == "__metadata__" {
                 continue;
             }
-            let dtype_str = v["dtype"].as_str().ok_or_else(|| bad("нет dtype"))?;
+            let dtype_str = v["dtype"].as_str().ok_or_else(|| bad("no dtype"))?;
             let Some(dtype) = StDtype::parse(dtype_str) else {
-                return Err(bad(&format!("неподдерживаемый тип {dtype_str} у {name}")));
+                return Err(bad(&format!("unsupported type {dtype_str} for {name}")));
             };
             let shape: Vec<usize> = v["shape"]
                 .as_array()
-                .ok_or_else(|| bad("нет shape"))?
+                .ok_or_else(|| bad("no shape"))?
                 .iter()
                 .map(|x| x.as_u64().unwrap_or(0) as usize)
                 .collect();
             let off = v["data_offsets"]
                 .as_array()
-                .ok_or_else(|| bad("нет data_offsets"))?;
+                .ok_or_else(|| bad("no data_offsets"))?;
             let start = off[0].as_u64().unwrap_or(0) as usize;
             let end = off[1].as_u64().unwrap_or(0) as usize;
             tensors.insert(
@@ -132,7 +132,7 @@ impl Shard {
         self.tensors.get(name)
     }
 
-    /// Сырые байты тензора. Копирования нет — это срез из mmap.
+    /// Raw tensor bytes. No copy — it's a slice of the mmap.
     pub fn bytes(&self, name: &str) -> Option<&[u8]> {
         let t = self.tensors.get(name)?;
         Some(&self.mmap[self.data_offset + t.start..self.data_offset + t.end])
@@ -145,9 +145,9 @@ impl Shard {
     /// Drops clean file-backed pages after their tensors have been uploaded.
     /// The virtual mapping stays valid and pages can be faulted in again.
     pub fn evict_pages(&self) -> std::io::Result<()> {
-        // SAFETY: отображение read-only и file-backed, грязных страниц нет —
-        // MADV_DONTNEED здесь только сбрасывает чистые страницы, данные
-        // подгрузятся из файла заново при следующем обращении.
+        // SAFETY: the mapping is read-only and file-backed, no dirty pages —
+        // MADV_DONTNEED here only drops clean pages; the data
+        // will be reloaded from the file on next access.
         unsafe { self.mmap.unchecked_advise(UncheckedAdvice::DontNeed) }
     }
 }

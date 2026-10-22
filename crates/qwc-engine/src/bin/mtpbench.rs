@@ -1,10 +1,10 @@
-//! Acceptance и цена чернового шага MTP-головы на GPU.
+//! Acceptance and cost of the MTP head's draft step on the GPU.
 //!
 //! `cargo run --release -p qwc-engine --bin mtpbench -- --corpus bench/corpus/core.jsonl --max-new 128`
 //!
-//! Тот же замер, что оффлайн в `bench/mtp_acceptance.py`, но головой, которая
-//! реально считается нашими ядрами: если числа сходятся, реализация верна.
-//! Заодно меряется время чернового шага — из него и складывается вся выгода.
+//! The same measurement as the offline `bench/mtp_acceptance.py`, but with the head
+//! actually computed by our kernels: if the numbers match, the implementation is right.
+//! The draft step time is measured too — the whole gain comes out of it.
 
 use qwc_core::arch::{HIDDEN_SIZE, VOCAB_SIZE};
 use qwc_cuda::paged_attention::KvCacheDtype;
@@ -27,13 +27,13 @@ fn parse_cases(text: &str) -> Vec<(String, Vec<u32>)> {
         let prompt = match explicit {
             Some(ids) => ids,
             None => {
-                let unit = list(line, "\"token_ids\":").expect("нет токенов промпта");
+                let unit = list(line, "\"token_ids\":").expect("no prompt tokens");
                 let length: usize = line
                     .split("\"length\":")
                     .nth(1)
                     .and_then(|rest| rest.split([',', '}']).next())
                     .and_then(|value| value.trim().parse().ok())
-                    .expect("нет length");
+                    .expect("no length");
                 unit.iter().cycle().take(length).copied().collect()
             }
         };
@@ -53,8 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut corpus = PathBuf::from("bench/corpus/core.jsonl");
     let mut max_new = 128usize;
     let mut context = 4096usize;
-    // Прогонять голову по промпту до первого черновика: без этого её KV на
-    // промпте пустой. `--no-prime` возвращает прежний замер для A/B.
+    // Run the head over the prompt before the first draft: without this its KV on
+    // the prompt is empty. `--no-prime` restores the old measurement for A/B.
     let mut prime = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--max-new" => max_new = args.next().ok_or("--max-new")?.parse()?,
             "--context" => context = args.next().ok_or("--context")?.parse()?,
             "--no-prime" => prime = false,
-            other => return Err(format!("неизвестный аргумент: {other}").into()),
+            other => return Err(format!("unknown argument: {other}").into()),
         }
     }
 
@@ -84,25 +84,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut draft_logits = DeviceBuffer::<f32>::zeroed(VOCAB_SIZE)?;
     let mut argmax = qwc_cuda::sampling::Argmax::new(1, VOCAB_SIZE)?;
     println!(
-        "голова: {:.0} МБ весов, KV одного слоя: {:.0} МБ\n",
+        "head: {:.0} MB of weights, KV of one layer: {:.0} MB\n",
         head.resident_bytes() as f64 / 1e6,
         scratch.resident_bytes() as f64 / 1e6
     );
 
-    println!("{:>12} {:>9} {:>12}", "случай", "черновиков", "acceptance");
+    println!("{:>12} {:>9} {:>12}", "case", "drafts", "acceptance");
     println!("{:->12} {:->9} {:->12}", "", "", "");
     let (mut hits, mut total) = (0usize, 0usize);
     let mut draft_times = Vec::new();
     let mut head_times = Vec::new();
     for (id, prompt) in &cases {
-        assert!(prompt.len() <= PREFILL_CHUNK_SIZE, "{id}: промпт длиннее чанка");
+        assert!(prompt.len() <= PREFILL_CHUNK_SIZE, "{id}: prompt longer than a chunk");
         assert!(prompt.len() + max_new <= context);
-        // Новый прогон — своя история у головы: KV-кэш черновика обнуляется.
+        // A new run gets its own head history: the draft KV cache is zeroed.
         scratch = MtpScratch::new(rows, context, KvCacheDtype::Fp8)?;
         executor.prefill_sequence(&weights, prompt, 0, 0)?;
         if prime {
-            // Пары (h_t, токен t+1) для всех позиций промпта, кроме последней:
-            // её токен t+1 модель ещё не выдала, это первый черновик ниже.
+            // Pairs (h_t, token t+1) for all prompt positions but the last:
+            // the model hasn't produced its token t+1 yet, that's the first draft below.
             let pairs = prompt.len() - 1;
             for begin in (0..pairs).step_by(rows) {
                 let count = rows.min(pairs - begin);
@@ -125,10 +125,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 executor.copy_decode_hidden_row(0, &mut hidden)?;
             }
-            // Черновик: голова видит h_t и токен, который модель только что
-            // выдала, и предсказывает следующий.
-            // Голова и словарная проекция меряются порознь: lm_head читает
-            // 1.27 ГБ, то есть может стоить дороже самой головы.
+            // Draft: the head sees h_t and the token the model just
+            // produced, and predicts the next one.
+            // The head and the vocab projection are measured separately: lm_head reads
+            // 1.27 GB, so it may cost more than the head itself.
             let started = Event::new()?;
             let after_head = Event::new()?;
             let finished = Event::new()?;
@@ -165,17 +165,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     draft_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     head_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     println!(
-        "\nacceptance всего: {:.3} ({total} черновиков)",
+        "\nacceptance overall: {:.3} ({total} drafts)",
         hits as f64 / total.max(1) as f64
     );
     let head_median = draft_times[draft_times.len() / 2];
     let vocab_median = head_times[head_times.len() / 2];
     println!(
-        "черновой шаг: голова {head_median:.3} мс + lm_head {vocab_median:.3} мс = {:.3} мс",
+        "draft step: head {head_median:.3} ms + lm_head {vocab_median:.3} ms = {:.3} ms",
         head_median + vocab_median
     );
     println!(
-        "  голова: {:.0} ГБ/с из 1790 возможных",
+        "  head: {:.0} GB/s of 1790 possible",
         head.resident_bytes() as f64 / 1e9 / (head_median * 1e-3)
     );
     Ok(())

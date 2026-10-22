@@ -1,5 +1,5 @@
-//! Имена тензоров в чекпоинте. Собраны в одном месте, чтобы раскладка
-//! конкретного чекпоинта не расползалась по коду загрузчика.
+//! Tensor names in the checkpoint. Gathered in one place so that the layout
+//! of a specific checkpoint doesn't spread across the loader code.
 
 pub const EMBED: &str = "model.language_model.embed_tokens.weight";
 pub const FINAL_NORM: &str = "model.language_model.norm.weight";
@@ -9,7 +9,7 @@ pub fn layer(i: usize) -> String {
     format!("model.language_model.layers.{i}")
 }
 
-/// Все квантованные linear-слои слоя `i` как (префикс, out_features, in_features).
+/// All quantized linear layers of layer `i` as (prefix, out_features, in_features).
 pub fn quant_linears(i: usize) -> Vec<(String, usize, usize)> {
     use qwc_core::arch::*;
     let l = layer(i);
@@ -20,7 +20,7 @@ pub fn quant_linears(i: usize) -> Vec<(String, usize, usize)> {
     ];
     match layer_kind(i) {
         LayerKind::FullAttention => {
-            // q_proj выдаёт [q; выходной гейт] одной проекцией: attn_output_gate = true.
+            // q_proj outputs [q; output gate] in one projection: attn_output_gate = true.
             v.push((format!("{l}.self_attn.q_proj"), 2 * Q_PROJ_DIM, HIDDEN_SIZE));
             v.push((format!("{l}.self_attn.k_proj"), KV_PROJ_DIM, HIDDEN_SIZE));
             v.push((format!("{l}.self_attn.v_proj"), KV_PROJ_DIM, HIDDEN_SIZE));
@@ -57,7 +57,7 @@ pub fn quant_linears(i: usize) -> Vec<(String, usize, usize)> {
     v
 }
 
-/// Неквантованные тензоры слоя `i` как (имя, ожидаемая форма).
+/// Unquantized tensors of layer `i` as (name, expected shape).
 pub fn plain_tensors(i: usize) -> Vec<(String, Vec<usize>)> {
     use qwc_core::arch::*;
     let l = layer(i);
@@ -70,7 +70,7 @@ pub fn plain_tensors(i: usize) -> Vec<(String, Vec<usize>)> {
     ];
     match layer_kind(i) {
         LayerKind::FullAttention => {
-            // QK-норма на голову: нормируются q и k перед attention.
+            // Per-head QK norm: q and k are normalized before attention.
             v.push((format!("{l}.self_attn.q_norm.weight"), vec![ATTN_HEAD_DIM]));
             v.push((format!("{l}.self_attn.k_norm.weight"), vec![ATTN_HEAD_DIM]));
         }
@@ -87,7 +87,7 @@ pub fn plain_tensors(i: usize) -> Vec<(String, Vec<usize>)> {
     v
 }
 
-/// Тензоры MTP-головы. В чекпоинте она не квантована.
+/// MTP head tensors. In the checkpoint it isn't quantized.
 pub fn mtp_tensors() -> Vec<(String, Vec<usize>)> {
     use qwc_core::arch::*;
     vec![

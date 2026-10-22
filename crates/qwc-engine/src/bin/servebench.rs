@@ -32,29 +32,29 @@ struct Args {
     delta_state: DeltaStateMode,
     speculative: usize,
     shortlist: usize,
-    /// Сколько последних позиций промпта MTP-голова прогоняет на префилле,
-    /// чтобы её KV не был пустым: 0 — ни одной, `usize::MAX` — весь промпт.
+    /// How many last prompt positions the MTP head runs during prefill,
+    /// so that its KV isn't empty: 0 — none, `usize::MAX` — the whole prompt.
     mtp_prime: usize,
     corpus: Option<PathBuf>,
 }
 
-/// Активации, скретч проекций, логиты, буферы сэмплинга и CUDA-графы.
-/// Ровно та же величина, что закладывает планировщик в `qwc-core`.
+/// Activations, projection scratch, logits, sampling buffers and CUDA graphs.
+/// Exactly the same quantity the planner in `qwc-core` reserves.
 const WORKSPACE_RESERVE: usize = 2_000_000_000;
 
-/// Запас поверх свободной памяти карты: округление аллокаций драйвером плюс
-/// то, что успевает занять чужой процесс между замером и захватом пула.
+/// Headroom on top of the card's free memory: driver allocation rounding plus
+/// whatever another process manages to grab between the measurement and the pool capture.
 const FREE_MARGIN: usize = 1_000_000_000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse()?;
     qwc_cuda::Device::init(0)?;
-    // Фактический лимит может оказаться ниже запрошенного: карта делится с
-    // чужими процессами. В артефакт пишется тот, под которым шёл замер.
+    // The actual limit may turn out lower than requested: the card is shared with
+    // other processes. The artifact records the one the measurement ran under.
     let memory_limit = qwc_cuda::set_memory_limit(args.memory_limit)?;
     if memory_limit < args.memory_limit {
         eprintln!(
-            "бюджет урезан по свободной памяти: {:.2} ГБ вместо запрошенных {:.2}",
+            "budget clamped to free memory: {:.2} GB instead of the requested {:.2}",
             memory_limit as f64 / 1e9,
             args.memory_limit as f64 / 1e9,
         );
@@ -69,27 +69,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         * KV_ELEMS_PER_TOKEN
         * args.kv_cache.bytes_per_element();
 
-    // `--kv-cache-gb 0` — отдать под KV весь остаток бюджета, как это делает
-    // vLLM со своим `gpu_memory_utilization`. Иначе сравнение по общему
-    // бюджету врёт: соперник забирает остаток, а мы требуем свои гигабайты
-    // сверх весов и падаем там, где на самом деле помещаемся.
+    // `--kv-cache-gb 0` — give the whole rest of the budget to KV, as
+    // vLLM does with its `gpu_memory_utilization`. Otherwise comparing by total
+    // budget lies: the rival takes the rest, while we demand our own gigabytes
+    // on top of the weights and fail where we actually fit.
     let kv_cache_bytes = if args.kv_cache_bytes == 0 {
         let used = qwc_cuda::memory_usage().used;
         let slots = args.concurrency + 1;
-        // Состояние покоящихся слотов — int8 плюс масштаб f32 на строку;
-        // сверх слотов лежит одна расквантованная bf16-копия на движок, по
-        // которой идёт префилл.
+        // The state of resting slots is int8 plus an f32 scale per row;
+        // beyond the slots there's one dequantized bf16 copy per engine, on
+        // which prefill runs.
         let state = NUM_LINEAR_LAYERS
             * (slots
                 * (STATE_ELEMS
                     + STATE_SCALE_ELEMS * std::mem::size_of::<f32>()
                     + CONV_STATE_ELEMS * std::mem::size_of::<f32>())
                 + STATE_ELEMS * std::mem::size_of::<u16>());
-        // Остаток бюджета по нашему учёту — верхняя граница, а не правда:
-        // драйвер округляет аллокации, а контекст и графы мы не считаем.
-        // Поэтому пул режется ещё и по тому, что карта показывает свободным
-        // прямо сейчас. Ровно это делает vLLM, профилируя память перед тем,
-        // как взять остаток под KV.
+        // The rest of the budget by our accounting is an upper bound, not the truth:
+        // the driver rounds allocations, and we don't count the context and graphs.
+        // So the pool is also clamped by what the card shows as free
+        // right now. That's exactly what vLLM does, profiling memory before
+        // taking the rest for KV.
         let by_budget = memory_limit
             .saturating_sub(used)
             .saturating_sub(state)
@@ -153,9 +153,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
     }
 
-    // Спекуляция окупается, пока шаг упирается в чтение весов. На широком
-    // batch они уже размазаны по строкам, а проверка k+1 строк стоит полного
-    // прохода, поэтому черновики берутся только для одиночной decode-строки.
+    // Speculation pays off while the step is bound by weight reads. At wide
+    // batch they're already spread over the rows, while verifying k+1 rows costs a full
+    // pass, so drafts are taken only for a single decode row.
     let mut speculator = match args.speculative {
         0 => None,
         _ => {
@@ -167,21 +167,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(speculator)
         }
     };
-    // Для какой последовательности в спекуляторе лежит актуальное скрытое
-    // состояние. Пока его нет, шаг идёт обычным путём и заодно его добывает.
+    // For which sequence the speculator holds the current hidden
+    // state. Until there is one, the step goes the regular way and obtains it along the way.
     let mut hidden_for: Option<SeqId> = None;
-    // Токены, чьи строки лежат в `spec.hidden`, в порядке позиций: после
-    // обычного шага — один ожидающий, после проверки — все принятые плюс
-    // исправленный. Первый черновой проход пишет их KV настоящими h.
+    // Tokens whose rows are in `spec.hidden`, in position order: after
+    // a regular step — one pending, after verification — all accepted plus
+    // the corrected one. The first draft pass writes their KV with real h.
     let mut head_tokens: Vec<u32> = Vec::new();
     let mut prime_ms = 0.0f64;
     let mut speculative_steps = 0usize;
     let mut speculative_tokens = 0usize;
-    // Сколько черновиков принято на шаге, по длинам: без этого «acceptance»
-    // остаётся средним, а среднее прячет обрыв на конкретной глубине.
+    // How many drafts were accepted per step, by length: without this "acceptance"
+    // stays an average, and the average hides a cliff at a specific depth.
     let mut accept_histogram = vec![0usize; qwc_engine::executor::MAX_SPECULATION_ROWS + 1];
-    // Обе фазы кончаются копией на хост, поэтому их время меряется часами
-    // напрямую — отдельная синхронизация не нужна.
+    // Both phases end with a copy to host, so their time is measured with clocks
+    // directly — no separate sync needed.
     let mut draft_ms = 0.0f64;
     let mut verify_ms = 0.0f64;
 
@@ -189,11 +189,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut produced = HashMap::<SeqId, usize>::new();
     let mut first_token_ms = HashMap::<SeqId, f64>::new();
     let mut last_token_at = HashMap::<SeqId, Instant>::new();
-    // Выданные токены по запросу: для TPOT, (последний − первый)/(n − 1).
-    // `produced` для этого не годится — он считает входы decode-шага.
+    // Emitted tokens per request: for TPOT, (last − first)/(n − 1).
+    // `produced` doesn't fit for this — it counts decode-step inputs.
     let mut emitted = HashMap::<SeqId, usize>::new();
-    // TTFT без очереди: от шага, взявшего запрос в работу, до первого токена.
-    // Все запросы подаются в t=0, и при c=1 обычный TTFT — почти одна очередь.
+    // TTFT without the queue: from the step that took the request into work to the first token.
+    // All requests are submitted at t=0, and at c=1 the ordinary TTFT is almost entirely queue.
     let mut admitted_at = HashMap::<SeqId, Instant>::new();
     let mut inter_token_ms: Vec<f64> = Vec::with_capacity(args.requests * args.max_new);
 
@@ -206,8 +206,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let batch = scheduler
             .next_batch()?
             .ok_or("scheduler made no progress")?;
-        // Запрос взят в работу — шаг с первым чанком его промпта, как
-        // `scheduled_ts` у vLLM.
+        // The request was taken into work — the step with the first chunk of its prompt, like
+        // vLLM's `scheduled_ts`.
         let scheduled_at = Instant::now();
         for chunk in &batch.prefill {
             if chunk.offset == 0 {
@@ -216,9 +216,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let layout = BatchLayout::build(&batch, scheduler.cache())?;
 
-        // Глубина урезается остатком запроса: шаг выдаёт rows токенов разом,
-        // и перескочить через max_new значит сделать лишнюю работу и
-        // посчитать несуществующий токен.
+        // Depth is clipped by what the request has left: a step emits rows tokens at once,
+        // and overshooting max_new means doing extra work and
+        // counting a nonexistent token.
         let depth = match (speculator.as_ref(), batch.decode.first()) {
             (Some(_), Some(&id)) if batch.prefill.is_empty() && batch.decode.len() == 1 => {
                 let remaining = scheduler.remaining_tokens(id).unwrap_or(0);
@@ -237,7 +237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             debug_assert_eq!(head_tokens.last(), Some(&token));
             let state_slot = layout.state_slots[0] as usize;
             if spec.bind(id)? {
-                // Новая последовательность — шортлисту нужен её промпт.
+                // A new sequence — the shortlist needs its prompt.
                 spec.set_context(&prompts[&id]);
             }
 
@@ -245,13 +245,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let first = position + 1 - head_tokens.len();
             let drafts = spec.draft_chain(&weights, &head_tokens, first, depth)?;
             draft_ms += draft_started.elapsed().as_secs_f64() * 1e3;
-            // Проверка пишет KV всем строкам разом, поэтому страницы под них
-            // нужны заранее. Если пул не дал — черновик просто короче.
+            // Verification writes KV for all rows at once, so pages for them
+            // are needed in advance. If the pool didn't give them, the draft is just shorter.
             let reserved = scheduler.reserve_extra(id, drafts.len());
             let drafts = &drafts[..reserved];
 
-            // Таблицу берём после резервирования: `layout` построен до него и
-            // новых страниц ещё не знает.
+            // Take the table after the reservation: `layout` was built before it and
+            // doesn't know the new pages yet.
             let blocks = scheduler
                 .cache()
                 .sequence(id)
@@ -274,8 +274,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rows = accepted + 1;
             executor.commit_speculation(&weights, rows_in.len(), rows, state_slot)?;
             scheduler.release_extra(id, reserved - accepted)?;
-            // Строки 0..rows проверки несут настоящие h для принятых позиций
-            // и для исправленной: следующий черновик перепишет ими KV головы.
+            // Verification rows 0..rows carry real h for the accepted positions
+            // and for the corrected one: the next draft will rewrite the head's KV with them.
             executor.copy_prefill_hidden_rows(0, rows, spec.hidden_mut())?;
             head_tokens.clear();
             head_tokens.extend_from_slice(&truth[..rows]);
@@ -298,9 +298,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             accept_histogram[accepted] += 1;
 
             passes += 1;
-            // Сбрасываем скрытое состояние только если закончился именно этот
-            // запрос: `completed` накопительный и после первого же финиша
-            // выключал бы спекуляцию на каждом втором шаге.
+            // Reset the hidden state only if exactly this request
+            // finished: `completed` is cumulative and after the very first finish
+            // would turn speculation off on every other step.
             let finished = scheduler.complete_batch_multi(&[], &[(id, rows)])?;
             completed += finished.len();
             steps += 1;
@@ -322,9 +322,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let sampled = executor.execute_layout(&weights, &layout, &input)?;
-        // Голова заполняет свой KV по промпту: без этого на промпте у неё
-        // нули, и acceptance проседает с 0.91 до 0.85. Обслуживает она одну
-        // последовательность, поэтому только в шаге с единственным чанком.
+        // The head fills its KV from the prompt: without this it has
+        // zeros on the prompt, and acceptance drops from 0.91 to 0.85. It serves one
+        // sequence, so only in a step with a single chunk.
         if let Some(spec) = speculator.as_mut()
             && args.mtp_prime > 0
             && let [chunk] = batch.prefill.as_slice()
@@ -340,8 +340,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let begin = chunk.offset.max(window_start);
             let end = chunk.offset + chunk.tokens;
             if begin < end {
-                // Пара строки t — (h_t, токен t+1). Для последней позиции
-                // промпта токен t+1 — тот, что шаг только что выдал.
+                // The pair for row t is (h_t, token t+1). For the last prompt
+                // position token t+1 is the one the step has just emitted.
                 let mut next = Vec::with_capacity(end - begin);
                 for t in begin..end {
                     next.push(match prompt.get(t + 1) {
@@ -363,10 +363,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         for (id, token) in sampled {
             pending.insert(id, token);
-            // Сэмпл есть у каждой строки шага, но токен запрос получает только
-            // от decode и от последнего чанка промпта. Сэмпл недопрефилленного
-            // чанка — не токен: иначе TTFT длинного промпта — время первого
-            // чанка, а шаги остальных чанков попадают в ITL и TPOT.
+            // Every row of the step has a sample, but a request gets a token only
+            // from decode and from the prompt's last chunk. The sample of a partially prefilled
+            // chunk is not a token: otherwise a long prompt's TTFT is the time of the first
+            // chunk, and steps of the other chunks land in ITL and TPOT.
             let partial = batch
                 .prefill
                 .iter()
@@ -383,8 +383,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             *emitted.entry(id).or_insert(0) += 1;
         }
-        // Скрытое состояние для следующего чернового шага берётся отсюда:
-        // спекуляции нужен вход головы, а он есть только после прохода.
+        // The hidden state for the next draft step is taken from here:
+        // speculation needs the head's input, and it exists only after the pass.
         hidden_for = None;
         if let Some(spec) = speculator.as_mut()
             && batch.prefill.is_empty()
@@ -405,9 +405,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let output_tokens: usize = produced.values().sum();
     let mut ttft: Vec<f64> = first_token_ms.values().copied().collect();
-    // TPOT — среднее время на токен после первого, по запросу; перцентили —
-    // по запросам. ITL — по промежуткам между выдачами, при спекуляции
-    // промежуток делится на число выданных за шаг токенов.
+    // TPOT is the mean time per token after the first, per request; percentiles are
+    // over requests. ITL is over intervals between emissions; with speculation
+    // an interval is divided by the number of tokens emitted in the step.
     let mut tpot: Vec<f64> = emitted
         .iter()
         .filter(|&(_, &count)| count > 1)
@@ -489,10 +489,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Промпты из корпуса: те же строки, что читает `bench/servebench.py` для
-/// vLLM, поэтому оба движка видят один и тот же текст. Парсер намеренно
-/// примитивный — формат пишет `bench/make_corpus.py`, одна запись в строке и
-/// `prompt_token_ids` массивом целых.
+/// Prompts from the corpus: the same lines `bench/servebench.py` reads for
+/// vLLM, so both engines see the same text. The parser is intentionally
+/// primitive — the format is written by `bench/make_corpus.py`, one record per line and
+/// `prompt_token_ids` as an array of integers.
 fn corpus_prompts(
     path: &std::path::Path,
     requests: usize,
@@ -510,14 +510,14 @@ fn corpus_prompts(
             .and_then(|at| line[at..].find('[').map(|b| at + b + 1))
             .ok_or_else(|| {
                 format!(
-                    "{}: строка {} без prompt_token_ids",
+                    "{}: line {} without prompt_token_ids",
                     path.display(),
                     index + 1
                 )
             })?;
         let end = line[start..].find(']').ok_or_else(|| {
             format!(
-                "{}: строка {} с незакрытым массивом",
+                "{}: line {} with an unclosed array",
                 path.display(),
                 index + 1
             )
@@ -528,7 +528,7 @@ fn corpus_prompts(
             .collect::<Result<_, _>>()?;
         if ids.len() < prompt_tokens {
             return Err(format!(
-                "{}: промпт {} даёт {} токенов, а нужно {prompt_tokens}",
+                "{}: prompt {} gives {} tokens, but {prompt_tokens} are needed",
                 path.display(),
                 index + 1,
                 ids.len()
@@ -539,7 +539,7 @@ fn corpus_prompts(
     }
     if prompts.len() < requests {
         return Err(format!(
-            "{}: {} промптов, а запрошено {requests}",
+            "{}: {} prompts, but {requests} requested",
             path.display(),
             prompts.len()
         )
@@ -572,7 +572,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     let mut prompt_tokens = 256usize;
     let mut max_new = 128usize;
     let mut context = 2048usize;
-    // Бюджет токенов на шаг; потолок — ёмкость арены префилла.
+    // Token budget per step; the cap is the prefill arena capacity.
     let mut prefill_chunk = PREFILL_CHUNK_SIZE;
     let mut speculative = 0usize;
     let mut memory_limit = 28_000_000_000usize;
@@ -581,11 +581,11 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
     let mut kv_cache_bytes = 5_000_000_000usize;
     let mut kv_cache = KvCacheDtype::Fp8;
     let mut corpus: Option<PathBuf> = None;
-    // 0 — полная проекция в словарь; иначе столько первых строк словаря
-    // держатся в шортлисте всегда, сверх токенов контекста.
+    // 0 — full vocab projection; otherwise this many first vocab rows
+    // are always kept in the shortlist, on top of context tokens.
     let mut shortlist = 0usize;
-    // Как у `serve`: стенд должен мерить тот же прогрев, что работает в
-    // сервере, иначе на длинных промптах он показывает не ту цену TTFT.
+    // As in `serve`: the bench must measure the same priming that runs in
+    // the server, otherwise on long prompts it shows the wrong TTFT cost.
     let mut mtp_prime = 2048usize;
     let mut delta_state = DeltaStateMode::Wy;
     let mut args = std::env::args().skip(1);
@@ -596,7 +596,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--shortlist" => {
                 shortlist = args.next().ok_or("--shortlist")?.parse()?;
                 if shortlist > VOCAB_SIZE {
-                    return Err("--shortlist не может быть больше словаря".into());
+                    return Err("--shortlist can't be larger than the vocab".into());
                 }
             }
             "--mtp-prime" => {
@@ -622,7 +622,7 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
                     "fp32" => DeltaStateMode::Fp32,
                     "wy" => DeltaStateMode::Wy,
                     other => {
-                        return Err(format!("неизвестное значение --delta-state: {other}").into());
+                        return Err(format!("unknown --delta-state value: {other}").into());
                     }
                 };
             }
@@ -640,12 +640,12 @@ fn parse() -> Result<Args, Box<dyn std::error::Error>> {
             "--speculative" => {
                 speculative = args.next().ok_or("--speculative")?.parse()?;
                 if speculative > 7 {
-                    return Err("--speculative поддерживает глубину 0..7".into());
+                    return Err("--speculative supports depth 0..7".into());
                 }
             }
             "--kv-cache-gb" => {
                 let gb: f64 = args.next().ok_or("--kv-cache-gb")?.parse()?;
-                // 0 — отдать под KV весь остаток `--memory-limit-gb`.
+                // 0 — give the whole rest of `--memory-limit-gb` to KV.
                 if !gb.is_finite() || gb < 0.0 {
                     return Err("--kv-cache-gb must not be negative".into());
                 }

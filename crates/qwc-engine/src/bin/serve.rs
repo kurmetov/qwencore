@@ -40,6 +40,8 @@ struct AppState {
     tokenizer: Arc<Tokenizer>,
     model: Arc<str>,
     max_context: usize,
+    /// Whether to reason if the request itself didn't set enable_thinking (--thinking).
+    thinking: bool,
 }
 
 struct Args {
@@ -55,17 +57,18 @@ struct Args {
     delta_state: DeltaStateMode,
     prefix_snapshots: usize,
     speculation: SpeculationConfig,
+    thinking: bool,
 }
 
-/// Спекуляция MTP-головой. Работает, когда decode идёт у одной
-/// последовательности: голова держит KV только одного диалога.
+/// Speculation with the MTP head. Works when decode is running for a single
+/// sequence: the head holds the KV of only one dialog.
 #[derive(Clone, Copy)]
 struct SpeculationConfig {
-    /// Глубина черновика; 0 — спекуляция выключена.
+    /// Draft depth; 0 — speculation off.
     depth: usize,
-    /// Шортлист словаря для черновых логитов; 0 — полная проекция.
+    /// Vocab shortlist for draft logits; 0 — full projection.
     shortlist: usize,
-    /// Сколько последних токенов промпта голова прогоняет на префилле.
+    /// How many last prompt tokens the head runs during prefill.
     prime_window: usize,
 }
 
@@ -90,16 +93,16 @@ enum Command {
 struct GenerateJob {
     id: u32,
     prompt: Vec<u32>,
-    /// Длина истории диалога: всё до промпта генерации. На этой границе
-    /// снимается кэш префиксов — следующий ход повторит историю дословно.
+    /// Length of the dialog history: everything before the generation prompt. The prefix cache
+    /// is captured at this boundary — the next turn will repeat the history verbatim.
     history_tokens: usize,
     max_new_tokens: usize,
     stop: Vec<String>,
     buffer_output: bool,
-    /// Сколько лучших токенов отдавать с логвероятностями на каждом шаге.
+    /// How many top tokens to return with log-probabilities at each step.
     logprobs: Option<usize>,
-    /// Не останавливаться на EOS: сверка с `eval` идёт ровно `max_tokens`
-    /// шагов.
+    /// Don't stop at EOS: matching against `eval` runs exactly `max_tokens`
+    /// steps.
     ignore_eos: bool,
     event_tx: async_mpsc::UnboundedSender<EngineEvent>,
 }
@@ -111,14 +114,16 @@ enum EngineEvent {
         finish_reason: &'static str,
         completion_tokens: usize,
         buffered_output: bool,
+        /// Bytes of `text` already sent as deltas before the first `<tool_call>`.
+        streamed: usize,
         tokens: Vec<u32>,
         scores: Vec<StepScores>,
     },
     Error(String),
 }
 
-/// Логвероятности одного выданного токена: его собственная и лучших
-/// `top_k`, как их считает `eval`.
+/// Log-probabilities of one emitted token: its own and those of the top
+/// `top_k`, the way `eval` computes them.
 struct StepScores {
     chosen: f32,
     top: Vec<(u32, f32)>,
@@ -130,11 +135,13 @@ struct ActiveJob {
     rendered: String,
     stop: Vec<String>,
     buffer_output: bool,
+    /// How many bytes of `rendered` went out as deltas with `buffer_output`.
+    streamed: usize,
     logprobs: Option<usize>,
     ignore_eos: bool,
     scores: Vec<StepScores>,
-    /// Оценки токена, который выдаст следующий `emit_token`. Логиты есть в
-    /// момент выборки, а выдача идёт шагом позже.
+    /// Scores of the token the next `emit_token` will emit. Logits exist at
+    /// sampling time, while emission happens a step later.
     next_scores: Option<StepScores>,
     event_tx: async_mpsc::UnboundedSender<EngineEvent>,
 }
@@ -159,6 +166,9 @@ struct ChatRequest {
     stop: Option<Stop>,
     #[serde(default)]
     enable_thinking: Option<bool>,
+    /// This is how reasoning is turned off in vLLM: `{"enable_thinking": false}`.
+    #[serde(default)]
+    chat_template_kwargs: Option<Value>,
     #[serde(default)]
     reasoning_effort: Option<String>,
 }
@@ -170,6 +180,9 @@ struct ChatMessage {
     content: Value,
     #[serde(default)]
     tool_calls: Option<Vec<Value>>,
+    /// The previous turn's reasoning, separate from the answer, as vLLM returns it.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,9 +192,9 @@ enum Stop {
     Many(Vec<String>),
 }
 
-/// Старый OpenAI `/v1/completions`: промпт идёт мимо chat template, текстом
-/// или готовыми id токенов. Нужен сверке с `eval`, которой нужны логиты
-/// сервера на тех же токенах.
+/// The old OpenAI `/v1/completions`: the prompt bypasses the chat template, as text
+/// or ready token ids. Needed for matching against `eval`, which needs the server's
+/// logits on the same tokens.
 #[derive(Debug, Deserialize)]
 struct CompletionRequest {
     #[serde(default)]
@@ -198,11 +211,11 @@ struct CompletionRequest {
     stop: Option<Stop>,
     #[serde(default)]
     logprobs: Option<usize>,
-    /// Расширение vLLM: генерировать ровно `max_tokens`, не глядя на EOS.
+    /// vLLM extension: generate exactly `max_tokens`, ignoring EOS.
     #[serde(default)]
     ignore_eos: bool,
-    /// Расширение vLLM: токены в `logprobs` как `token_id:N`, чтобы клиенту
-    /// не восстанавливать id по тексту.
+    /// vLLM extension: tokens in `logprobs` as `token_id:N`, so the client
+    /// doesn't have to recover ids from text.
     #[serde(default)]
     return_tokens_as_token_ids: bool,
 }
@@ -214,8 +227,8 @@ enum CompletionPrompt {
     Tokens(Vec<u32>),
 }
 
-/// Столько лучших токенов отдаёт vLLM по умолчанию; больше клиенту сверки не
-/// нужно.
+/// vLLM returns this many top tokens by default; a matching client doesn't
+/// need more.
 const MAX_LOGPROBS: usize = 20;
 
 #[derive(Serialize)]
@@ -312,6 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokenizer,
         model: Arc::from(args.model_name.as_str()),
         max_context: args.max_context,
+        thinking: args.thinking,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -345,14 +359,15 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
         "data": [{
             "id": state.model.as_ref(),
             "object": "model",
-            "owned_by": "local"
+            "owned_by": "local",
+            "thinking": state.thinking
         }]
     }))
 }
 
 async fn chat_completions(
     State(state): State<AppState>,
-    Json(request): Json<ChatRequest>,
+    Json(mut request): Json<ChatRequest>,
 ) -> Result<Response, ApiError> {
     if request.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
@@ -363,6 +378,16 @@ async fn chat_completions(
         }
     }
 
+    // The client didn't say whether to reason — the server's launch mode decides.
+    if request.enable_thinking.is_none()
+        && request
+            .chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.get("enable_thinking"))
+            .is_none()
+    {
+        request.enable_thinking = Some(state.thinking);
+    }
     let prompt_text = render_chat(&request)?;
     let encoding = state
         .tokenizer
@@ -440,8 +465,9 @@ async fn chat_completions(
             Event::default().data(first.to_string()),
         )]);
         let stream_id = request_id.clone();
+        let tools = request.tools.clone().unwrap_or_default();
         let event_stream = UnboundedReceiverStream::new(event_rx).flat_map(move |event| {
-            let events = stream_events(&stream_id, created, model.as_ref(), event);
+            let events = stream_events(&stream_id, created, model.as_ref(), &tools, event);
             tokio_stream::iter(
                 events
                     .into_iter()
@@ -463,7 +489,7 @@ async fn chat_completions(
                 completion_tokens,
                 ..
             } => {
-                let assistant = parse_assistant(&text);
+                let assistant = parse_assistant(&text, request.tools.as_deref().unwrap_or(&[]));
                 let finish_reason = if assistant.tool_calls.is_empty() {
                     finish_reason
                 } else {
@@ -497,9 +523,9 @@ async fn chat_completions(
     Err(ApiError::unavailable("engine closed the response channel"))
 }
 
-/// Промпт генерации начинается последним `<|im_start|>`: ход модели в
-/// историю следующего запроса попадёт уже без `<think>` и с ответом. На этой
-/// границе снимается кэш префиксов.
+/// The generation prompt starts at the last `<|im_start|>`: the model's turn
+/// will enter the next request's history already without `<think>` and with the answer. The prefix cache
+/// is captured at this boundary.
 fn history_boundary(tokenizer: &Tokenizer, prompt: &[u32]) -> usize {
     tokenizer
         .token_to_id("<|im_start|>")
@@ -625,7 +651,7 @@ async fn completions(
     Err(ApiError::unavailable("engine closed the response channel"))
 }
 
-/// `logprobs` старого формата: токены, их логвероятности и словари лучших.
+/// Old-format `logprobs`: tokens, their log-probabilities and top dictionaries.
 fn completion_logprobs(
     tokenizer: &Tokenizer,
     tokens: &[u32],
@@ -657,7 +683,13 @@ fn completion_logprobs(
     })
 }
 
-fn stream_events(id: &str, created: u64, model: &str, event: EngineEvent) -> Vec<Event> {
+fn stream_events(
+    id: &str,
+    created: u64,
+    model: &str,
+    tools: &[Value],
+    event: EngineEvent,
+) -> Vec<Event> {
     match event {
         EngineEvent::Delta(delta) => {
             vec![Event::default().data(
@@ -675,9 +707,11 @@ fn stream_events(id: &str, created: u64, model: &str, event: EngineEvent) -> Vec
             text,
             finish_reason,
             buffered_output,
+            streamed,
             ..
         } => {
-            let assistant = parse_assistant(&text);
+            // What went out as deltas is a prefix without calls; send the rest.
+            let assistant = parse_assistant(&text[streamed.min(text.len())..], tools);
             let finish_reason = if assistant.tool_calls.is_empty() {
                 finish_reason
             } else {
@@ -690,7 +724,18 @@ fn stream_events(id: &str, created: u64, model: &str, event: EngineEvent) -> Vec
                     delta.insert("content".into(), Value::String(content));
                 }
                 if !assistant.tool_calls.is_empty() {
-                    delta.insert("tool_calls".into(), Value::Array(assistant.tool_calls));
+                    // In a stream OpenAI merges call deltas by index;
+                    // without it openai clients don't assemble the call.
+                    let calls = assistant
+                        .tool_calls
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, mut call)| {
+                            call["index"] = json!(index);
+                            call
+                        })
+                        .collect();
+                    delta.insert("tool_calls".into(), Value::Array(calls));
                 }
                 if !delta.is_empty() {
                     events.push(
@@ -752,9 +797,9 @@ fn run_worker(
     };
     let mut jobs = HashMap::<u32, ActiveJob>::new();
     let mut pending = HashMap::<u32, u32>::new();
-    // Для какой последовательности у спекулятора лежат настоящие скрытые
-    // состояния и для каких токенов: после обычного шага это один ожидающий
-    // токен, после проверки — все принятые плюс исправленный.
+    // For which sequence the speculator holds real hidden
+    // states and for which tokens: after a regular step it's one pending
+    // token, after verification — all accepted plus the corrected one.
     let mut hidden_for: Option<u32> = None;
     let mut head_tokens: Vec<u32> = Vec::new();
 
@@ -788,9 +833,9 @@ fn run_worker(
                 return;
             }
         };
-        // Одна decode-последовательность и свежие скрытые состояния — шаг
-        // идёт спекулятивно: черновик головы, проверка k+1 строк за один
-        // проход по весам.
+        // One decode sequence and fresh hidden states — the step
+        // goes speculatively: a head draft, verification of k+1 rows in one
+        // pass over the weights.
         let depth = match (speculator.as_ref(), batch.decode.as_slice()) {
             (Some(_), &[id]) if batch.prefill.is_empty() && hidden_for == Some(id) => {
                 let remaining = scheduler.remaining_tokens(id).unwrap_or(0);
@@ -801,8 +846,8 @@ fn run_worker(
         if let (Some(spec), true) = (speculator.as_mut(), depth > 0) {
             let id = batch.decode[0];
             let token = pending[&id];
-            // Голова могла обслуживать другой диалог: без привязки черновик
-            // шёл бы по чужому KV и чужому шортлисту.
+            // The head may have been serving another dialog: without binding the draft
+            // would run on someone else's KV and shortlist.
             let bound = match jobs.get(&id) {
                 Some(job) => spec.bind_prompt(id, &job.prompt).map(|_| ()),
                 None => Ok(()),
@@ -831,8 +876,8 @@ fn run_worker(
                 }
             };
 
-            // Логиты строк проверки ещё лежат у исполнителя: фиксация их не
-            // трогает.
+            // Logits of the verification rows are still with the executor: the commit doesn't
+            // touch them.
             let mut verified = match jobs.get(&id).and_then(|job| job.logprobs) {
                 Some(top_k) => {
                     let rows: Result<Vec<_>, String> = (0..=accepted)
@@ -849,8 +894,8 @@ fn run_worker(
                 None => Vec::new(),
             };
 
-            // Шаг выдал ожидающий токен и принятые черновики; на первом
-            // стоп-токене или стоп-строке выдача обрывается.
+            // The step emitted the pending token and the accepted drafts; at the first
+            // stop token or stop string emission stops.
             let mut produced = 0;
             let mut emitted_index = 0;
             let mut stopped = Vec::new();
@@ -858,8 +903,8 @@ fn run_worker(
                 produced += 1;
                 let stop = match jobs.get_mut(&id) {
                     Some(job) => {
-                        // Первый токен ждал с прошлого шага, его оценки уже
-                        // лежат в задаче; строка i проверки дала truth[i].
+                        // The first token was waiting from the previous step, its scores are already
+                        // in the task; verification row i gave truth[i].
                         if emitted_index > 0
                             && let Some(scores) = verified.get_mut(emitted_index - 1)
                         {
@@ -986,7 +1031,7 @@ fn run_worker(
                 job.next_scores = Some(scores);
             }
         }
-        // Вход головы — скрытое состояние только что сделанного шага.
+        // The head's input is the hidden state of the step just taken.
         hidden_for = None;
         if let (Some(spec), &[id]) = (speculator.as_mut(), batch.decode.as_slice())
             && batch.prefill.is_empty()
@@ -1028,9 +1073,9 @@ fn run_worker(
     }
 }
 
-/// Логвероятности строки `row` последнего шага так же, как их считает
-/// `eval`. `chosen` выбрал argmax на карте: если его логит не максимален,
-/// строка не та, и молча отдавать чужие числа нельзя.
+/// Log-probabilities of row `row` of the last step, computed the same way
+/// `eval` does. `chosen` was picked by argmax on the card: if its logit isn't the max,
+/// it's the wrong row, and silently returning someone else's numbers is not allowed.
 fn score_row(
     executor: &Executor,
     row: usize,
@@ -1070,7 +1115,7 @@ fn score_row(
     })
 }
 
-/// Оценки всех строк обычного шага, чьи задачи просили `logprobs`.
+/// Scores of all rows of a regular step whose tasks asked for `logprobs`.
 fn score_sampled(
     executor: &Executor,
     jobs: &HashMap<u32, ActiveJob>,
@@ -1102,6 +1147,7 @@ fn finish_job(
             finish_reason,
             completion_tokens: job.output.len(),
             buffered_output: job.buffer_output,
+            streamed: job.streamed,
             tokens: job.output,
             scores: job.scores,
         });
@@ -1109,10 +1155,10 @@ fn finish_job(
     pending.remove(&completion.id);
 }
 
-/// Спекулятивный шаг одной последовательности: черновик головы, проверка
-/// основной моделью, фиксация принятого. Возвращает argmax проверки по
-/// строкам и число принятых черновиков; `truth[accepted]` — следующий
-/// ожидающий токен.
+/// A speculative step of one sequence: a head draft, verification by
+/// the main model, commit of what was accepted. Returns the verification argmax per
+/// row and the number of accepted drafts; `truth[accepted]` is the next
+/// pending token.
 #[allow(clippy::too_many_arguments)]
 fn speculative_step(
     executor: &mut Executor,
@@ -1131,8 +1177,8 @@ fn speculative_step(
     let drafts = spec
         .draft_chain(weights, head_tokens, first, depth)
         .map_err(|error| error.to_string())?;
-    // Проверка пишет KV всем строкам разом, страницы нужны заранее. Не дал
-    // пул — черновик короче.
+    // Verification writes KV for all rows at once, pages are needed in advance. If the pool
+    // didn't give them, the draft is shorter.
     let reserved = scheduler.reserve_extra(id, drafts.len());
     let drafts = &drafts[..reserved];
     let blocks = scheduler
@@ -1165,10 +1211,10 @@ fn speculative_step(
     Ok((truth, accepted))
 }
 
-/// Голова заполняет свой KV по промпту, пока тот идёт префиллом: без этого
-/// на промпте у неё нули и acceptance проседает с 0.92 до 0.88. Только когда
-/// в движке одна последовательность: иначе спекуляции не будет, а прогрев
-/// стоит ~80 мкс на токен.
+/// The head fills its KV from the prompt while it goes through prefill: without this
+/// it has zeros on the prompt and acceptance drops from 0.92 to 0.88. Only when
+/// the engine has one sequence: otherwise there will be no speculation, and priming
+/// costs ~80 µs per token.
 #[allow(clippy::too_many_arguments)]
 fn prime_head(
     spec: &mut Speculator,
@@ -1201,8 +1247,8 @@ fn prime_head(
     if begin >= end {
         return Ok(());
     }
-    // Пара строки t — (h_t, токен t+1); для последней позиции промпта это
-    // токен, который шаг только что выдал.
+    // The pair for row t is (h_t, token t+1); for the last prompt position that's
+    // the token the step has just emitted.
     let generated = sampled
         .iter()
         .find(|&&(id, _)| id == chunk.id)
@@ -1217,8 +1263,8 @@ fn prime_head(
     spec.prime(weights, executor, row_begin + begin - chunk.offset, &next, begin + 1)
 }
 
-/// Кэш префиксов перед шагом: скопировать неполные страницы продолжаемых
-/// префиксов и сказать исполнителю, какие слоты поднять и какие снять.
+/// Prefix cache before a step: copy incomplete pages of continued
+/// prefixes and tell the executor which slots to restore and which to capture.
 fn apply_prefix_ops(executor: &mut Executor, batch: &Batch) -> qwc_cuda::Result<()> {
     for op in &batch.restores {
         if let Some((from, to)) = op.copy_block {
@@ -1311,6 +1357,7 @@ fn accept_command(command: Command, scheduler: &mut Scheduler, jobs: &mut HashMa
             rendered: String::new(),
             stop: job.stop,
             buffer_output: job.buffer_output,
+            streamed: 0,
             logprobs: job.logprobs,
             ignore_eos: job.ignore_eos,
             scores: Vec::new(),
@@ -1346,7 +1393,32 @@ fn emit_token(job: &mut ActiveJob, token: u32, tokenizer: &Tokenizer) -> bool {
         }
         job.rendered.push_str(delta);
     }
+    // With tools the text before the call is still streamed: reasoning and answer
+    // are visible right away, only the call's XML is buffered.
+    if job.buffer_output {
+        let safe = before_tool_call(&job.rendered);
+        if safe > job.streamed {
+            let delta = job.rendered[job.streamed..safe].to_owned();
+            if job.event_tx.send(EngineEvent::Delta(delta)).is_err() {
+                return true;
+            }
+            job.streamed = safe;
+        }
+    }
     stop_at.is_some()
+}
+
+/// Length of the prefix that definitely contains no start of `<tool_call>`: up to the tag itself
+/// or without a tail that might turn out to be its start.
+fn before_tool_call(text: &str) -> usize {
+    const TAG: &str = "<tool_call>";
+    if let Some(index) = text.find(TAG) {
+        return index;
+    }
+    (1..TAG.len())
+        .rev()
+        .find(|&length| text.ends_with(&TAG[..length]))
+        .map_or(text.len(), |length| text.len() - length)
 }
 
 fn finish_text(job: &mut ActiveJob, tokenizer: &Tokenizer) {
@@ -1376,7 +1448,7 @@ struct ParsedAssistant {
 
 /// Converts the checkpoint's documented XML function-call format into the
 /// OpenAI `tool_calls` shape consumed by agent harnesses.
-fn parse_assistant(text: &str) -> ParsedAssistant {
+fn parse_assistant(text: &str, tools: &[Value]) -> ParsedAssistant {
     let mut content = String::new();
     let mut tool_calls = Vec::new();
     let mut rest = text;
@@ -1389,7 +1461,7 @@ fn parse_assistant(text: &str) -> ParsedAssistant {
             break;
         };
         let call = &body[..end];
-        if let Some((name, arguments)) = parse_xml_function(call) {
+        if let Some((name, arguments)) = parse_xml_function(call, tools) {
             let index = tool_calls.len();
             tool_calls.push(json!({
                 "id": format!("call_qwc_{index}"),
@@ -1413,7 +1485,10 @@ fn parse_assistant(text: &str) -> ParsedAssistant {
     }
 }
 
-fn parse_xml_function(call: &str) -> Option<(String, serde_json::Map<String, Value>)> {
+fn parse_xml_function(
+    call: &str,
+    tools: &[Value],
+) -> Option<(String, serde_json::Map<String, Value>)> {
     let marker = "<function=";
     let begin = call.find(marker)? + marker.len();
     let name_end = call[begin..].find('>')? + begin;
@@ -1422,6 +1497,11 @@ fn parse_xml_function(call: &str) -> Option<(String, serde_json::Map<String, Val
         return None;
     }
     let function_end = call[name_end + 1..].find("</function>")? + name_end + 1;
+    let properties = tools
+        .iter()
+        .map(|tool| tool.get("function").unwrap_or(tool))
+        .find(|function| function.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|function| function.pointer("/parameters/properties"));
     let mut arguments = serde_json::Map::new();
     let mut body = &call[name_end + 1..function_end];
     while let Some(parameter) = body.find("<parameter=") {
@@ -1431,16 +1511,124 @@ fn parse_xml_function(call: &str) -> Option<(String, serde_json::Map<String, Val
         body = &body[key_end + 1..];
         let value_end = body.find("</parameter>")?;
         let raw = body[..value_end].trim();
-        let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+        let value = match properties.and_then(|properties| properties.get(key)) {
+            Some(schema) => coerce_to_schema(raw, &schema_types(schema)),
+            None => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())),
+        };
         arguments.insert(key.to_owned(), value);
         body = &body[value_end + "</parameter>".len()..];
     }
     Some((name.to_owned(), arguments))
 }
 
+/// Parameter types from a JSON Schema: `type`, `enum` value types, the
+/// `anyOf`/`oneOf`/`allOf` branches. Like vLLM's `extract_types_from_schema`.
+fn schema_types(schema: &Value) -> Vec<String> {
+    let mut types = Vec::new();
+    let mut add = |name: &str| {
+        if !types.iter().any(|known| known == name) {
+            types.push(name.to_owned());
+        }
+    };
+    match schema.get("type") {
+        Some(Value::String(name)) => add(name),
+        Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).for_each(&mut add),
+        _ => {}
+    }
+    for value in schema.get("enum").and_then(Value::as_array).into_iter().flatten() {
+        add(match value {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(number) if number.is_f64() => "number",
+            Value::Number(_) => "integer",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        });
+    }
+    for field in ["anyOf", "oneOf", "allOf"] {
+        for choice in schema.get(field).and_then(Value::as_array).into_iter().flatten() {
+            for name in schema_types(choice) {
+                add(&name);
+            }
+        }
+    }
+    if types.is_empty() {
+        types.push("string".to_owned());
+    }
+    types
+}
+
+/// A parameter value from the call's XML by the schema type. The model writes `True`,
+/// `500 000`-like things and bare strings; JSON parsing without a schema turned
+/// `True` into a string and the string "123" into a number. The order of attempts is as in
+/// `coerce_to_schema_type` vLLM: null, integer, number, boolean,
+/// object/array, string.
+fn coerce_to_schema(raw: &str, types: &[String]) -> Value {
+    let has = |name: &str| {
+        types.iter().any(|known| {
+            let known = known.trim().to_lowercase();
+            known == name
+                || matches!(
+                    (known.as_str(), name),
+                    ("int" | "int32" | "int64" | "long", "integer")
+                        | ("float" | "double", "number")
+                        | ("bool", "boolean")
+                        | ("str" | "text", "string")
+                        | ("dict", "object")
+                        | ("list", "array")
+                )
+        })
+    };
+    if has("null") && raw.eq_ignore_ascii_case("null") {
+        return Value::Null;
+    }
+    if has("integer") {
+        if let Ok(number) = raw.parse::<i64>() {
+            return Value::from(number);
+        }
+    }
+    if has("number") {
+        if let Ok(number) = raw.parse::<f64>() {
+            if number.is_finite() {
+                return if number.fract() == 0.0 && number.abs() < 9.0e15 {
+                    Value::from(number as i64)
+                } else {
+                    Value::from(number)
+                };
+            }
+        }
+    }
+    if has("boolean") {
+        match raw.trim().to_lowercase().as_str() {
+            "true" | "1" => return Value::Bool(true),
+            "false" | "0" => return Value::Bool(false),
+            _ => {}
+        }
+    }
+    if has("object") || has("array") {
+        if let Ok(value) = serde_json::from_str::<Value>(raw) {
+            return value;
+        }
+    }
+    if has("string") {
+        return Value::String(raw.to_owned());
+    }
+    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+}
+
 fn render_chat(request: &ChatRequest) -> Result<String, ApiError> {
     let mut output = String::new();
-    let thinking = request.enable_thinking.unwrap_or(true);
+    let thinking = request
+        .enable_thinking
+        .or_else(|| {
+            request
+                .chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.get("enable_thinking"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true);
     let reasoning = match request.reasoning_effort.as_deref().unwrap_or("xhigh") {
         "high" | "xhigh" => Some(
             "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
@@ -1472,9 +1660,11 @@ fn render_chat(request: &ChatRequest) -> Result<String, ApiError> {
         output.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
         for tool in request.tools.as_ref().unwrap() {
             output.push('\n');
-            output.push_str(&tool.to_string());
+            write_tojson(&mut output, tool);
         }
-        output.push_str("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nFunction calls MUST use the XML format above. Required parameters MUST be specified. You may reason before a function call, but put nothing after it.\n</IMPORTANT>");
+        // Verbatim from the checkpoint's chat_template.jinja: the model was trained
+        // to call tools on this text, paraphrasing it made the calls worse.
+        output.push_str("\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>");
         if request
             .messages
             .first()
@@ -1492,6 +1682,7 @@ fn render_chat(request: &ChatRequest) -> Result<String, ApiError> {
         .messages
         .first()
         .is_some_and(|message| message.role == "system")
+        && !message_text(&request.messages[0].content)?.trim().is_empty()
     {
         output.push_str("<|im_start|>system\n");
         if thinking {
@@ -1511,6 +1702,15 @@ fn render_chat(request: &ChatRequest) -> Result<String, ApiError> {
         }
     }
 
+    // The template skips an empty system without tools entirely.
+    if first_message == 0
+        && request
+            .messages
+            .first()
+            .is_some_and(|message| message.role == "system")
+    {
+        first_message = 1;
+    }
     let mut in_tool_response = false;
     for message in &request.messages[first_message..] {
         let content = message_text(&message.content)?;
@@ -1530,10 +1730,19 @@ fn render_chat(request: &ChatRequest) -> Result<String, ApiError> {
                     output.push_str("<|im_end|>\n");
                     in_tool_response = false;
                 }
-                output.push_str("<|im_start|>assistant\n");
+                // preserve_thinking isn't set in the template, so a <think> block
+                // is present in every assistant turn, even an empty one.
+                output.push_str("<|im_start|>assistant\n<think>\n");
+                output.push_str(message.reasoning_content.as_deref().unwrap_or("").trim());
+                output.push_str("\n</think>\n\n");
                 output.push_str(content.trim());
                 if let Some(tool_calls) = &message.tool_calls {
-                    for call in tool_calls {
+                    for (index, call) in tool_calls.iter().enumerate() {
+                        output.push_str(match (index, content.trim().is_empty()) {
+                            (0, true) => "",
+                            (0, false) => "\n\n",
+                            _ => "\n",
+                        });
                         render_tool_call(&mut output, call)?;
                     }
                 }
@@ -1593,7 +1802,7 @@ fn render_tool_call(output: &mut String, call: &Value) -> Result<(), ApiError> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("tool call has no function name"))?;
-    output.push_str("\n<tool_call>\n<function=");
+    output.push_str("<tool_call>\n<function=");
     output.push_str(name);
     output.push_str(">\n");
     let arguments = function.get("arguments").cloned().unwrap_or(Value::Null);
@@ -1610,13 +1819,44 @@ fn render_tool_call(output: &mut String, call: &Value) -> Result<(), ApiError> {
             if let Some(value) = value.as_str() {
                 output.push_str(value);
             } else {
-                output.push_str(&value.to_string());
+                write_tojson(output, &value);
             }
             output.push_str("\n</parameter>\n");
         }
     }
     output.push_str("</function>\n</tool_call>");
     Ok(())
+}
+
+/// `tojson` from the template, i.e. Python `json.dumps(ensure_ascii=False)`:
+/// separators ", " and ": ", keys in original order (serde_json is built with
+/// preserve_order). The compact `to_string` gave the model a different schema text.
+fn write_tojson(output: &mut String, value: &Value) {
+    match value {
+        Value::Array(items) => {
+            output.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                write_tojson(output, item);
+            }
+            output.push(']');
+        }
+        Value::Object(map) => {
+            output.push('{');
+            for (index, (key, item)) in map.iter().enumerate() {
+                if index > 0 {
+                    output.push_str(", ");
+                }
+                output.push_str(&Value::String(key.clone()).to_string());
+                output.push_str(": ");
+                write_tojson(output, item);
+            }
+            output.push('}');
+        }
+        scalar => output.push_str(&scalar.to_string()),
+    }
 }
 
 fn load_eos_ids(model_path: &Path) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
@@ -1647,27 +1887,36 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut bind = "127.0.0.1:8000".parse()?;
     let mut max_context = 32 * 1024usize;
     let mut max_seqs = 32usize;
-    // Бюджет токенов на шаг. Больше — быстрее префилл, но decode-строки ждут
-    // весь чанк: на 4096-токенных промптах 512 -> 2048 дало +22% префилла и
-    // ITL p50 66 -> 205 мс. Потолок — ёмкость арены.
+    // Token budget per step. More is faster prefill, but decode rows wait for
+    // the whole chunk: on 4096-token prompts 512 -> 2048 gave +22% prefill and
+    // ITL p50 66 -> 205 ms. The cap is the arena capacity.
     let mut prefill_chunk = PREFILL_CHUNK_SIZE;
     let mut memory_limit = 28_000_000_000usize;
     let mut kv_cache_bytes = 5_000_000_000usize;
     let mut kv_cache_dtype = KvCacheDtype::Fp8;
     let mut delta_state = DeltaStateMode::Wy;
-    // Снимков состояния под кэш префиксов, ~81 МБ каждый. Восемь — это
-    // восемь диалогов, чей следующий ход не пересчитывает историю.
+    // State snapshots for the prefix cache, ~81 MB each. Eight means
+    // eight dialogs whose next turn doesn't recompute the history.
     let mut prefix_snapshots = 8usize;
-    // Лучшая точка замера batch-1: глубина 3 и шортлист 32k (156.7 tok/s
-    // против 78 без спекуляции). Голова стоит 0.85 ГБ VRAM.
+    // The best batch-1 measured point: depth 3 and a 32k shortlist (156.7 tok/s
+    // vs 78 without speculation). The head costs 0.85 GB of VRAM.
     let mut speculation = SpeculationConfig {
         depth: 3,
         shortlist: 32768,
         prime_window: 2048,
     };
+    // Reasons by default, as before; --thinking off answers right away.
+    let mut thinking = true;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--thinking" => {
+                thinking = match args.next().ok_or("--thinking needs on|off")?.as_str() {
+                    "on" | "true" => true,
+                    "off" | "false" => false,
+                    other => return Err(format!("--thinking: {other}, expected on|off").into()),
+                }
+            }
             "--model" => model_path = PathBuf::from(args.next().ok_or("--model needs a path")?),
             "--served-model-name" => model_name = Some(args.next().ok_or("--served-model-name")?),
             "--bind" => bind = args.next().ok_or("--bind")?.parse()?,
@@ -1717,7 +1966,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
 [--context 32768] [--max-seqs 32] [--kv-cache fp8|bf16] [--kv-cache-gb 5] \
 [--memory-limit-gb 28] [--prefill-chunk N] [--delta-state wy|bf16|fp32] \
 [--served-model-name NAME] [--prefix-cache 8] [--speculative 3] \
-[--shortlist 32768] [--mtp-prime 2048]"
+[--shortlist 32768] [--mtp-prime 2048] [--thinking on|off]"
                 );
                 std::process::exit(0);
             }
@@ -1762,6 +2011,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         delta_state,
         prefix_snapshots,
         speculation,
+        thinking,
     })
 }
 
@@ -1777,6 +2027,7 @@ mod tests {
     fn qwen_xml_tool_call_becomes_openai_tool_call() {
         let parsed = parse_assistant(
             "checking\n<tool_call>\n<function=read_file>\n<parameter=path>\n\"/tmp/a\"\n</parameter>\n<parameter=lines>\n[1,2]\n</parameter>\n</function>\n</tool_call>",
+            &[],
         );
         assert_eq!(parsed.content.as_deref(), Some("checking"));
         assert_eq!(parsed.tool_calls.len(), 1);
@@ -1793,8 +2044,55 @@ mod tests {
     #[test]
     fn malformed_tool_call_stays_visible_content() {
         let source = "before <tool_call>broken</tool_call> after";
-        let parsed = parse_assistant(source);
+        let parsed = parse_assistant(source, &[]);
         assert!(parsed.tool_calls.is_empty());
         assert_eq!(parsed.content.as_deref(), Some(source));
+    }
+
+    #[test]
+    fn tool_arguments_follow_schema_types() {
+        // The model writes booleans Python-style; without a schema `True` went out as a string
+        // and the remote filter silently didn't work.
+        let tools = [json!({"type": "function", "function": {"name": "search", "parameters": {
+            "type": "object", "properties": {
+                "remote": {"type": "boolean"}, "salary_from": {"type": "integer"},
+                "query": {"type": "string"}, "ratio": {"type": ["number", "null"]},
+                "tags": {"type": "array"}, "level": {"enum": ["junior", "senior"]}}}}})];
+        let parsed = parse_assistant(
+            "<tool_call>\n<function=search>\n<parameter=remote>\nTrue\n</parameter>\n<parameter=salary_from>\n500000\n</parameter>\n<parameter=query>\n123\n</parameter>\n<parameter=ratio>\nnull\n</parameter>\n<parameter=tags>\n[\"a\"]\n</parameter>\n<parameter=level>\njunior\n</parameter>\n<parameter=extra>\n7\n</parameter>\n</function>\n</tool_call>",
+            &tools,
+        );
+        let arguments: Value =
+            serde_json::from_str(parsed.tool_calls[0]["function"]["arguments"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            arguments,
+            json!({"remote": true, "salary_from": 500000, "query": "123", "ratio": null,
+                   "tags": ["a"], "level": "junior", "extra": 7})
+        );
+    }
+
+    #[test]
+    fn render_chat_matches_checkpoint_template() {
+        // References are transformers.apply_chat_template over the checkpoint's
+        // chat_template.jinja, see tests/chat_template/generate.py.
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../../tests/chat_template/cases.json")).unwrap();
+        for case in cases {
+            let request: ChatRequest = serde_json::from_value(case["request"].clone()).unwrap();
+            let Ok(rendered) = render_chat(&request) else {
+                panic!("case {} rejected", case["name"]);
+            };
+            assert_eq!(rendered, case["expected"].as_str().unwrap(), "case {}", case["name"]);
+        }
+    }
+
+    #[test]
+    fn streaming_with_tools_holds_back_only_the_call() {
+        assert_eq!(before_tool_call("ответ без вызова"), "ответ без вызова".len());
+        assert_eq!(before_tool_call("ищу\n<tool_c"), "ищу\n".len());
+        assert_eq!(before_tool_call("ищу\n<"), "ищу\n".len());
+        assert_eq!(before_tool_call("ищу <tool_call>\n<function=x>"), "ищу ".len());
+        assert_eq!(before_tool_call("a < b"), "a < b".len());
     }
 }

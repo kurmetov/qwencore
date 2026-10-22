@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Acceptance rate MTP-головы, оффлайн и без всякой машинерии спекуляции.
+"""MTP head acceptance rate, offline and without any speculation machinery.
 
-Голова принимает (h_t, эмбеддинг токена t+1) и обязана предсказать токен t+2.
-Скрытые состояния и токены снимает `qwc-engine --bin mtpdump`; здесь считается
-сама голова (torch, веса как есть в чекпоинте) и сверяется её argmax с тем,
-что выдала настоящая модель.
+The head takes (h_t, embedding of token t+1) and must predict token t+2.
+Hidden states and tokens are dumped by `qwc-engine --bin mtpdump`; here the
+head itself is computed (torch, weights as-is from the checkpoint) and its argmax is compared with
+what the real model produced.
 
     python bench/mtp_acceptance.py --dumps /tmp/mtp
 
-Замер даёт верхнюю границу для acceptance: голова тут видит только принятые
-токены, то есть ровно ту историю, которую она видела бы в спекуляции.
+The measurement gives an upper bound on acceptance: the head here sees only accepted
+tokens, i.e. exactly the history it would see during speculation.
 """
 
 from __future__ import annotations
@@ -29,13 +29,13 @@ DEFAULT_MODEL = Path.home() / "models/Qwen3.8-27B-QUASAR-NVFP4"
 HEAD_DIM = 256
 NUM_Q_HEADS = 24
 NUM_KV_HEADS = 4
-ROPE_DIMS = 64          # partial RoPE: только первая четверть измерений
+ROPE_DIMS = 64          # partial RoPE: only the first quarter of dimensions
 
 
 def read_dump(path: Path):
     with open(path, "rb") as handle:
         blob = handle.read()
-    assert blob[:8] == b"QWCMTP01", f"{path}: чужой формат"
+    assert blob[:8] == b"QWCMTP01", f"{path}: unknown format"
     hidden, positions, prompt_len, token_count = struct.unpack_from("<IIII", blob, 8)
     offset = 24
     tokens = torch.frombuffer(
@@ -66,11 +66,11 @@ def load_weights(model_dir: Path, device: str):
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
-    """Gemma-вариант: масштаб (1 + weight), а не weight.
+    """Gemma variant: scale is (1 + weight), not weight.
 
-    Вся модель нормируется именно так (`rmsnorm.cu` — то же самое). Обычная
-    форма даёт на выходе головы ровный ноль совпадений: направление вектора
-    уезжает целиком.
+    The whole model normalizes this way (`rmsnorm.cu` does the same). The usual
+    form gives exactly zero matches at the head output: the vector's direction
+    drifts away entirely.
     """
     dtype = x.dtype
     x = x.float()
@@ -79,7 +79,7 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6):
 
 
 def rope(x: torch.Tensor, positions: torch.Tensor, theta: float):
-    # x: [tokens, heads, HEAD_DIM]; вращаются только первые ROPE_DIMS.
+    # x: [tokens, heads, HEAD_DIM]; only the first ROPE_DIMS are rotated.
     half = ROPE_DIMS // 2
     inv = theta ** (-torch.arange(0, half, device=x.device, dtype=torch.float32) / half)
     angles = positions.float()[:, None] * inv[None, :]
@@ -96,11 +96,11 @@ def rope(x: torch.Tensor, positions: torch.Tensor, theta: float):
 
 def mtp_forward(w: dict, hidden: torch.Tensor, next_tokens: torch.Tensor,
                 positions: torch.Tensor, theta: float):
-    """Один слой draft-головы над всей последовательностью сразу.
+    """One draft-head layer over the whole sequence at once.
 
-    Позиция t получает h_t и эмбеддинг токена t+1 — та же связка, что в
-    спекуляции; причинное внимание внутри слоя делает историю такой же, какой
-    она была бы при пошаговой работе с KV-кэшем.
+    Position t gets h_t and the embedding of token t+1 — the same pairing as in
+    speculation; causal attention within the layer makes the history the same as
+    it would be with step-by-step KV-cache operation.
     """
     embed = w["model.language_model.embed_tokens.weight"][next_tokens]
     x = torch.cat(
@@ -113,9 +113,9 @@ def mtp_forward(w: dict, hidden: torch.Tensor, next_tokens: torch.Tensor,
     residual = x
     h = rms_norm(x, w["mtp.layers.0.input_layernorm.weight"])
 
-    # q и гейт лежат чередуясь по головам: [голова][q | gate], а не двумя
-    # половинами подряд. Разрезать пополам по последней оси — классическая
-    # ловушка, дающая ровно нулевое совпадение.
+    # q and gate are interleaved per head: [head][q | gate], not two
+    # consecutive halves. Splitting in half along the last axis is a classic
+    # trap that gives exactly zero matches.
     qg = h @ w["mtp.layers.0.self_attn.q_proj.weight"].t()
     qg = qg.view(h.shape[0], NUM_Q_HEADS, 2 * HEAD_DIM)
     q, gate = qg.chunk(2, dim=-1)
@@ -158,8 +158,8 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--chain", type=int, default=3,
-                        help="глубина цепочки черновиков: второй и дальше идут "
-                             "по собственному выходу головы")
+                        help="draft chain depth: the second and later ones follow "
+                             "the head's own output")
     args = parser.parse_args()
 
     config = json.load(open(args.model / "config.json"))
@@ -171,14 +171,14 @@ def main() -> None:
     head = w.get("lm_head.weight")
     if head is None:
         head = w["model.language_model.embed_tokens.weight"]
-    print(f"веса загружены на {args.device}, rope_theta={theta:g}\n")
+    print(f"weights loaded on {args.device}, rope_theta={theta:g}\n")
 
-    print(f"{'случай':>12} {'позиций':>8} {'промпт':>8} {'генерация':>10} {'всего':>7}")
+    print(f"{'case':>12} {'positions':>8} {'prompt':>8} {'generation':>10} {'total':>7}")
     print(f"{'':->12} {'':->8} {'':->8} {'':->10} {'':->7}")
     total_hit = total = prompt_hit = prompt_total = gen_hit = gen_total = 0
-    # Цепочка: сколько раз принят k-й черновик при условии, что приняты все
-    # предыдущие. Только по сгенерированным позициям — промпт в спекуляции не
-    # участвует.
+    # Chain: how often the k-th draft is accepted given that all previous ones
+    # were accepted. Only over generated positions — the prompt doesn't take part
+    # in speculation.
     chain_hit = [0] * args.chain
     chain_total = [0] * args.chain
     for path in sorted(glob.glob(str(args.dumps / "*.bin"))):
@@ -202,9 +202,9 @@ def main() -> None:
         prompt_hit += p_hit[0]; prompt_total += p_hit[1]
         gen_hit += g_hit[0]; gen_total += g_hit[1]
 
-        # Второй и дальше черновики: голова идёт по собственному выходу, как и
-        # в настоящей спекуляции. Приближение одно — её собственные позиции не
-        # попадают в KV соседних черновиков, то есть оценка чуть занижена.
+        # Second and later drafts: the head follows its own output, as
+        # in real speculation. The one approximation — its own positions don't
+        # get into the KV of neighbouring drafts, so the estimate is slightly low.
         alive = ~in_prompt
         state, token_in, offset = out, predicted, 0
         for depth in range(args.chain):
@@ -221,11 +221,11 @@ def main() -> None:
             alive = torch.zeros_like(alive)
             alive[:limit] = mask & step_hit
 
-    print(f"\nacceptance по промптам:  {prompt_hit/max(prompt_total,1):.3f} ({prompt_total} позиций)")
-    print(f"acceptance по генерации: {gen_hit/max(gen_total,1):.3f} ({gen_total} позиций)")
-    print(f"acceptance всего:        {total_hit/max(total,1):.3f} ({total} позиций)")
+    print(f"\nacceptance on prompts:    {prompt_hit/max(prompt_total,1):.3f} ({prompt_total} positions)")
+    print(f"acceptance on generation: {gen_hit/max(gen_total,1):.3f} ({gen_total} positions)")
+    print(f"acceptance overall:       {total_hit/max(total,1):.3f} ({total} positions)")
 
-    print("\nцепочка черновиков (условная вероятность принять k-й, когда приняты предыдущие):")
+    print("\ndraft chain (conditional probability of accepting the k-th when the previous ones were accepted):")
     expected = 1.0
     survive = 1.0
     for depth in range(args.chain):
@@ -234,8 +234,8 @@ def main() -> None:
         p = chain_hit[depth] / chain_total[depth]
         survive *= p
         expected += survive
-        print(f"  k={depth+1}: p={p:.3f} ({chain_total[depth]} случаев), "
-              f"E[токенов за шаг] = {expected:.2f}")
+        print(f"  k={depth+1}: p={p:.3f} ({chain_total[depth]} cases), "
+              f"E[tokens per step] = {expected:.2f}")
 
 if __name__ == "__main__":
     main()

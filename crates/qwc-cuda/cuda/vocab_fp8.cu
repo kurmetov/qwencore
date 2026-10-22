@@ -35,8 +35,8 @@ __device__ __forceinline__ uint8_t to_fp8(float value) {
   return converted.__x;
 }
 
-// Одна колонка hidden против ROWS весов: разворачивается целиком, поэтому
-// сдвиг по байту внутри упакованного слова остаётся константой.
+// One hidden column against ROWS weights: fully unrolled, so the
+// byte shift within the packed word stays a constant.
 template <int ROWS, int COLUMNS>
 __device__ __forceinline__ void accumulate(
     const uint32_t (&packed)[ROWS],
@@ -97,7 +97,7 @@ __global__ void quantize_rows_kernel(
     for (int i = 0; i < kThreads / kWarpSize; ++i) {
       row_max = fmaxf(row_max, partial[i]);
     }
-    // Пустая строка не должна давать деления на ноль и не несёт информации.
+    // An empty row must not cause division by zero and carries no information.
     partial[0] = row_max > 0.0f ? row_max / kFp8Max : 1.0f;
     row_scales[row] = partial[0];
   }
@@ -120,8 +120,8 @@ __global__ void embedding_gather_kernel(
   const uint32_t token = token_ids[blockIdx.x];
   const size_t output_base = static_cast<size_t>(blockIdx.x) * cols;
   if (token >= static_cast<uint32_t>(vocab)) {
-    // Токен вне словаря — ошибка выше по стеку; здесь важно не читать чужую
-    // память и выдать различимый ноль.
+    // A token outside the vocab is an error further up the stack; here what matters is not reading
+    // foreign memory and producing a distinguishable zero.
     for (int column = threadIdx.x; column < cols; column += kThreads) {
       output[output_base + column] = __float2bfloat16(0.0f);
     }
@@ -194,8 +194,8 @@ __global__ void lm_head_kernel(
     if (!active) {
       continue;
     }
-    // Каждый lane берёт по четыре веса за раз: fp8 читается uint32-словами,
-    // иначе на строку приходится 5120 однобайтных обращений.
+    // Each lane takes four weights at a time: fp8 is read as uint32 words,
+    // otherwise a row takes 5120 single-byte accesses.
     for (int base = lane * 4; base < width; base += kWarpSize * 4) {
       const int remaining = width - base;
       uint32_t packed = 0;
@@ -233,21 +233,21 @@ __global__ void lm_head_kernel(
   }
 }
 
-// Батчевый проход по словарю: тайл [kRowTile строк × BATCH_TILE столбцов].
+// Batched pass over the vocab: a tile of [kRowTile rows × BATCH_TILE columns].
 //
-// Прежний кернел держит hidden-тайл в статической shared и упирается в batch 8,
-// а батчи больше перечитывают все 1.27 ГБ таблицы на каждую группу: на
-// concurrency 64 это восемь проходов и треть шага. Здесь таблица читается один
-// раз. Цена постановки hidden в shared амортизируется числом строк на блок:
-// при 128 строках она вдвое меньше самих весов, тогда как при восьми была бы
-// больше их на порядок.
+// The old kernel keeps the hidden tile in static shared and is capped at batch 8,
+// while larger batches re-read all 1.27 GB of the table for each group: at
+// concurrency 64 that's eight passes and a third of the step. Here the table is read
+// once. The cost of staging hidden in shared is amortized by the number of rows per block:
+// at 128 rows it's half the weights themselves, whereas at eight it would be
+// an order of magnitude more.
 constexpr int kRowTile = 128;
 constexpr int kBatchThreads = 16;
 constexpr int kRowThreads = kThreads / kBatchThreads;
 constexpr int kRowsPerThread = kRowTile / kRowThreads;
 constexpr int kLogitsChunk = 64;
-// Шаг тайла по batch: аккумуляторы живут в регистрах, поэтому берётся
-// наименьший подходящий тайл, а не максимальный.
+// Tile step over batch: accumulators live in registers, so the
+// smallest fitting tile is taken, not the largest.
 constexpr int kBatchTileStep = kBatchThreads;
 constexpr int kMaxBatchedLogits = 96;
 
@@ -262,7 +262,7 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_kernel(
     int batch) {
   constexpr int kBatchPerThread = BATCH_TILE / kBatchThreads;
   __shared__ uint8_t weight_tile[kRowTile][kLogitsChunk];
-  // Лишний столбец разводит по банкам чтение тайла во внутреннем цикле.
+  // An extra column spreads the tile reads in the inner loop across banks.
   __shared__ float hidden_tile[BATCH_TILE][kLogitsChunk + 1];
 
   const int row_base = blockIdx.x * kRowTile;
@@ -281,7 +281,7 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_kernel(
   for (int base = 0; base < hidden_size; base += kLogitsChunk) {
     const int width = min(kLogitsChunk, hidden_size - base);
     __syncthreads();
-    // Веса: по четыре байта на поток, шестнадцать потоков на строку.
+    // Weights: four bytes per thread, sixteen threads per row.
     for (int index = threadIdx.x; index < kRowTile * (kLogitsChunk / 4);
          index += kThreads) {
       const int row = index / (kLogitsChunk / 4);
@@ -300,7 +300,7 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_kernel(
       }
       *reinterpret_cast<uint32_t*>(&weight_tile[row][column]) = packed;
     }
-    // hidden: строка на последовательность, столбцы идут подряд.
+    // hidden: a row per sequence, columns go consecutively.
     for (int index = threadIdx.x; index < BATCH_TILE * kLogitsChunk;
          index += kThreads) {
       const int b = index / kLogitsChunk;
@@ -355,24 +355,24 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_kernel(
   }
 }
 
-// Широкий batch идёт через тензорные ядра, и упирается он не в них, а в то,
-// сколько байт таблицы висит в полёте. Веса грузятся прямо в регистры
-// фрагментов по 16 байт на поток и подкачиваются на кусок вперёд, пока
-// считается текущий; через shared идёт только hidden. Прежний вариант ставил
-// тайл 128x32 в shared побайтно, с двумя барьерами на тайл, и держал
-// 380-450 ГБ/с на любом batch.
+// A wide batch goes through tensor cores, and it's bound not by them but by
+// how many bytes of the table are in flight. Weights are loaded straight into fragment
+// registers 16 bytes per thread and prefetched one chunk ahead while
+// the current one is computed; only hidden goes through shared. The old variant put
+// a 128x32 tile into shared byte by byte, with two barriers per tile, and held
+// 380-450 GB/s at any batch.
 //
-// Внутри куска в kMmaK столбцов порядок по K переставлен: поток (group,
-// position) берёт 16 подряд идущих байт строки, а шаг s раздаёт из них
-// столбцы 4s..4s+3 на логические k = 2p, 2p+1, 2p+8, 2p+9. Фрагмент B читает
-// hidden по той же перестановке, так что скалярное произведение не меняется.
+// Within a chunk of kMmaK columns the K order is permuted: thread (group,
+// position) takes 16 consecutive bytes of a row, and step s hands out of them
+// columns 4s..4s+3 onto logical k = 2p, 2p+1, 2p+8, 2p+9. The B fragment reads
+// hidden with the same permutation, so the dot product doesn't change.
 constexpr int kMmaK = 64;
 constexpr int kMmaRowTiles = 1;
 constexpr int kMmaWarps = kThreads / kWarpSize;
 constexpr int kMmaRows = kMmaWarps * 16 * kMmaRowTiles;
 constexpr int kHiddenChunk = 128;
-// Четыре лишних bf16 сдвигают строку hidden на два банка: чтение фрагмента B
-// по восемь байт идёт без конфликтов.
+// Four extra bf16 shift a hidden row by two banks: reading the B fragment
+// eight bytes at a time goes without conflicts.
 constexpr int kHiddenStride = kHiddenChunk + 4;
 
 __device__ __forceinline__ void mma_m16n8k16(
@@ -385,8 +385,8 @@ __device__ __forceinline__ void mma_m16n8k16(
         "r"(b[0]), "r"(b[1]));
 }
 
-// Два E4M3 из младших 16 бит в пару BF16. Оба перехода точные: E4M3
-// укладывается и в f16, и в bf16 без округления.
+// Two E4M3 from the low 16 bits into a BF16 pair. Both conversions are exact: E4M3
+// fits in both f16 and bf16 without rounding.
 __device__ __forceinline__ uint32_t e4m3x2_to_bf16x2(uint32_t pair) {
   const __half2_raw raw = __nv_cvt_fp8x2_to_halfraw2(
       static_cast<__nv_fp8x2_storage_t>(pair & 0xffffu), __NV_E4M3);
@@ -414,7 +414,7 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_mma_kernel(
   const int position = lane % 4;
   const int warp_row = blockIdx.x * kMmaRows + warp * 16 * kMmaRowTiles;
 
-  // Строка r = warp_row + 16t + group + 8h; за словарём — нули.
+  // Row r = warp_row + 16t + group + 8h; beyond the vocab — zeros.
   const uint8_t* row_base[kMmaRowTiles][2];
   bool row_valid[kMmaRowTiles][2];
 #pragma unroll
@@ -428,8 +428,8 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_mma_kernel(
     }
   }
 
-  // Шаг цикла — kHiddenChunk столбцов, kMmaSteps кусков по kMmaK: следующий
-  // шаг целиком в полёте, пока считается текущий.
+  // A loop step is kHiddenChunk columns, kMmaSteps chunks of kMmaK: the next
+  // step is fully in flight while the current one is computed.
   constexpr int kMmaSteps = kHiddenChunk / kMmaK;
   uint4 current[kMmaSteps][kMmaRowTiles][2];
   uint4 next[kMmaSteps][kMmaRowTiles][2];
@@ -453,7 +453,7 @@ __global__ __launch_bounds__(kThreads) void lm_head_batched_mma_kernel(
   load(current, 0);
 
   for (int k = 0; k < hidden_size; k += kHiddenChunk) {
-    // Следующий шаг уходит в полёт до барьера и до математики текущего.
+    // The next step goes into flight before the barrier and before the current one's math.
     if (k + kHiddenChunk < hidden_size) {
       load(next, k + kHiddenChunk);
     }
@@ -588,15 +588,15 @@ __global__ void bf16_lm_head_kernel(
   }
 }
 
-// Логиты только по списку строк словаря.
+// Logits only over a list of vocab rows.
 //
-// Черновой голове точный argmax по 248 320 строкам не нужен: её предложение
-// всё равно проверяет основная модель, и промах шортлиста стоит отвергнутого
-// черновика, а не неверного выхода. Список строк задаётся снаружи — частотный
-// префикс словаря плюс токены контекста.
+// The draft head doesn't need an exact argmax over 248 320 rows: its proposal
+// is verified by the main model anyway, and a shortlist miss costs a rejected
+// draft, not a wrong output. The row list is given from outside — a frequency
+// prefix of the vocab plus context tokens.
 //
-// Варп владеет строкой: у строки 5120 байт, лента читается по четыре байта на
-// поток, активация лежит в shared и читается всеми варпами блока.
+// A warp owns a row: a row is 5120 bytes, the strip is read four bytes per
+// thread, the activation lies in shared and is read by all warps of the block.
 __global__ __launch_bounds__(kThreads) void lm_head_subset_kernel(
     const uint8_t* __restrict__ weights,
     const float* __restrict__ row_scales,
@@ -838,8 +838,8 @@ extern "C" cudaError_t qwc_fp8_lm_head_batched(
   const float* s = static_cast<const float*>(row_scales);
   const __nv_bfloat16* h = static_cast<const __nv_bfloat16*>(hidden);
   float* out = static_cast<float*>(logits);
-  // MMA-путь берёт hidden кусками по kHiddenChunk; остальные ширины идут
-  // скалярным кернелом.
+  // The MMA path takes hidden in chunks of kHiddenChunk; other widths go through
+  // the scalar kernel.
   const bool mma = hidden_size % kHiddenChunk == 0;
   const int blocks = mma ? (vocab + kMmaRows - 1) / kMmaRows
                          : (vocab + kRowTile - 1) / kRowTile;

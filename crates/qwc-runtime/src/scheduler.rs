@@ -1,9 +1,9 @@
-//! Continuous batching поверх двух независимых пулов кэша.
+//! Continuous batching on top of two independent cache pools.
 //!
-//! Планировщик резервирует память до отправки работы на GPU. В каждый момент
-//! разрешён только один in-flight batch: это делает переходы состояний
-//! однозначными и позволяет полностью откатить план, если запуск кернела не
-//! состоялся.
+//! The scheduler reserves memory before sending work to the GPU. At any moment
+//! only one in-flight batch is allowed: this makes state transitions
+//! unambiguous and allows fully rolling back the plan if the kernel launch didn't
+//! happen.
 
 use crate::cache::{CacheManager, PrefixRestore, Rejected, SeqId};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerConfig {
-    /// Максимум последовательностей в одном смешанном batch.
+    /// Max sequences in one mixed batch.
     pub max_num_seqs: usize,
-    /// Общий token budget: decode стоит один токен, prefill — размер чанка.
+    /// Shared token budget: decode costs one token, prefill costs the chunk size.
     pub max_num_batched_tokens: usize,
 }
 
@@ -21,11 +21,11 @@ impl SchedulerConfig {
     pub fn new(max_num_seqs: usize, max_num_batched_tokens: usize) -> Self {
         assert!(
             max_num_seqs > 0,
-            "batch должен вмещать хотя бы одну последовательность"
+            "batch must fit at least one sequence"
         );
         assert!(
             max_num_batched_tokens > 0,
-            "token budget должен быть положительным"
+            "token budget must be positive"
         );
         Self {
             max_num_seqs,
@@ -44,22 +44,22 @@ pub struct Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefillChunk {
     pub id: SeqId,
-    /// Смещение чанка в исходном prompt.
+    /// The chunk's offset in the original prompt.
     pub offset: usize,
     pub tokens: usize,
 }
 
-/// Поднять снимок префикса в слот до того, как пойдёт первый чанк.
+/// Restore a prefix snapshot into the slot before the first chunk runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefixRestoreOp {
     pub id: SeqId,
     pub state_slot: u32,
     pub snapshot: u32,
-    /// `(откуда, куда)`: неполную страницу префикса надо скопировать до шага.
+    /// `(from, to)`: the prefix's incomplete page must be copied before the step.
     pub copy_block: Option<(u32, u32)>,
 }
 
-/// Снять состояние слота в снимок сразу после чанка, закончившего промпт.
+/// Capture the slot's state into a snapshot right after the chunk that finished the prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrefixSaveOp {
     pub id: SeqId,
@@ -71,8 +71,8 @@ pub struct PrefixSaveOp {
 pub struct Batch {
     pub prefill: Vec<PrefillChunk>,
     pub decode: Vec<SeqId>,
-    /// Операции кэша префиксов. Исполнитель обязан выполнить их в этом же
-    /// шаге: подъём — до прохода, снятие — внутри, после скана чанка.
+    /// Prefix cache operations. The executor must perform them in this same
+    /// step: restore before the pass, capture inside it, after the chunk's scan.
     pub restores: Vec<PrefixRestoreOp>,
     pub saves: Vec<PrefixSaveOp>,
 }
@@ -116,14 +116,14 @@ pub enum SubmitError {
 impl std::fmt::Display for SubmitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Duplicate(id) => write!(f, "SeqId {id} уже находится в scheduler"),
-            Self::EmptyPrompt => write!(f, "prompt не содержит токенов"),
-            Self::NoOutputTokens => write!(f, "max_new_tokens должен быть положительным"),
-            Self::NoStateCapacity => write!(f, "пул не содержит state-слотов"),
+            Self::Duplicate(id) => write!(f, "SeqId {id} is already in the scheduler"),
+            Self::EmptyPrompt => write!(f, "prompt contains no tokens"),
+            Self::NoOutputTokens => write!(f, "max_new_tokens must be positive"),
+            Self::NoStateCapacity => write!(f, "the pool contains no state slots"),
             Self::ContextTooLong { need, capacity } => {
                 write!(
                     f,
-                    "prompt и генерация требуют {need} KV-блоков, ёмкость пула {capacity}"
+                    "prompt and generation need {need} KV blocks, pool capacity is {capacity}"
                 )
             }
         }
@@ -146,14 +146,14 @@ pub enum SchedulerError {
 impl std::fmt::Display for SchedulerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BatchInFlight => write!(f, "предыдущий batch ещё не завершён"),
-            Self::NoBatchInFlight => write!(f, "нет batch для завершения или отката"),
+            Self::BatchInFlight => write!(f, "the previous batch hasn't finished yet"),
+            Self::NoBatchInFlight => write!(f, "no batch to complete or roll back"),
             Self::SequenceInFlight(id) => {
-                write!(f, "SeqId {id} нельзя отменить во время исполнения batch")
+                write!(f, "SeqId {id} can't be cancelled while a batch is executing")
             }
-            Self::InvalidStopped(id) => write!(f, "SeqId {id} не входил в decode batch"),
-            Self::DuplicateStopped(id) => write!(f, "SeqId {id} дважды указан как завершённый"),
-            Self::Invariant(id) => write!(f, "нарушено внутреннее состояние SeqId {id}"),
+            Self::InvalidStopped(id) => write!(f, "SeqId {id} wasn't in the decode batch"),
+            Self::DuplicateStopped(id) => write!(f, "SeqId {id} listed as finished twice"),
+            Self::Invariant(id) => write!(f, "internal state of SeqId {id} violated"),
             Self::Cache(err) => err.fmt(f),
         }
     }
@@ -182,12 +182,12 @@ struct ActiveRequest {
     prefilled: usize,
     generated: usize,
     phase: Phase,
-    /// Снимок префикса ещё не поднят: первый чанк его не отработал.
+    /// The prefix snapshot hasn't been restored yet: the first chunk hasn't processed it.
     restore: Option<PrefixRestore>,
 }
 
-/// FIFO admission + round-robin decode. Длинный prompt, временно не
-/// помещающийся в KV, не блокирует меньший запрос позади него.
+/// FIFO admission + round-robin decode. A long prompt that temporarily
+/// doesn't fit in KV doesn't block a smaller request behind it.
 #[derive(Debug)]
 pub struct Scheduler {
     config: SchedulerConfig,
@@ -196,21 +196,21 @@ pub struct Scheduler {
     prefill_ready: VecDeque<SeqId>,
     decode_ready: VecDeque<SeqId>,
     active: HashMap<SeqId, ActiveRequest>,
-    /// Логически обещанные активным запросам KV-блоки на полный lifetime.
-    /// Физически CacheManager выделяет их лениво.
+    /// KV blocks logically promised to active requests for their full lifetime.
+    /// Physically CacheManager allocates them lazily.
     committed_kv_blocks: usize,
     in_flight: Option<Batch>,
-    /// Токены промптов, по которым ищется и сохраняется кэш префиксов.
-    /// Без них запрос принимается обычным путём.
+    /// Prompt tokens used to look up and store the prefix cache.
+    /// Without them the request is admitted the ordinary way.
     prompts: HashMap<SeqId, PromptTokens>,
 }
 
 #[derive(Debug)]
 struct PromptTokens {
     tokens: Arc<[u32]>,
-    /// Где снять снимок. Не конец промпта: хвост промпта генерации
-    /// (`<|im_start|>assistant\n<think>\n`) в историю следующего хода не
-    /// попадает, и снимок после него никогда не стал бы её префиксом.
+    /// Where to capture the snapshot. Not the end of the prompt: the generation prompt's tail
+    /// (`<|im_start|>assistant\n<think>\n`) doesn't make it into the next turn's history,
+    /// and a snapshot after it would never become its prefix.
     snapshot_at: usize,
 }
 
@@ -229,26 +229,26 @@ impl Scheduler {
         }
     }
 
-    /// Включает кэш префиксов на `snapshots` снимков. Исполнитель должен
-    /// держать столько же слотов под снимки.
+    /// Enables the prefix cache with `snapshots` snapshots. The executor must
+    /// hold the same number of snapshot slots.
     pub fn enable_prefix_cache(&mut self, snapshots: usize) {
         self.cache.enable_prefix_cache(snapshots);
     }
 
-    /// То же, что `submit`, но с самими токенами промпта: только такой
-    /// запрос может продолжить закэшированный префикс и оставить свой.
+    /// Same as `submit`, but with the prompt tokens themselves: only such
+    /// a request can continue a cached prefix and leave its own.
     ///
-    /// `snapshot_at` — длина префикса, который стоит закэшировать: у чата
-    /// это граница истории перед промптом генерации. Чанк префилла режется
-    /// на ней, чтобы снимок пришёлся ровно туда.
+    /// `snapshot_at` — the length of the prefix worth caching: for chat
+    /// that's the history boundary before the generation prompt. The prefill chunk is cut
+    /// at it so that the snapshot lands exactly there.
     pub fn submit_prompt(
         &mut self,
         request: Request,
         prompt: Arc<[u32]>,
         snapshot_at: usize,
     ) -> Result<(), SubmitError> {
-        assert_eq!(prompt.len(), request.prompt_tokens, "длина промпта не сходится");
-        assert!(snapshot_at <= prompt.len(), "точка снимка за концом промпта");
+        assert_eq!(prompt.len(), request.prompt_tokens, "prompt length doesn't match");
+        assert!(snapshot_at <= prompt.len(), "snapshot point is past the end of the prompt");
         self.submit(request)?;
         self.prompts.insert(
             request.id,
@@ -287,11 +287,11 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Формирует смешанный continuous batch. Decode получает приоритет ради
-    /// низкого ITL, остаток лимита заполняется chunked prefill.
+    /// Builds a mixed continuous batch. Decode gets priority for the sake of
+    /// low ITL, the rest of the limit is filled with chunked prefill.
     ///
-    /// Для decode KV под следующий токен резервируется прямо здесь. До вызова
-    /// `complete_batch` или `abort_batch` новый batch планировать нельзя.
+    /// For decode, KV for the next token is reserved right here. Until
+    /// `complete_batch` or `abort_batch` is called, a new batch can't be planned.
     pub fn next_batch(&mut self) -> Result<Option<Batch>, SchedulerError> {
         if self.in_flight.is_some() {
             return Err(SchedulerError::BatchInFlight);
@@ -337,8 +337,8 @@ impl Scheduler {
             let mut tokens = remaining.min(budget);
             let offset = active.prefilled;
             let restore = active.restore;
-            // Точка снимка внутри чанка — чанк кончается на ней, остаток
-            // промпта уходит следующим шагом.
+            // The snapshot point is inside the chunk — the chunk ends at it, the rest
+            // of the prompt goes in the next step.
             let snapshot_at = self
                 .prompts
                 .get(&id)
@@ -361,7 +361,7 @@ impl Scheduler {
                     copy_block: restore.copy_block,
                 });
             }
-            // Следующий ход того же диалога начнётся с этой истории целиком.
+            // The next turn of the same dialog will start with this whole history.
             if snapshot_at.is_some_and(|at| at >= self.cache.kv().block_size())
                 && let Some(snapshot) = self.cache.reserve_snapshot()
             {
@@ -383,18 +383,18 @@ impl Scheduler {
         Ok(Some(batch))
     }
 
-    /// Подтверждает успешно исполненный batch. `stopped` содержит decode-
-    /// последовательности, для которых модель вернула EOS/stop condition.
+    /// Commits a successfully executed batch. `stopped` contains the decode
+    /// sequences for which the model returned EOS/stop condition.
     pub fn complete_batch(&mut self, stopped: &[SeqId]) -> Result<Vec<Completion>, SchedulerError> {
         self.complete_batch_multi(stopped, &[])
     }
 
-    /// То же, но decode-последовательность могла выдать больше одного токена.
+    /// The same, but a decode sequence may have produced more than one token.
     ///
-    /// Спекуляция за шаг принимает от одного до k+1 токенов, и планировщик
-    /// обязан знать сколько: иначе `generated` разъедется с реальностью и
-    /// запрос закончится не на своей длине. Отсутствующие в `produced`
-    /// последовательности считаются выдавшими один токен.
+    /// Speculation accepts one to k+1 tokens per step, and the scheduler
+    /// must know how many: otherwise `generated` will drift from reality and
+    /// the request won't end at its length. Sequences missing from `produced`
+    /// are considered to have produced one token.
     pub fn complete_batch_multi(
         &mut self,
         stopped: &[SeqId],
@@ -499,13 +499,13 @@ impl Scheduler {
         Ok(completed)
     }
 
-    /// Резервирует в KV ещё `tokens` позиций для decode-последовательности
-    /// сверх той одной, что уже взял `next_batch`.
+    /// Reserves `tokens` more KV positions for a decode sequence
+    /// beyond the one that `next_batch` already took.
     ///
-    /// Спекулятивная проверка пишет k+1 строк, а не одну, и страницы под них
-    /// нужны до прогона: узнать число принятых можно только после него.
-    /// Возвращает, сколько удалось зарезервировать — при исчерпании пула
-    /// глубина черновика просто уменьшается.
+    /// Speculative verification writes k+1 rows, not one, and pages for them
+    /// are needed before the run: the number accepted can only be known after it.
+    /// Returns how many could be reserved — when the pool is exhausted
+    /// the draft depth simply shrinks.
     pub fn reserve_extra(&mut self, id: SeqId, tokens: usize) -> usize {
         let mut reserved = 0;
         while reserved < tokens {
@@ -517,8 +517,8 @@ impl Scheduler {
         reserved
     }
 
-    /// Возвращает в пул позиции, которые спекуляция зарезервировала, но
-    /// проверка отвергла.
+    /// Returns to the pool positions that speculation reserved but
+    /// verification rejected.
     pub fn release_extra(&mut self, id: SeqId, tokens: usize) -> Result<(), SchedulerError> {
         for _ in 0..tokens {
             self.cache.rollback_token(id)?;
@@ -526,15 +526,15 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Откатывает ещё не исполненный batch и возвращает работу в начало
-    /// соответствующих очередей. Резервации decode-токенов освобождаются.
+    /// Rolls back a not-yet-executed batch and returns the work to the front of
+    /// the corresponding queues. Decode token reservations are freed.
     pub fn abort_batch(&mut self) -> Result<(), SchedulerError> {
         let Some(batch) = self.in_flight.take() else {
             return Err(SchedulerError::NoBatchInFlight);
         };
 
-        // Подъёмы остаются за последовательностями и уйдут со следующим
-        // чанком; снимки не сняты — их слоты свободны.
+        // Restores stay with the sequences and will go with the next
+        // chunk; snapshots weren't captured — their slots are free.
         for op in &batch.saves {
             self.cache.cancel_snapshot(op.snapshot);
         }
@@ -550,9 +550,9 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Удаляет ожидающий или готовый запрос и сразу освобождает его кэш.
-    /// In-flight запрос сначала нужно завершить либо откатить целиком вместе
-    /// с batch, иначе GPU мог бы обратиться к уже освобождённым блокам.
+    /// Removes a waiting or ready request and immediately frees its cache.
+    /// An in-flight request must first be completed or rolled back entirely together
+    /// with the batch, otherwise the GPU could access already freed blocks.
     pub fn cancel(&mut self, id: SeqId) -> Result<bool, SchedulerError> {
         if self.in_flight.as_ref().is_some_and(|batch| {
             batch.decode.contains(&id) || batch.prefill.iter().any(|c| c.id == id)
@@ -579,9 +579,9 @@ impl Scheduler {
         Ok(false)
     }
 
-    /// Сколько токенов запросу ещё осталось выдать. Спекуляция обязана это
-    /// знать: шаг выдаёт от одного до k+1 токенов, и перескочить через
-    /// `max_new_tokens` значит посчитать лишнее и сделать лишнюю работу.
+    /// How many tokens the request still has left to emit. Speculation must
+    /// know this: a step emits one to k+1 tokens, and overshooting
+    /// `max_new_tokens` means computing extra and doing extra work.
     pub fn remaining_tokens(&self, id: SeqId) -> Option<usize> {
         self.active
             .get(&id)
@@ -761,8 +761,8 @@ mod tests {
         s.next_batch().unwrap();
         s.complete_batch(&[]).unwrap();
 
-        // После резервации decode для seq 1 свободен один блок. Seq 2 требует
-        // три, но seq 3 помещается и должен попасть в этот же batch.
+        // After the decode reservation for seq 1 one block is free. Seq 2 needs
+        // three, but seq 3 fits and must get into this same batch.
         s.submit(request(2, 192, 1)).unwrap();
         s.submit(request(3, 63, 1)).unwrap();
         let batch = s.next_batch().unwrap().unwrap();
@@ -832,8 +832,8 @@ mod tests {
         s.submit(request(1, 64, 1)).unwrap();
         s.submit(request(2, 64, 1)).unwrap();
 
-        // Одна последовательность коммитит оба блока: prompt и страницу,
-        // которая понадобится первому decode-токену.
+        // One sequence commits both blocks: the prompt and the page
+        // the first decode token will need.
         let prefill = s.next_batch().unwrap().unwrap();
         assert_eq!(prefill.prefill.len(), 1);
         assert_eq!(s.committed_kv_blocks(), 2);
@@ -845,7 +845,7 @@ mod tests {
         s.complete_batch(&[]).unwrap();
         assert_eq!(s.committed_kv_blocks(), 0);
 
-        // После release второй запрос может быть принят и продолжить работу.
+        // After release the second request can be admitted and continue working.
         assert_eq!(s.next_batch().unwrap().unwrap().prefill[0].id, 2);
     }
 
@@ -878,7 +878,7 @@ mod tests {
         (0..len as u32).collect::<Vec<_>>().into()
     }
 
-    /// Прогнать запрос до конца, возвращая батчи, которые он породил.
+    /// Run a request to the end, returning the batches it produced.
     fn drain(s: &mut Scheduler) -> Vec<Batch> {
         let mut batches = Vec::new();
         while let Some(batch) = s.next_batch().unwrap() {
@@ -894,7 +894,7 @@ mod tests {
         s.enable_prefix_cache(4);
         s.submit_prompt(request(1, 150, 2), tokens(150), 150).unwrap();
         let first = drain(&mut s);
-        // Промпт закончился в первом же шаге — там и снимок.
+        // The prompt ended in the very first step — the snapshot is there too.
         assert_eq!(first[0].saves.len(), 1);
         assert!(first[0].restores.is_empty());
         assert_eq!(s.cache().prefix_entries(), 1);
@@ -926,7 +926,7 @@ mod tests {
         s.submit_prompt(request(2, 130, 1), tokens(130), 130).unwrap();
         let batch = s.next_batch().unwrap().unwrap();
         assert_eq!(batch.restores.len(), 1);
-        // Единственный слот держит закреплённая запись: снимать некуда.
+        // The only slot is held by a pinned entry: nowhere to capture.
         assert!(batch.saves.is_empty());
         s.abort_batch().unwrap();
 
@@ -945,7 +945,7 @@ mod tests {
         s.next_batch().unwrap().unwrap();
         s.abort_batch().unwrap();
         assert!(s.cancel(2).unwrap());
-        // Запись снова вытесняема: новый снимок забирает её слот.
+        // The entry is evictable again: a new snapshot takes its slot.
         let other: Arc<[u32]> = tokens(64).iter().map(|t| t + 7).collect::<Vec<_>>().into();
         s.submit_prompt(request(3, 64, 1), other, 64).unwrap();
         let batch = s.next_batch().unwrap().unwrap();
@@ -954,8 +954,8 @@ mod tests {
 
     #[test]
     fn prefill_is_cut_at_the_history_boundary() {
-        // Промпт 150 токенов, из них последние 6 — промпт генерации. Снимок
-        // должен лечь на 144, а следующий ход — продолжить именно оттуда.
+        // A 150-token prompt, the last 6 of which are the generation prompt. The snapshot
+        // must land at 144, and the next turn must continue exactly from there.
         let mut s = scheduler(2, 100, 2, 512);
         s.enable_prefix_cache(2);
         s.submit_prompt(request(1, 150, 1), tokens(150), 144).unwrap();
@@ -976,7 +976,7 @@ mod tests {
         s.complete_batch(&[]).unwrap();
         drain(&mut s);
 
-        // Следующий ход: те же 144 токена истории, дальше другое.
+        // The next turn: the same 144 history tokens, then something different.
         let mut next: Vec<u32> = (0..144).collect();
         next.extend(1000..1100);
         s.submit_prompt(request(2, 244, 1), next.into(), 238).unwrap();

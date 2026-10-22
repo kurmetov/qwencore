@@ -1,143 +1,143 @@
-# Счёт против vLLM под общим бюджетом памяти — 2026-09-17
+# Score against vLLM under a shared memory budget — 2026-09-17
 
-> **Одиночные точки одной сессии, без доверительных интервалов.** Сравнение с
-> vLLM здесь снято до появления протокола
-> [`docs/11-experiments.md`](../../docs/11-experiments.md): один-два прогона на
-> точку, без ротации порядка вариантов и без bootstrap CI, на частично занятой
-> карте. Эти множители отменяются прогоном comparison suite и не должны
-> цитироваться как результат проекта. Условия каждой точки — ниже по тексту.
+> **Single points from one session, without confidence intervals.** The comparison with
+> vLLM here was taken before the protocol
+> [`docs/11-experiments.md`](../../docs/11-experiments.md) existed: one or two runs per
+> point, no variant order rotation and no bootstrap CI, on a partially busy
+> card. These multipliers are superseded by a comparison suite run and must not
+> be quoted as a project result. The conditions of each point are given below.
 
-## Почему поменялась методика
+## Why the methodology changed
 
-Прошлое сравнение (`where-we-stand-2026-09-16.md`) снималось в одной точке и
-несло оговорку: карту частично держал чужой процесс, vLLM жил под 24.5 ГБ и
-на смешанных точках голодал по кэшу, поэтому часть нашего отрыва была его
-голодом, а не нашими ядрами. Напрашивалось «перемерить на свободной карте».
+The previous comparison (`where-we-stand-2026-09-16.md`) was taken at one point and
+carried a caveat: the card was partially held by someone else's process, vLLM lived under 24.5 GB and
+starved for cache on mixed points, so part of our lead was its
+starvation, not our kernels. "Re-measure on a free card" suggested itself.
 
-Это неверный вывод. На целевом сервере рядом с движком живут реранкеры,
-индексация и whisper — **стеснённая карта и есть рабочее условие**, а не
-помеха замеру. Мерить на пустой карте значит мерить режим, которого не будет.
+That's the wrong conclusion. On the target server, rerankers,
+indexing and whisper live next to the engine — **a cramped card is the working condition**, not
+a measurement nuisance. Measuring on an empty card means measuring a mode that won't exist.
 
-Поэтому вместо одной точки — свип по **общему бюджету на движок**:
-`bench/servebench.py --engine-budget-gb B`. У нас это абсолютный
-`--memory-limit-gb`, у vLLM пересчитывается в `gpu_memory_utilization` от
-ёмкости карты; обе величины пишутся в артефакт и проверяемы.
+So instead of one point — a sweep over the **total per-engine budget**:
+`bench/servebench.py --engine-budget-gb B`. For us that's an absolute
+`--memory-limit-gb`, for vLLM it's converted to `gpu_memory_utilization` of
+card capacity; both values are written to the artifact and verifiable.
 
-И прежняя оговорка разворачивается: наша фора по весам (17.08 ГБ против 20.5
-у vLLM) — не «нечестная часть отрыва», а самая работающая часть продукта
-ровно в этом режиме.
+And the earlier caveat turns around: our weight headroom (17.08 GB vs 20.5
+for vLLM) is not "the unfair part of the lead" but the most effective part of the product
+exactly in this mode.
 
-## Условия
+## Conditions
 
-RTX 5090, 34.19 ГБ. **Карта не освобождалась**: ~4.7 ГБ держат десктоп и
-чужой сервис, одинаково для обоих движков на протяжении всех прогонов.
-Контекст 2048, KV fp8 у обоих, уникальный промпт на запрос, всё подано в t=0.
-vLLM 0.28.0 с поднятым FlashInfer (см. ниже) — это его лучшая доступная
-конфигурация. Наш движок — **без спекуляции**: MTP живёт в `bin/speculate.rs`
-и в сервер ещё не заведён.
+RTX 5090, 34.19 GB. **The card was not freed**: ~4.7 GB held by the desktop and
+someone else's service, the same for both engines across all runs.
+Context 2048, KV fp8 for both, a unique prompt per request, everything submitted at t=0.
+vLLM 0.28.0 with FlashInfer brought up (see below) — that's its best available
+configuration. Our engine is **without speculation**: MTP lives in `bin/speculate.rs`
+and isn't wired into the server yet.
 
-## Граница жизнеспособности
+## Viability boundary
 
-8 запросов, c=4, 256/32 — числа здесь показывают только, стартует ли движок.
+8 requests, c=4, 256/32 — the numbers here only show whether the engine starts.
 
-| бюджет | qwencore | vLLM | vLLM + MTP |
+| budget | qwencore | vLLM | vLLM + MTP |
 |---|---|---|---|
-| 19 ГБ | 221.9 tok/s | — | — |
-| 22 ГБ | 221.1 | **не стартует** | **не стартует** |
-| 24 ГБ | 221.9 | **не стартует** | **не стартует** |
-| 26 ГБ | 221.7 | 260.6 | 142.4 |
-| 28 ГБ | 221.0 | 258.0 | 236.5 |
+| 19 GB | 221.9 tok/s | — | — |
+| 22 GB | 221.1 | **doesn't start** | **doesn't start** |
+| 24 GB | 221.9 | **doesn't start** | **doesn't start** |
+| 26 GB | 221.7 | 260.6 | 142.4 |
+| 28 GB | 221.0 | 258.0 | 236.5 |
 
-Минимум: **у нас 19 ГБ, у vLLM 26**. Разница 7 ГБ — это ровно то, что
-остаётся соседям по карте.
+Minimum: **19 GB for us, 26 for vLLM**. The 7 GB difference is exactly what
+remains for neighbors on the card.
 
-## Чат-точка
+## Chat point
 
-160 запросов, c=32, 256/128. Все прогоны выдали полные 20 480 токенов.
+160 requests, c=32, 256/128. All runs produced the full 20 480 tokens.
 
-| бюджет | qwencore | vLLM | vLLM + MTP |
+| budget | qwencore | vLLM | vLLM + MTP |
 |---|---|---|---|
-| 22 ГБ | **1173.6** tok/s, TTFT 7.2 с | не стартует | не стартует |
-| 24 ГБ | 1166.4, TTFT 7.4 с | не стартует | не стартует |
-| 26 ГБ | **1167.5**, TTFT 7.4 с | 632.2, TTFT 15.3 с | не стартует |
-| 28 ГБ | ошибка, см. ниже | 1083.2, TTFT 8.5 с | 515.8, TTFT 19.2 с |
+| 22 GB | **1173.6** tok/s, TTFT 7.2 s | doesn't start | doesn't start |
+| 24 GB | 1166.4, TTFT 7.4 s | doesn't start | doesn't start |
+| 26 GB | **1167.5**, TTFT 7.4 s | 632.2, TTFT 15.3 s | doesn't start |
+| 28 GB | error, see below | 1083.2, TTFT 8.5 s | 515.8, TTFT 19.2 s |
 
-**На 26 ГБ — единственном бюджете, где работают оба, — мы 1.85x по
-пропускной и 2.1x по TTFT.**
+**At 26 GB — the only budget where both work — we're 1.85x in
+throughput and 2.1x in TTFT.**
 
-Главное в таблице не множитель, а форма кривой: у нас пропускная **ровная**
-от 22 до 26 ГБ (1173 / 1166 / 1167), у vLLM она падает с 1083 до 632 при
-переходе с 28 на 26. Мы к бюджету нечувствительны в этом диапазоне, он —
-нет.
+The main thing in the table isn't the multiplier but the shape of the curve: our throughput is **flat**
+from 22 to 26 GB (1173 / 1166 / 1167), while vLLM's drops from 1083 to 632 when
+going from 28 to 26. We're insensitive to the budget in this range, it
+isn't.
 
-Встречное наблюдение, которое таблица скрывает: ITL p50 у vLLM **лучше**
-нашего (15.0 против 22.7 мс). Он держит меньше последовательностей разом,
-поэтому каждая идёт быстрее, а сквозная пропускная вдвое хуже.
+A counter-observation the table hides: vLLM's ITL p50 is **better**
+than ours (15.0 vs 22.7 ms). It holds fewer sequences at once,
+so each goes faster, while end-to-end throughput is half.
 
-## Батч-1: здесь мы проигрываем
+## Batch 1: here we lose
 
-8 запросов, c=1, 256/128, бюджет 26 ГБ у обоих.
+8 requests, c=1, 256/128, 26 GB budget for both.
 
 | | tok/s | ITL p50 |
 |---|---:|---:|
-| qwencore (сервер, без спекуляции) | 78.3 | 12.50 мс |
-| vLLM без MTP | 72.3 | 13.38 мс |
-| vLLM + MTP, k=2 | 127.5 | 7.18 мс |
-| **vLLM + MTP, k=3** | **133.9** | **5.97 мс** |
+| qwencore (server, no speculation) | 78.3 | 12.50 ms |
+| vLLM without MTP | 72.3 | 13.38 ms |
+| vLLM + MTP, k=2 | 127.5 | 7.18 ms |
+| **vLLM + MTP, k=3** | **133.9** | **5.97 ms** |
 
-**Правильно настроенный vLLM обгоняет наш сервер в 1.71x.** Без MTP наш отрыв
-на этой точке — 1.08x, а не 1.57x из прошлого разбора. Часть разницы
-объясняется контекстом (тогда 8192, здесь 2048), но главное в другом: тогда
-vLLM мерился без FlashInfer и без спекуляции, то есть в заведомо худшей для
-него конфигурации.
+**A properly configured vLLM beats our server by 1.71x.** Without MTP our lead
+at this point is 1.08x, not 1.57x as in the previous analysis. Part of the difference
+is explained by context (8192 then, 2048 here), but the main thing is different: back then
+vLLM was measured without FlashInfer and without speculation, i.e. in a configuration knowingly worse
+for it.
 
-Наша спекуляция закрывает разрыв с запасом: стендовые 2.04x (k=2) и 2.20x
-(k=3) от 78.3 дают 160-172 tok/s против их 133.9. Но она живёт в
-`bin/speculate.rs` и в сервер не заведена, поэтому **на сегодня эта строка
-таблицы за нами не числится**.
+Our speculation closes the gap with room to spare: the bench 2.04x (k=2) and 2.20x
+(k=3) over 78.3 give 160-172 tok/s vs their 133.9. But it lives in
+`bin/speculate.rs` and isn't wired into the server, so **as of today this table row
+doesn't count as ours**.
 
-## MTP у vLLM: пропускную не улучшает
+## vLLM's MTP: doesn't improve throughput
 
-При c=4 — 142 против 260 на 26 ГБ; при c=32 — 516 против 1083 на 28 ГБ, а на
-26 ГБ вообще не стартует: `max_num_seqs (32) exceeds available Mamba cache
-blocks (19)`. Ожидаемо: на широком batch шаг уже амортизирует веса, а
-спекуляция добавляет работы и отъедает кэш.
+At c=4 — 142 vs 260 at 26 GB; at c=32 — 516 vs 1083 at 28 GB, and at
+26 GB it doesn't start at all: `max_num_seqs (32) exceeds available Mamba cache
+blocks (19)`. As expected: at wide batch the step already amortizes the weights, while
+speculation adds work and eats cache.
 
-Отсюда важное: тезис «vLLM включит MTP и срежет наш отрыв» **не подтверждён**
-и к пропускной не относится вовсе. Проверять его надо на латентности batch-1,
-где спекуляция и должна помогать. Эта точка ещё не снята.
+Hence the important point: the thesis "vLLM will enable MTP and cut our lead" is **not confirmed**
+and doesn't apply to throughput at all. It has to be checked on batch-1 latency,
+where speculation is supposed to help. That point hasn't been measured yet.
 
-## Что в этой таблице нечестно
+## What's unfair in this table
 
-- **Наш прогон на 28 ГБ упал** (`CudaError(1)`). При 4.7 ГБ, занятых другими,
-  бюджет 28 ГБ физически не помещается: мы лимит пытаемся выбрать, а vLLM
-  профилирует свободную память и берёт меньше номинала. Поэтому строка 28 ГБ
-  **не сравнима**; сравнимая строка одна — 26 ГБ.
-- Первый свип дал нам минимум 24 ГБ, и это была **ошибка стенда против нас**:
-  `servebench.rs` просил фиксированные 5 ГБ под KV сверх весов, тогда как
-  vLLM забирает остаток бюджета. Исправлено: `--kv-cache-gb 0` означает «весь
-  остаток», и это подставляется при общем бюджете. После починки минимум упал
-  с 24 до 19 ГБ.
-- Наша сторона — **без спекуляции**. Стендовые 2.04x (глубина 2) и 2.20x
-  (глубина 3) на batch-1 в эту таблицу не входят.
+- **Our 28 GB run crashed** (`CudaError(1)`). With 4.7 GB taken by others,
+  a 28 GB budget physically doesn't fit: we try to pick the limit, while vLLM
+  profiles free memory and takes less than nominal. So the 28 GB row is
+  **not comparable**; there is one comparable row — 26 GB.
+- The first sweep gave us a minimum of 24 GB, and that was **a bench bug against us**:
+  `servebench.rs` asked for a fixed 5 GB of KV on top of the weights, whereas
+  vLLM takes the rest of the budget. Fixed: `--kv-cache-gb 0` means "all
+  the rest", and that's substituted with a total budget. After the fix the minimum dropped
+  from 24 to 19 GB.
+- Our side is **without speculation**. The bench 2.04x (depth 2) and 2.20x
+  (depth 3) at batch 1 aren't part of this table.
 
-## Как поднять vLLM с MTP
+## How to bring up vLLM with MTP
 
-Четыре слоя, каждый молча ломает предыдущий вывод:
+Four layers, each silently breaking the previous conclusion:
 
-1. MTP требует FlashInfer; стоит 0.6.16.post3 и импортируется;
-2. `has_flashinfer()` считает его доступным только при `nvcc` в PATH —
-   `/usr/local/cuda/bin`, туда не входил;
-3. JIT требует `ninja` — лежит в `~/.venvs/baseline/bin`, а venv звался по
-   абсолютному пути, поэтому его bin в PATH не попадал;
-4. сборка падала на `curand_kernel.h`: в CUDA 13 заголовки curand вынесены из
-   toolkit в pip-пакет `nvidia/cu13`.
+1. MTP requires FlashInfer; 0.6.16.post3 is installed and imports;
+2. `has_flashinfer()` considers it available only with `nvcc` on PATH —
+   `/usr/local/cuda/bin` wasn't there;
+3. JIT requires `ninja` — it's in `~/.venvs/baseline/bin`, but the venv was invoked by
+   absolute path, so its bin didn't get onto PATH;
+4. the build failed on `curand_kernel.h`: in CUDA 13 the curand headers moved out of
+   the toolkit into the pip package `nvidia/cu13`.
 
-На четвёртом шаге подстановка всего `nvidia/cu13/include` даёт «CUDA compiler
-and CUDA toolkit headers are incompatible» — там 13.0 против nvcc 13.1.
-Решение — тот же приём, что в нашем `crates/qwc-cuda/build.rs`: теневое дерево
-include из симлинков на настоящий toolkit, пропатченный
-`crt/math_functions.h` под конфликт glibc с `rsqrt`, плюс симлинки только на
+At the fourth step substituting the whole `nvidia/cu13/include` gives "CUDA compiler
+and CUDA toolkit headers are incompatible" — it's 13.0 there vs nvcc 13.1.
+The solution is the same trick as in our `crates/qwc-cuda/build.rs`: a shadow include
+tree of symlinks to the real toolkit, a patched
+`crt/math_functions.h` for the glibc `rsqrt` conflict, plus symlinks only to
 `curand*.h`.
 
 ```
@@ -146,21 +146,21 @@ export NVCC_APPEND_FLAGS="-I<shim>"
 export MAX_JOBS=4
 ```
 
-`MAX_JOBS` обязателен: без него JIT запускает nvcc по числу ядер, и на этой
-машине сборка CUTLASS выбрала всю хостовую RAM — сработал OOM-killer. Прогоны
-стоит держать под `systemd-run --user --scope -p MemoryMax=36G`.
+`MAX_JOBS` is mandatory: without it JIT launches nvcc per core, and on this
+machine the CUTLASS build took all of host RAM — the OOM killer fired. Runs
+should be kept under `systemd-run --user --scope -p MemoryMax=36G`.
 
-**Это меняет и замеры качества.** С FlashInfer vLLM берёт `FLASHINFER`
-attention вместо `TRITON_ATTN` и `FlashInferCutlassNvFp4LinearKernel` вместо
-`CutlassNvFp4LinearKernel`. Значит `numerics-findings.md` от 11.09 и вывод
-«мы в 70 раз ближе к истине» сняты в конфигурации, которой больше нет, и их
-надо переснимать.
+**This also changes the quality measurements.** With FlashInfer vLLM takes `FLASHINFER`
+attention instead of `TRITON_ATTN` and `FlashInferCutlassNvFp4LinearKernel` instead of
+`CutlassNvFp4LinearKernel`. So `numerics-findings.md` from 11.09 and the conclusion
+"we're 70 times closer to the truth" were taken in a configuration that no longer exists, and they
+need re-measuring.
 
-## Что дальше
+## What's next
 
-1. **Спекуляция в наш сервер** — из «хорошо бы» это стало обязательным: без
-   неё batch-1 проигран правильно настроенному сопернику в 1.71x.
-2. FP8-состояние DeltaNet: пулы состояния при c=32 берут 2.7 ГБ и поднимают
-   наш пол с 19 до 22 ГБ. Вдвое меньший слот опускает пол и поднимает потолок
-   шага.
-3. Переснять numerics в конфигурации с FlashInfer.
+1. **Speculation in our server** — it went from "nice to have" to mandatory: without
+   it batch 1 is lost to a properly configured rival by 1.71x.
+2. FP8 DeltaNet state: state pools at c=32 take 2.7 GB and raise
+   our floor from 19 to 22 GB. A slot half the size lowers the floor and raises the step
+   ceiling.
+3. Re-measure numerics in the FlashInfer configuration.

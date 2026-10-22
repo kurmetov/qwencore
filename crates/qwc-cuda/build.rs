@@ -1,15 +1,15 @@
-//! Сборка CUDA-кернелов.
+//! Building the CUDA kernels.
 //!
-//! Никаких build-зависимостей: nvcc вызывается напрямую. Целевая архитектура
-//! одна — sm_120a (RTX 5090), это часть специализации движка, а не настройка.
+//! No build dependencies: nvcc is invoked directly. There is one target architecture
+//! — sm_120a (RTX 5090); it's part of the engine's specialization, not a setting.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
-/// Единственная поддерживаемая архитектура. `a` — вариант с
-/// архитектурно-специфичными инструкциями, без него недоступен
-/// block-scaled MMA для NVFP4.
+/// The only supported architecture. `a` is the variant with
+/// architecture-specific instructions; without it
+/// block-scaled MMA for NVFP4 is unavailable.
 const ARCH: &str = "sm_120a";
 
 fn main() {
@@ -21,47 +21,47 @@ fn main() {
     let nvcc = cuda.join("bin/nvcc");
     assert!(
         nvcc.exists(),
-        "не найден nvcc в {}. Задайте CUDA_HOME.",
+        "nvcc not found in {}. Set CUDA_HOME.",
         cuda.display()
     );
 
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     let mut includes: Vec<PathBuf> = Vec::new();
 
-    // CUTLASS используется только как header-only генератор SM120 MMA.
-    // В runtime он не добавляет ни зависимостей, ни скрытых аллокаций.
+    // CUTLASS is used only as a header-only SM120 MMA generator.
+    // At runtime it adds neither dependencies nor hidden allocations.
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let cutlass = manifest.join("../../third_party/cutlass");
     assert!(
         cutlass.join("include/cutlass/cutlass.h").exists(),
-        "не найден vendored CUTLASS в {}",
+        "vendored CUTLASS not found in {}",
         cutlass.display()
     );
     includes.push(cutlass.join("include"));
     includes.push(cutlass.join("tools/util/include"));
 
-    // Баг CUDA 13.1 + glibc >= 2.41: конфликт объявлений rsqrt.
-    // Проверяем компиляцией, а не версией, чтобы обход сам отключился
-    // на CUDA >= 13.3, где NVIDIA это исправила.
+    // CUDA 13.1 + glibc >= 2.41 bug: conflicting rsqrt declarations.
+    // Detected by compiling, not by version, so the workaround turns itself off
+    // on CUDA >= 13.3, where NVIDIA fixed it.
     if !probe_compiles(&nvcc, &out, &[]) {
         let shim = out.join("cuda-shim");
         generate_shim(&cuda, &shim);
         assert!(
             probe_compiles(&nvcc, &out, std::slice::from_ref(&shim)),
-            "не удалось обойти конфликт заголовков CUDA/glibc даже с шимом"
+            "failed to work around the CUDA/glibc header conflict even with the shim"
         );
-        println!("cargo:warning=применён обход бага CUDA/glibc (см. docs/02-toolchain.md)");
+        println!("cargo:warning=applied CUDA/glibc bug workaround (see docs/02-toolchain.md)");
         includes.push(shim);
     }
 
     let sources: Vec<PathBuf> = fs::read_dir("cuda")
-        .expect("нет каталога cuda/")
+        .expect("no cuda/ directory")
         .filter_map(|e| {
             let p = e.ok()?.path();
             (p.extension()? == "cu").then_some(p)
         })
         .collect();
-    assert!(!sources.is_empty(), "в cuda/ нет ни одного .cu");
+    assert!(!sources.is_empty(), "no .cu files in cuda/");
 
     let lib = out.join("libqwc_kernels.a");
     let mut cmd = Command::new(&nvcc);
@@ -71,7 +71,7 @@ fn main() {
         .arg("--lib")
         .arg("-Xcompiler")
         .arg("-fPIC")
-        // 20012/20014: __host__/__device__ на defaulted-функциях в CUTLASS.
+        // 20012/20014: __host__/__device__ on defaulted functions in CUTLASS.
         .args(["-diag-suppress", "20012,20014"])
         .arg("--expt-relaxed-constexpr");
     for inc in &includes {
@@ -79,8 +79,8 @@ fn main() {
     }
     cmd.arg("-o").arg(&lib).args(&sources);
 
-    let status = cmd.status().expect("не удалось запустить nvcc");
-    assert!(status.success(), "nvcc завершился с ошибкой");
+    let status = cmd.status().expect("failed to launch nvcc");
+    assert!(status.success(), "nvcc failed");
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=qwc_kernels");
@@ -101,10 +101,10 @@ fn cuda_root() -> PathBuf {
             return PathBuf::from(c);
         }
     }
-    panic!("не найден CUDA toolkit; задайте CUDA_HOME");
+    panic!("CUDA toolkit not found; set CUDA_HOME");
 }
 
-/// Компилирует пробник, который включает проблемные заголовки.
+/// Compiles a probe that includes the problematic headers.
 fn probe_compiles(nvcc: &Path, out: &Path, includes: &[PathBuf]) -> bool {
     let src = out.join("probe.cu");
     fs::write(
@@ -121,10 +121,10 @@ fn probe_compiles(nvcc: &Path, out: &Path, includes: &[PathBuf]) -> bool {
     cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }
 
-/// Теневое дерево include: симлинки на настоящий toolkit плюс одна
-/// пропатченная копия crt/math_functions.h. Работает потому, что CUDA
-/// подключает его как "crt/math_functions.h" — относительно каталога
-/// включающего файла, а он здесь наш.
+/// A shadow include tree: symlinks to the real toolkit plus one
+/// patched copy of crt/math_functions.h. Works because CUDA
+/// includes it as "crt/math_functions.h" — relative to the directory
+/// of the including file, which here is ours.
 fn generate_shim(cuda: &Path, shim: &Path) {
     let inc = cuda.join("targets/x86_64-linux/include");
     let _ = fs::remove_dir_all(shim);
@@ -157,7 +157,7 @@ fn generate_shim(cuda: &Path, shim: &Path) {
         );
     assert!(
         patched.contains("rsqrt(double x) noexcept;"),
-        "патч не применился: заголовок CUDA изменился"
+        "patch didn't apply: the CUDA header changed"
     );
     fs::write(shim.join("crt/math_functions.h"), patched).unwrap();
 }

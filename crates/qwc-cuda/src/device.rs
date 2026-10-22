@@ -1,12 +1,12 @@
-//! Свойства устройства. Значения читаются с железа, а не берутся из паспорта:
-//! знаменатель в метрике «доля достигнутой пропускной способности» должен быть
-//! измеримым, иначе метрика бессмысленна.
+//! Device properties. Values are read from the hardware, not taken from the spec:
+//! the denominator in the "share of achieved bandwidth" metric must be
+//! measurable, otherwise the metric is meaningless.
 
 use crate::error::{Result, check};
 use crate::ffi;
 use std::ffi::c_int;
 
-// Значения из driver_types.h.
+// Values from driver_types.h.
 const ATTR_CLOCK_RATE: c_int = 13;
 const ATTR_SM_COUNT: c_int = 16;
 const ATTR_MEMORY_CLOCK_RATE: c_int = 36;
@@ -25,8 +25,8 @@ pub struct Device {
     pub l2_bytes: u64,
     pub max_threads_per_sm: u32,
     pub max_registers_per_sm: u32,
-    /// Потолок shared memory на блок при явном запросе. Для sm_120 — 99 KB,
-    /// вчетверо меньше датацентрового Blackwell. Определяет тайл attention.
+    /// Shared memory cap per block on explicit opt-in. For sm_120 it's 99 KB,
+    /// four times less than datacenter Blackwell. Determines the attention tile.
     pub max_shared_mem_optin: u32,
 }
 
@@ -50,12 +50,12 @@ impl Device {
         })
     }
 
-    /// Паспортный пик: удвоенная частота памяти на ширину шины.
+    /// Spec peak: double the memory clock times the bus width.
     pub fn peak_bandwidth(&self) -> f64 {
         2.0 * self.memory_clock_hz * (self.memory_bus_bits as f64 / 8.0)
     }
 
-    /// Свободно и всего байт VRAM.
+    /// Free and total VRAM bytes.
     pub fn mem_info() -> Result<(u64, u64)> {
         let (mut free, mut total) = (0usize, 0usize);
         check(unsafe { ffi::cudaMemGetInfo(&mut free, &mut total) })?;

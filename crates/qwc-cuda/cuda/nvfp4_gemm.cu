@@ -1,16 +1,16 @@
 // SM120 block-scaled NVFP4 GEMM.
 //
 // A: [M,K] row-major packed E2M1, B: [K,N] column-major packed E2M1.
-// Физический B совпадает с checkpoint [N,K] row-major, поэтому 4-битные
-// веса не репакуются. SFA/SFB обязаны быть в CUTLASS 128x4 layout.
+// Physical B matches the checkpoint's [N,K] row-major, so the 4-bit
+// weights aren't repacked. SFA/SFB must be in the CUTLASS 128x4 layout.
 //
-// Две инстанции, выбор по форме задачи. Тайл 128x128 нарезает выход на
-// ceil(M/128) * ceil(N/128) блоков, и на узких по N проекциях их меньше, чем
-// SM: down_proj [5120, 17408] при M<=128 даёт 40 блоков на 170 SM и стоит
-// намертво на 780 GB/s при любом batch, тогда как gate_proj той же массы
-// весов берёт 1335. Когда блоков меньше, чем SM, задача режется по K
-// stream-K-планировщиком; ping-pong его не поддерживает, поэтому вторая
-// инстанция идёт на cooperative.
+// Two instances, chosen by problem shape. A 128x128 tile cuts the output into
+// ceil(M/128) * ceil(N/128) blocks, and on projections narrow in N there are fewer than
+// SMs: down_proj [5120, 17408] at M<=128 gives 40 blocks on 170 SMs and is stuck
+// at 780 GB/s at any batch, while gate_proj with the same weight mass
+// gets 1335. When there are fewer blocks than SMs, the problem is split along K
+// by the stream-K scheduler; ping-pong doesn't support it, so the second
+// instance uses cooperative.
 
 #include <cuda_runtime.h>
 
@@ -153,10 +153,10 @@ static int sm_count() {
   return cached;
 }
 
-// Узкой задача считается тогда, когда тайлов выхода вдвое меньше, чем SM.
-// Порог именно с запасом: ровно на границе stream-K уже проигрывает ping-pong
-// (замер down при M=512 — 78.3 против 76.4 us), потому что редукция стоит
-// дороже, чем добавленная занятость.
+// A problem counts as narrow when there are half as many output tiles as SMs.
+// The threshold has margin on purpose: right at the boundary stream-K already loses to ping-pong
+// (down measured at M=512 — 78.3 vs 76.4 us), because the reduction costs
+// more than the added occupancy.
 static bool is_narrow(int m, int n) {
   const int tiles = ((m + kTileM - 1) / kTileM) * ((n + kTileN - 1) / kTileN);
   return tiles * 2 <= sm_count();
@@ -205,8 +205,8 @@ extern "C" cudaError_t qwc_nvfp4_w4a4_workspace_size(
   if (bytes == nullptr || m <= 0 || n <= 0 || k <= 0) {
     return cudaErrorInvalidValue;
   }
-  // Максимум по обеим инстанциям: буфер выделяется один раз на форму, а
-  // выбор между ними делается на каждом запуске.
+  // Max over both instances: the buffer is allocated once per shape, while
+  // the choice between them is made on every launch.
   using Wide = qwc::nvfp4_gemm::Wide;
   using Narrow = qwc::nvfp4_gemm::Narrow;
   const size_t wide = Wide::Gemm::get_workspace_size(

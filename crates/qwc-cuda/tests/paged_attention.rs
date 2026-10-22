@@ -198,33 +198,33 @@ fn bf16_cache_matches_cpu_for_direct_and_split_contexts() {
     }
 }
 
-/// Тайл строк префилла должен совпасть с построчным decode: каждая строка
-/// видит ровно свой причинный префикс, а общий проход по KV не должен
-/// смешивать строки между собой.
+/// A tile of prefill rows must match row-wise decode: each row
+/// sees exactly its own causal prefix, and the shared KV pass must not
+/// mix rows with each other.
 #[test]
 fn prefill_tile_matches_rowwise_decode() {
-    // Строк больше, чем варпов в блоке, чтобы проверить и неполный хвостовой
-    // тайл, и границу страницы внутри одного тайла.
+    // More rows than warps in a block, to check both an incomplete tail
+    // tile and a page boundary inside one tile.
     for rows in [19usize, 127, 200] {
         prefill_case(rows, PrefillKernel::Tiled, 0);
     }
 }
 
-/// То же для ядра на тензорных ядрах: причинность, порядок страниц, неполный
-/// хвостовой тайл и граница страницы внутри тайла.
+/// The same for the tensor-core kernel: causality, page order, an incomplete
+/// tail tile and a page boundary inside a tile.
 #[test]
 fn prefill_mma_matches_rowwise_decode() {
-    // 601 строк — это 19 KV-тайлов и контекст длиннее чанка префилла: ровно
-    // та форма, на которой сквозной eval разошёлся.
+    // 601 rows is 19 KV tiles and a context longer than the prefill chunk: exactly
+    // the shape on which the end-to-end eval diverged.
     for rows in [19usize, 127, 200, 601] {
         prefill_case(rows, PrefillKernel::Mma, 0);
     }
 }
 
-/// Чанк во всю арену: 2048 строк — это 128 тайлов запроса и контекст вдвое
-/// длиннее всего, что проверяют случаи выше. CPU-эталон на такой форме считался
-/// бы минутами, поэтому арбитром здесь работает тайловое ядро: оно сверено с
-/// CPU на малых формах, а тут проверяется только счёт строк.
+/// A chunk filling the whole arena: 2048 rows is 128 query tiles and a context twice
+/// as long as anything the cases above check. A CPU reference on this shape would take
+/// minutes, so the tiled kernel acts as the arbiter here: it's checked against
+/// CPU on small shapes, and here only the row computation is checked.
 #[test]
 fn prefill_mma_matches_the_tiled_kernel_on_a_full_arena_chunk() {
     const ROWS: usize = 2048;
@@ -282,7 +282,7 @@ fn prefill_mma_matches_the_tiled_kernel_on_a_full_arena_chunk() {
         let (a, b) = (bf16::to_f32(a), bf16::to_f32(b));
         assert!(
             (a - b).abs() <= 0.004 + b.abs() * 0.02,
-            "строка {}, индекс {index}: MMA={a}, тайловое={b}",
+            "row {}, index {index}: MMA={a}, tiled={b}",
             index / (NUM_ATTN_HEADS * ATTN_HEAD_DIM)
         );
     }
@@ -294,9 +294,9 @@ enum PrefillKernel {
     Mma,
 }
 
-/// Второй и последующие чанки промпта: строки те же, а причинный префикс у
-/// них начинается не с единицы. В движке эта форма встречается на любом
-/// промпте длиннее чанка, и ни один тест её раньше не покрывал.
+/// The second and following prompt chunks: the rows are the same, but their causal prefix
+/// doesn't start at one. In the engine this shape occurs on any
+/// prompt longer than a chunk, and no test covered it before.
 #[test]
 fn prefill_mma_matches_rowwise_decode_on_a_later_chunk() {
     for (rows, start) in [(89usize, 512usize), (16, 512), (200, 1024)] {
@@ -323,8 +323,8 @@ fn prefill_case(rows: usize, kernel: PrefillKernel, context_start: usize) {
         .map(|index| value_codes[(index * 3 + index / 17) % value_codes.len()])
         .collect();
 
-    // Одна последовательность: таблица блоков у всех строк одна и та же.
-    // Порядок страниц перевёрнут, чтобы тест нельзя было пройти, игнорируя её.
+    // One sequence: all rows share the same block table.
+    // The page order is reversed so the test can't be passed by ignoring it.
     let one_table: Vec<u32> = (0..max_blocks as u32).rev().collect();
     let block_tables: Vec<u32> = (0..ROWS).flat_map(|_| one_table.clone()).collect();
 
@@ -394,15 +394,15 @@ fn prefill_case(rows: usize, kernel: PrefillKernel, context_start: usize) {
         let expected = reference / (1.0 + (-raw).exp());
         assert!(
             (actual - expected).abs() <= 0.004 + expected.abs() * 0.004,
-            "строка {}, индекс {index}: GPU={actual}, CPU={expected}",
+            "row {}, index {index}: GPU={actual}, CPU={expected}",
             index / (NUM_ATTN_HEADS * ATTN_HEAD_DIM)
         );
     }
 }
 
-/// Тот же вход, но прежним путём: decode-ядро на строках префилла. Если оно
-/// с эталоном не сходится, значит расхождение в eval — не регресс нового
-/// ядра, а исправление старого.
+/// The same input, but via the old path: the decode kernel on prefill rows. If it
+/// doesn't match the reference, then the divergence in eval is not a regression of the new
+/// kernel but a fix of the old one.
 #[test]
 fn rowwise_decode_on_prefill_rows_matches_cpu() {
     const ROWS: usize = 19;
@@ -477,14 +477,14 @@ fn rowwise_decode_on_prefill_rows_matches_cpu() {
     let reference = expected[worst_index];
     assert!(
         worst <= 0.004 + reference.abs() * 0.004,
-        "строка {}, индекс {worst_index}: расхождение {worst}, эталон {reference}",
+        "row {}, index {worst_index}: divergence {worst}, reference {reference}",
         worst_index / (NUM_ATTN_HEADS * ATTN_HEAD_DIM)
     );
 }
 
-/// Прямое сравнение путей между собой: эталон обоих устраивает с допуском,
-/// но движок гоняет через 64 слоя, и важно, насколько они расходятся друг с
-/// другом, а не насколько каждый близок к CPU.
+/// A direct comparison of the paths with each other: the reference accepts both within tolerance,
+/// but the engine runs them through 64 layers, and what matters is how much they diverge from each
+/// other, not how close each is to the CPU.
 #[test]
 fn prefill_tile_and_rowwise_decode_agree_within_bf16() {
     for bf16_cache in [false, true] {
@@ -534,9 +534,9 @@ fn agreement_case(bf16_cache: bool) {
     .unwrap();
 
     let mut rowwise = DeviceBuffer::<u16>::zeroed(query.len()).unwrap();
-    // Движок создаёт workspace под сконфигурированный максимум контекста, а не
-    // под фактический, поэтому на коротком промпте старый путь всё равно шёл
-    // через партиционированное ядро. Воспроизводим именно это.
+    // The engine creates the workspace for the configured max context, not
+    // the actual one, so on a short prompt the old path still went
+    // through the partitioned kernel. We reproduce exactly that.
     let mut workspace = PagedAttentionWorkspace::new(ROWS, 4096).unwrap();
     paged_attention::decode_gated(
         &device_query, &device_gate, &device_key, &device_value, num_blocks,
@@ -557,19 +557,19 @@ fn agreement_case(bf16_cache: bool) {
         }
     }
     println!(
-        "bf16_cache={bf16_cache}: макс. расхождение путей {worst:.3e}, строка {}, канал {}",
+        "bf16_cache={bf16_cache}: max path divergence {worst:.3e}, row {}, channel {}",
         worst_index / (NUM_ATTN_HEADS * ATTN_HEAD_DIM),
         worst_index % ATTN_HEAD_DIM
     );
-    assert!(worst < 0.02, "пути разошлись на {worst}");
+    assert!(worst < 0.02, "paths diverged by {worst}");
 }
 
-/// Кто ближе к эталону на форме, где движок показал расхождение: мало строк,
-/// короткий контекст, а workspace создан под сконфигурированный максимум,
-/// поэтому старый путь дробит контекст на партиции и сливает их.
-/// Точность ядра на тензорных ядрах против построчного decode на общем
-/// fp32-эталоне. P округляется до bf16 перед PV, поэтому важно не «совпадает
-/// ли», а «не хуже ли» — и на длинном контексте тоже.
+/// Who is closer to the reference on the shape where the engine showed a divergence: few rows,
+/// short context, and the workspace created for the configured max,
+/// so the old path splits the context into partitions and merges them.
+/// Accuracy of the tensor-core kernel vs row-wise decode against a shared
+/// fp32 reference. P is rounded to bf16 before PV, so what matters is not "does it
+/// match" but "is it no worse" — on long context too.
 #[test]
 fn prefill_mma_is_not_less_accurate_than_rowwise_decode() {
     for rows in [63usize, 200, 601] {
@@ -633,10 +633,10 @@ fn prefill_mma_is_not_less_accurate_than_rowwise_decode() {
             mma_error = mma_error.max((x - expected[index]).abs());
             row_error = row_error.max((y - expected[index]).abs());
         }
-        println!("строк {rows:3}: ошибка MMA {mma_error:.3e}, построчного {row_error:.3e}");
+        println!("rows {rows:3}: MMA error {mma_error:.3e}, row-wise {row_error:.3e}");
         assert!(
             mma_error <= row_error * 4.0 + 1e-3,
-            "строк {rows}: MMA {mma_error:.3e} против построчного {row_error:.3e}"
+            "rows {rows}: MMA {mma_error:.3e} vs row-wise {row_error:.3e}"
         );
     }
 }
@@ -707,25 +707,25 @@ fn prefill_tile_is_not_less_accurate_than_rowwise_decode() {
             between = between.max((x - y).abs());
         }
         println!(
-            "строк {rows:3}: партиций {}, ошибка тайла {tile_error:.3e}, \
-             ошибка построчного {row_error:.3e}, между собой {between:.3e}",
+            "rows {rows:3}: partitions {}, tile error {tile_error:.3e}, \
+             row-wise error {row_error:.3e}, between them {between:.3e}",
             workspace.partitions()
         );
         assert!(
             tile_error <= row_error * 1.5 + 1e-6,
-            "тайловый путь хуже эталона: {tile_error} против {row_error}"
+            "the tiled path is worse than the reference: {tile_error} vs {row_error}"
         );
     }
 }
 
 #[test]
 fn workspace_partitions_follow_actual_rows() {
-    // Исполнитель на 32 слота и 32K: одиночный decode обязан разбить
-    // контекст по партициям, а не идти одной, как полный batch.
+    // A 32-slot, 32K executor: a single decode must split
+    // the context into partitions rather than go with one, like a full batch.
     let workspace = PagedAttentionWorkspace::new(32, 32_768).unwrap();
     let (_, single) = workspace.plan_for(1);
     let (_, full) = workspace.plan_for(32);
-    assert!(single > 1, "batch 1 идёт {single} партицией");
+    assert!(single > 1, "batch 1 runs with {single} partition");
     assert_eq!(full, 1);
     let alone = PagedAttentionWorkspace::new(1, 32_768).unwrap();
     assert_eq!(workspace.plan_for(1), alone.plan_for(1));
@@ -733,7 +733,7 @@ fn workspace_partitions_follow_actual_rows() {
 
 #[test]
 fn oversized_workspace_matches_exact_one_bit_for_bit() {
-    // Разметка по фактическим строкам: ответ не зависит от ёмкости workspace.
+    // Sizing by actual rows: the answer doesn't depend on workspace capacity.
     const CONTEXT: usize = 4_096;
     let max_blocks = CONTEXT.div_ceil(PAGE_SIZE);
     let cache_elements = max_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
@@ -763,11 +763,11 @@ fn oversized_workspace_matches_exact_one_bit_for_bit() {
     assert_eq!(run(1), run(32));
 }
 
-/// Входы упакованного ядра на арене в `arena` строк.
+/// Packed kernel inputs on an arena of `arena` rows.
 ///
-/// V зависит от номера физической страницы, K псевдослучайны: веса
-/// неравномерны, и потерянная партиция или чужая таблица страниц сдвигают
-/// выход заметно, а не на шум.
+/// V depends on the physical page number, K is pseudorandom: weights are
+/// non-uniform, and a lost partition or a foreign page table shifts
+/// the output noticeably, not by noise.
 struct PackedInputs {
     query: Vec<u16>,
     query_gate: Vec<u16>,
@@ -808,8 +808,8 @@ fn packed_inputs(arena: usize, num_blocks: usize) -> PackedInputs {
     PackedInputs { query, query_gate, key_cache, value_cache }
 }
 
-/// Упакованное ядро на строках `row_base..row_base + rows` арены. Возвращает
-/// выход всей арены и CPU-эталон с гейтом.
+/// The packed kernel on rows `row_base..row_base + rows` of the arena. Returns
+/// the output of the whole arena and a CPU reference with the gate.
 #[allow(clippy::too_many_arguments)]
 fn run_packed(
     inputs: &PackedInputs,
@@ -849,8 +849,8 @@ fn run_packed(
     output.to_vec().unwrap()
 }
 
-/// Сверка строк `row_base..row_base + rows` с CPU-эталоном; строки вне
-/// сегмента должны остаться нулями.
+/// Checks rows `row_base..row_base + rows` against the CPU reference; rows outside
+/// the segment must stay zero.
 #[allow(clippy::too_many_arguments)]
 fn check_packed_against_cpu(
     label: &str,
@@ -874,7 +874,7 @@ fn check_packed_against_cpu(
         let row = index / width;
         let actual = bf16::to_f32(value);
         if row < row_base || row >= row_base + rows {
-            assert_eq!(value, 0, "{label}: задета строка {row} вне сегмента");
+            assert_eq!(value, 0, "{label}: row {row} outside the segment was touched");
             continue;
         }
         let raw = bf16::to_f32(
@@ -886,16 +886,16 @@ fn check_packed_against_cpu(
         worst = worst.max((actual - expected).abs());
         assert!(
             (actual - expected).abs() <= 0.004 + expected.abs() * 0.004,
-            "{label}: строка {row}, голова {}, канал {}: GPU={actual}, CPU={expected}",
+            "{label}: row {row}, head {}, channel {}: GPU={actual}, CPU={expected}",
             index / ATTN_HEAD_DIM % NUM_ATTN_HEADS,
             index % ATTN_HEAD_DIM
         );
     }
-    println!("{label}: макс. ошибка {worst:.3e}");
+    println!("{label}: max error {worst:.3e}");
 }
 
-/// Сегмент одной последовательности за историей `start`, после `row_base`
-/// чужих однострочных строк.
+/// A segment of one sequence after a `start` history, after `row_base`
+/// foreign single rows.
 fn packed_segment_case(
     rows: usize,
     start: usize,
@@ -917,40 +917,40 @@ fn packed_segment_case(
         &inputs, &contexts, &tables, num_blocks, max_blocks, PackedShape::Segment, rows,
         row_base, partitions, host_context.unwrap_or(max_context),
     );
-    let label = format!("сегмент {rows} строк на {start}, P={partitions:?}");
+    let label = format!("segment of {rows} rows at {start}, P={partitions:?}");
     check_packed_against_cpu(&label, &inputs, &contexts, &tables, max_blocks, rows, row_base, &actual);
 }
 
 #[test]
 fn packed_segment_matches_cpu() {
-    // Проверка трёх черновиков за длинной историей после decode-строк арены.
+    // Verifying three drafts after a long history, after the arena's decode rows.
     packed_segment_case(4, 6_000, 3, None, None);
-    // Одна строка, число партиций не делит контекст.
+    // One row, the number of partitions doesn't divide the context.
     packed_segment_case(1, 3_000, 0, Some(7), None);
-    // Партиций больше 32: редукция берёт веса второй порцией дорожек.
+    // More than 32 partitions: the reduction takes weights with a second batch of lanes.
     packed_segment_case(1, 3_000, 0, Some(45), None);
-    // Две и пять строк: тайлы на 16 и 32 упакованные строки.
+    // Two and five rows: tiles of 16 and 32 packed rows.
     packed_segment_case(2, 700, 1, None, None);
     packed_segment_case(5, 1_000, 0, Some(3), None);
-    // Хвост промпта: тайлы по десять строк, у первых строк поздние партиции
-    // пусты, и последний тайл неполный.
+    // Prompt tail: tiles of ten rows, the first rows have empty late partitions,
+    // and the last tile is incomplete.
     packed_segment_case(203, 150, 5, Some(4), None);
-    // Без разбиения, причинный край внутри тайла и внутри страницы.
+    // No splitting, the causal edge inside a tile and inside a page.
     packed_segment_case(130, 0, 0, Some(1), None);
 }
 
 #[test]
 fn packed_segment_survives_an_underestimated_context() {
-    // Хост недооценил контекст: последняя партиция всё равно доходит до
-    // конца причинного префикса.
+    // The host underestimated the context: the last partition still reaches
+    // the end of the causal prefix.
     packed_segment_case(4, 4_000, 0, Some(4), Some(2_000));
 }
 
 #[test]
 fn packed_decode_rows_use_their_own_tables_and_contexts() {
-    // Decode-строки разных последовательностей: у каждой своя перестановка
-    // страниц и свой контекст, включая неполные страницы и одну строку в
-    // один токен.
+    // Decode rows of different sequences: each has its own page permutation
+    // and its own context, including incomplete pages and a single row of
+    // one token.
     let contexts: Vec<u32> = vec![1, 63, 64, 65, 3_000, 777, 4_096];
     let arena = contexts.len();
     let max_context = *contexts.iter().max().unwrap() as usize;
@@ -967,13 +967,13 @@ fn packed_decode_rows_use_their_own_tables_and_contexts() {
             &inputs, &contexts, &tables, num_blocks, max_blocks, PackedShape::Rows, arena, 0,
             partitions, max_context,
         );
-        let label = format!("decode {arena} строк, P={partitions:?}");
+        let label = format!("decode {arena} rows, P={partitions:?}");
         check_packed_against_cpu(&label, &inputs, &contexts, &tables, max_blocks, arena, 0, &actual);
     }
 }
 
-/// Прежнее MMA-ядро и упакованное на общей форме; эталон на CPU здесь
-/// слишком дорог.
+/// The old MMA kernel and the packed one on a common shape; a CPU reference here is
+/// too expensive.
 fn packed_matches_unsplit(rows: usize, start: usize) {
     let contexts: Vec<u32> = (0..rows).map(|row| (start + row + 1) as u32).collect();
     let max_context = *contexts.iter().max().unwrap() as usize;
@@ -1011,13 +1011,13 @@ fn packed_matches_unsplit(rows: usize, start: usize) {
     for (index, (&a, &b)) in packed.iter().zip(&unsplit).enumerate() {
         let (a, b) = (bf16::to_f32(a), bf16::to_f32(b));
         worst = worst.max((a - b).abs());
-        // Прежнее ядро округляет P до bf16, упакованное — до f16.
+        // The old kernel rounds P to bf16, the packed one to f16.
         assert!(
             (a - b).abs() <= 0.004 + b.abs() * 0.012,
-            "{rows} строк на {start}, индекс {index}: упакованное={a}, прежнее={b}"
+            "{rows} rows at {start}, index {index}: packed={a}, old={b}"
         );
     }
-    println!("{rows} строк на {start}: макс. расхождение с прежним ядром {worst:.3e}");
+    println!("{rows} rows at {start}: max divergence from the old kernel {worst:.3e}");
 }
 
 #[test]
@@ -1030,10 +1030,10 @@ fn packed_matches_unsplit_on_a_full_chunk() {
     packed_matches_unsplit(2_048, 1_000);
 }
 
-/// Острый softmax: K до ±4, q до ±2, скоры порядка единиц. На тестовых кэшах
-/// выше скоры сотые, softmax почти равномерный, и выход — среднее V при любой
-/// ошибке в QK: перепутанная раскладка измерений там бы не упала. Допуск —
-/// доля наибольшего элемента эталона, а не абсолют.
+/// Sharp softmax: K up to ±4, q up to ±2, scores of order one. On the test caches
+/// above scores are hundredths, softmax is nearly uniform, and the output is the mean of V for any
+/// QK error: a mixed-up dim layout wouldn't fail there. Tolerance is
+/// a fraction of the reference's largest element, not absolute.
 #[test]
 fn packed_matches_cpu_on_a_sharp_softmax() {
     for (rows, start, partitions) in [
@@ -1044,8 +1044,8 @@ fn packed_matches_cpu_on_a_sharp_softmax() {
         (8, 200, Some(1)),
         (130, 0, Some(1)),
         (130, 500, Some(3)),
-        // Разбитые формы движка: частичные выходы в f16 сводит редукция,
-        // и у партиций острого softmax сильно разные максимумы.
+        // The engine's split shapes: partial outputs in f16 are merged by the reduction,
+        // and partitions of a sharp softmax have very different maxima.
         (8, 3_000, Some(40)),
         (64, 3_000, Some(7)),
     ] {
@@ -1092,8 +1092,8 @@ fn packed_matches_cpu_on_a_sharp_softmax() {
             .zip(&gated)
             .map(|(&value, &expected)| (bf16::to_f32(value) - expected).abs())
             .fold(0.0f32, f32::max);
-        println!("{rows} строк на {start}, P={partitions:?}: ошибка {worst:.2e} при масштабе {scale:.3}");
-        // Округление выхода до bf16 — 0.4% элемента; наблюдалось до 0.3% масштаба.
-        assert!(worst <= scale * 0.006, "{rows} строк на {start}: {worst} при масштабе {scale}");
+        println!("{rows} rows at {start}, P={partitions:?}: error {worst:.2e} at scale {scale:.3}");
+        // Rounding the output to bf16 is 0.4% of an element; observed up to 0.3% of scale.
+        assert!(worst <= scale * 0.006, "{rows} rows at {start}: {worst} at scale {scale}");
     }
 }

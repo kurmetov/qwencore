@@ -1,4 +1,4 @@
-//! Рантайм движка: управление кэшем, планирование, батчинг.
+//! The engine runtime: cache management, scheduling, batching.
 
 pub mod cache;
 pub mod layout;

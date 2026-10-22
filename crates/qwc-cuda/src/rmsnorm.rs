@@ -23,8 +23,8 @@ impl RmsNorm {
         })
     }
 
-    /// RMSNorm в BF16. Если передан residual, сначала выполняется
-    /// residual = BF16(residual + input), и нормируется именно округлённая сумма.
+    /// RMSNorm in BF16. If a residual is passed, first
+    /// residual = BF16(residual + input) is computed, and it's the rounded sum that gets normalized.
     pub fn forward_bf16(
         &self,
         input: &DeviceBuffer<u16>,
@@ -56,7 +56,7 @@ impl RmsNorm {
     }
 
     /// Fused residual-add + RMSNorm + dynamic NVFP4 quantization.
-    /// Нормализованный BF16-тензор не материализуется в VRAM.
+    /// The normalized BF16 tensor isn't materialized in VRAM.
     pub fn forward_nvfp4(
         &self,
         input: &DeviceBuffer<u16>,

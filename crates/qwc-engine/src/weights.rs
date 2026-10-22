@@ -1,9 +1,9 @@
-//! Подъём весов чекпоинта в VRAM.
+//! Loading checkpoint weights into VRAM.
 //!
-//! Загрузчик не «подстраивается» под чекпоинт: формы и типы берутся из
-//! `qwc_model::names` и `qwc_core::arch`, а расхождение — ошибка загрузки.
-//! Страницы mmap вытесняются после каждого слоя, поэтому host-RAM держится
-//! на уровне одного слоя, а не всего чекпоинта.
+//! The loader doesn't "adapt" to the checkpoint: shapes and types come from
+//! `qwc_model::names` and `qwc_core::arch`, and a mismatch is a load error.
+//! mmap pages are evicted after every layer, so host RAM stays
+//! at the level of one layer rather than the whole checkpoint.
 
 use qwc_core::arch::*;
 use qwc_cuda::attention_prepare::AttentionPreprocessor;
@@ -17,8 +17,8 @@ use qwc_model::names;
 use qwc_model::safetensors::StDtype;
 use std::collections::HashMap;
 
-/// Квантованная проекция вместе с масштабом квантизации активаций: он нужен
-/// только W4A4-пути, но принадлежит той же паре весов.
+/// A quantized projection together with the activation quantization scale: it's needed
+/// only by the W4A4 path, but belongs to the same weight pair.
 pub struct Projection {
     pub linear: Linear,
     pub input_global_scale: f32,
@@ -37,36 +37,36 @@ pub struct Mlp {
     pub down: Projection,
 }
 
-/// Full-attention слой. `q_proj` выдаёт [q; выходной гейт] одной проекцией.
+/// Full-attention layer. `q_proj` produces [q; output gate] in one projection.
 pub struct FullAttention {
     pub q: Projection,
     pub k: Projection,
     pub v: Projection,
     pub o: Projection,
-    /// QK-норма на голову, частичный RoPE и запись FP8-страниц KV.
+    /// Per-head QK norm, partial RoPE and writing FP8 KV pages.
     pub prepare: AttentionPreprocessor,
 }
 
-/// Ширина слитой входной проекции миксера и смещения её частей.
+/// Width of the fused mixer input projection and offsets of its parts.
 ///
-/// qkv, z, a и b читают один и тот же вход, а их global scales совпадают во
-/// всех слоях чекпоинта — склейка точна, не приближённа. Порознь они дают
-/// четыре запуска на слой, из них два по N=48: при тайле 128 это один блок на
-/// 170 SM, и две крошечные проекции стоили дороже, чем qkv и z вместе.
+/// qkv, z, a and b read the same input, and their global scales match in
+/// all layers of the checkpoint — the concatenation is exact, not approximate. Separately they give
+/// four launches per layer, two of them with N=48: with a 128 tile that's one block on
+/// 170 SMs, and the two tiny projections cost more than qkv and z together.
 pub const MIXER_GATE_WIDTH: usize = LA_NUM_V_HEADS;
 pub const MIXER_Z_OFFSET: usize = LA_CONV_CHANNELS;
 pub const MIXER_A_OFFSET: usize = MIXER_Z_OFFSET + LA_V_PROJ_DIM;
 pub const MIXER_B_OFFSET: usize = MIXER_A_OFFSET + MIXER_GATE_WIDTH;
 pub const MIXER_FUSED_WIDTH: usize = MIXER_B_OFFSET + MIXER_GATE_WIDTH;
 
-/// Gated DeltaNet слой.
+/// Gated DeltaNet layer.
 pub struct LinearAttention {
-    /// Слитая [MIXER_FUSED_WIDTH, HIDDEN_SIZE]: qkv, z, a, b подряд.
+    /// Fused [MIXER_FUSED_WIDTH, HIDDEN_SIZE]: qkv, z, a, b in a row.
     pub in_proj: Projection,
     pub out: Projection,
-    /// conv1d + SiLU, L2-норма q/k, alpha/beta.
+    /// conv1d + SiLU, L2 norm of q/k, alpha/beta.
     pub prepare: DeltaPreprocessor,
-    /// RMSNormGated по v_head_dim: вес прямой, единица не добавляется.
+    /// RMSNormGated over v_head_dim: the weight is direct, no one is added.
     pub output_norm: DeltaOutputNorm,
 }
 
@@ -91,13 +91,13 @@ impl LayerWeights {
     }
 }
 
-/// Веса всех 64 слоёв, финальная норма и словарные матрицы в FP8.
+/// Weights of all 64 layers, the final norm and the vocab matrices in FP8.
 ///
-/// MTP-голова сюда не входит: она нужна только спекулятивному декодированию.
+/// The MTP head isn't included: it's only needed for speculative decoding.
 pub struct ModelWeights {
     pub layers: Vec<LayerWeights>,
     pub final_norm: RmsNorm,
-    /// Таблица эмбеддингов: BF16 в чекпоинте, E4M3 со шкалой на строку у нас.
+    /// Embedding table: BF16 in the checkpoint, E4M3 with a per-row scale here.
     pub embed: Embedding,
     pub lm_head: LmHead,
     decode_linear_mode: DecodeLinearMode,
@@ -224,8 +224,8 @@ impl LmHead {
         }
     }
 
-    /// Логиты только по строкам из `row_ids`. Есть лишь у FP8-головы:
-    /// BF16-путь — диагностический, и шортлист там незачем.
+    /// Logits only for the rows in `row_ids`. Only the FP8 head has this:
+    /// the BF16 path is diagnostic, and a shortlist has no point there.
     pub fn logits_subset(
         &self,
         hidden: &DeviceBuffer<u16>,
@@ -275,11 +275,11 @@ impl LmHead {
 pub struct LoadStats {
     pub layers: usize,
     pub projections: usize,
-    /// Упакованные веса вместе с переставленной scale-матрицей.
+    /// Packed weights together with the permuted scale matrix.
     pub quantized_bytes: usize,
-    /// Нормы, conv1d, A_log, dt_bias.
+    /// Norms, conv1d, A_log, dt_bias.
     pub plain_bytes: usize,
-    /// `embed_tokens` и `lm_head` после перевода в FP8.
+    /// `embed_tokens` and `lm_head` after conversion to FP8.
     pub vocab_bytes: usize,
 }
 
@@ -301,8 +301,8 @@ impl ModelWeights {
         Self::load_with_progress_config(checkpoint, config, |_, _| {})
     }
 
-    /// `on_layer` вызывается после подъёма каждого слоя: загрузка идёт
-    /// десятки секунд, и молчащий процесс на 14 GB неотличим от зависшего.
+    /// `on_layer` is called after each layer is loaded: loading takes
+    /// tens of seconds, and a silent 14 GB process is indistinguishable from a hung one.
     pub fn load_with_progress(
         checkpoint: &Checkpoint,
         on_layer: impl FnMut(usize, LoadStats),
@@ -325,15 +325,15 @@ impl ModelWeights {
                 &mut stats,
             )?);
             stats.layers += 1;
-            // Страницы уже скопированы в VRAM: держать их в working set незачем.
+            // The pages are already copied to VRAM: no reason to keep them in the working set.
             checkpoint.evict_file_pages()?;
             on_layer(index, stats);
         }
 
         let final_norm = load_norm(checkpoint, names::FINAL_NORM, HIDDEN_SIZE, &mut stats)?;
 
-        // Словарные матрицы идут последними: они самые большие на диске и
-        // после них вытеснять уже нечего.
+        // The vocab matrices go last: they're the largest on disk and
+        // after them there's nothing left to evict.
         let stream = Stream::new()?;
         let embed = match config.embedding {
             EmbeddingDtype::Fp8 => {
@@ -383,7 +383,7 @@ fn load_layer(
     let mut projection = |name: &str| -> Result<Projection, LoadError> {
         projections
             .remove(name)
-            .ok_or_else(|| LoadError::Checkpoint(format!("нет проекции {prefix}.{name}")))
+            .ok_or_else(|| LoadError::Checkpoint(format!("no projection {prefix}.{name}")))
     };
 
     let mlp = Mlp {
@@ -427,10 +427,10 @@ fn load_layer(
         &take(&mut plain, index, "post_attention_layernorm.weight")?,
         RMS_NORM_EPS,
     )?;
-    // Ни один описанный архитектурой тензор слоя не должен остаться неиспользованным.
+    // No layer tensor described by the architecture may remain unused.
     if let Some(unused) = plain.keys().next() {
         return Err(LoadError::Checkpoint(format!(
-            "тензор {unused} слоя {index} не разобран загрузчиком"
+            "tensor {unused} of layer {index} not consumed by the loader"
         )));
     }
 
@@ -442,8 +442,8 @@ fn load_layer(
     })
 }
 
-/// Все квантованные проекции слоя по короткому имени: `gate_proj`, `q_proj`,
-/// `in_proj_qkv` и так далее. Формы приходят из `names`, а не из чекпоинта.
+/// All quantized projections of a layer by short name: `gate_proj`, `q_proj`,
+/// `in_proj_qkv` and so on. Shapes come from `names`, not from the checkpoint.
 fn load_projections(
     checkpoint: &Checkpoint,
     index: usize,
@@ -459,7 +459,7 @@ fn load_projections(
         let short = prefix
             .rsplit('.')
             .next()
-            .expect("имя проекции не пустое")
+            .expect("projection name is not empty")
             .to_string();
         if MIXER_PARTS.contains(&short.as_str()) {
             fused.push((short, quant));
@@ -490,15 +490,15 @@ fn load_projections(
     Ok(out)
 }
 
-/// Части слитой входной проекции — в том порядке, в каком они лежат в строке.
+/// Parts of the fused input projection — in the order they lie in a row.
 const MIXER_PARTS: [&str; 4] = ["in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b"];
 
-/// Склеивает qkv, z, a и b в одну матрицу.
+/// Concatenates qkv, z, a and b into one matrix.
 ///
-/// Обе шкалы обязаны совпадать: alpha GEMM'а — один скаляр на запуск, и
-/// разные global scales склеить было бы нечем. В чекпоинте они совпадают во
-/// всех 48 слоях, поэтому расхождение здесь — это ошибка загрузки, а не
-/// случай, который нужно поддерживать.
+/// Both scales must match: the GEMM alpha is one scalar per launch, and
+/// there would be no way to merge different global scales. In the checkpoint they match in
+/// all 48 layers, so a mismatch here is a load error, not
+/// a case that needs supporting.
 fn fuse_mixer_input(
     parts: &[(String, qwc_model::checkpoint::QuantLinear<'_>)],
     decode_linear_mode: DecodeLinearMode,
@@ -506,7 +506,7 @@ fn fuse_mixer_input(
 ) -> Result<Projection, LoadError> {
     if parts.len() != MIXER_PARTS.len() {
         return Err(LoadError::Checkpoint(format!(
-            "слитая проекция миксера: частей {}, ожидалось {}",
+            "fused mixer projection: {} parts, expected {}",
             parts.len(),
             MIXER_PARTS.len()
         )));
@@ -521,18 +521,18 @@ fn fuse_mixer_input(
         let quant = &parts
             .iter()
             .find(|(short, _)| short == name)
-            .ok_or_else(|| LoadError::Checkpoint(format!("нет {name}")))?
+            .ok_or_else(|| LoadError::Checkpoint(format!("missing {name}")))?
             .1;
         if quant.weight_global_scale != weight_global_scale
             || quant.input_global_scale != input_global_scale
         {
             return Err(LoadError::Checkpoint(format!(
-                "{name}: global scale расходится с остальными частями миксера"
+                "{name}: global scale differs from the other mixer parts"
             )));
         }
         if quant.in_features != in_features {
             return Err(LoadError::Checkpoint(format!(
-                "{name}: K={} против {in_features}",
+                "{name}: K={} vs {in_features}",
                 quant.in_features
             )));
         }
@@ -542,7 +542,7 @@ fn fuse_mixer_input(
     }
     if out_features != MIXER_FUSED_WIDTH {
         return Err(LoadError::Checkpoint(format!(
-            "слитая проекция миксера: N={out_features}, ожидалось {MIXER_FUSED_WIDTH}"
+            "fused mixer projection: N={out_features}, expected {MIXER_FUSED_WIDTH}"
         )));
     }
     let linear = Linear::from_host(
@@ -561,8 +561,8 @@ fn fuse_mixer_input(
     })
 }
 
-/// Неквантованные тензоры слоя по суффиксу имени. Список и формы приходят
-/// из `names`, поэтому лишний или отсутствующий тензор виден сразу здесь.
+/// Non-quantized layer tensors by name suffix. The list and shapes come
+/// from `names`, so an extra or missing tensor is visible right here.
 fn load_plain(
     checkpoint: &Checkpoint,
     index: usize,
@@ -573,7 +573,7 @@ fn load_plain(
     for (name, shape) in names::plain_tensors(index) {
         let suffix = name
             .strip_prefix(&format!("{layer}."))
-            .ok_or_else(|| LoadError::Checkpoint(format!("{name} не принадлежит слою {index}")))?
+            .ok_or_else(|| LoadError::Checkpoint(format!("{name} doesn't belong to layer {index}")))?
             .to_string();
         let data = bf16_tensor(checkpoint, &name, shape.iter().product())?;
         stats.plain_bytes += data.len() * 2;
@@ -589,7 +589,7 @@ fn take(
 ) -> Result<Vec<u16>, LoadError> {
     plain
         .remove(suffix)
-        .ok_or_else(|| LoadError::Checkpoint(format!("нет {suffix} в слое {index}")))
+        .ok_or_else(|| LoadError::Checkpoint(format!("missing {suffix} in layer {index}")))
 }
 
 fn load_norm(
@@ -603,39 +603,39 @@ fn load_norm(
     Ok(RmsNorm::from_host(&weight, RMS_NORM_EPS)?)
 }
 
-/// `[vocab, hidden]` BF16 из чекпоинта в FP8 со шкалой на строку.
-/// Данные идут кусками через staging-буфер: держать 2.54 GB BF16 в VRAM
-/// ради конверсии незачем, а срез mmap отдаётся кернелу как есть.
+/// `[vocab, hidden]` BF16 from the checkpoint to FP8 with a per-row scale.
+/// Data goes in chunks through a staging buffer: there's no reason to hold 2.54 GB of BF16 in VRAM
+/// for the conversion, and the mmap slice is handed to the kernel as is.
 fn load_vocab(
     checkpoint: &Checkpoint,
     name: &str,
     stream: &Stream,
     stats: &mut LoadStats,
 ) -> Result<Fp8Vocab, LoadError> {
-    /// 84 MB staging: достаточно, чтобы запуск кернела не тонул в накладных
-    /// расходах, и достаточно мало, чтобы не мешать весам.
+    /// 84 MB staging: enough for the kernel launch not to drown in overhead,
+    /// and small enough not to get in the weights' way.
     const CHUNK_ROWS: usize = 8192;
 
     let info = checkpoint
         .info(name)
-        .ok_or_else(|| LoadError::Checkpoint(format!("нет {name}")))?;
+        .ok_or_else(|| LoadError::Checkpoint(format!("missing {name}")))?;
     let want = vec![VOCAB_SIZE, HIDDEN_SIZE];
     if info.shape != want {
         return Err(LoadError::Checkpoint(format!(
-            "{name}: форма {:?}, ожидалась {want:?}",
+            "{name}: shape {:?}, expected {want:?}",
             info.shape
         )));
     }
     if info.dtype != StDtype::Bf16 {
         return Err(LoadError::Checkpoint(format!(
-            "{name}: тип {}, ожидался bf16",
+            "{name}: type {}, expected bf16",
             info.dtype.name()
         )));
     }
 
     let raw = checkpoint
         .bytes(name)
-        .ok_or_else(|| LoadError::Checkpoint(format!("нет данных {name}")))?;
+        .ok_or_else(|| LoadError::Checkpoint(format!("no data for {name}")))?;
     let row_bytes = HIDDEN_SIZE * 2;
     let mut vocab = Fp8Vocab::zeroed(VOCAB_SIZE, HIDDEN_SIZE)?;
     let mut staging = DeviceBuffer::<u8>::zeroed(CHUNK_ROWS * row_bytes)?;
@@ -649,8 +649,8 @@ fn load_vocab(
             &mut staging,
             stream,
         )?;
-        // Вытеснение по куску, а не по тензору: иначе пик host-RAM вырастает
-        // на все 2.54 GB словарной матрицы.
+        // Evict per chunk, not per tensor: otherwise peak host RAM grows
+        // by the whole 2.54 GB of the vocab matrix.
         checkpoint.evict_file_pages()?;
         first_row += rows;
     }
@@ -658,7 +658,7 @@ fn load_vocab(
     Ok(vocab)
 }
 
-/// Загружает `lm_head` без квантизации для чистого A/B-замера.
+/// Loads `lm_head` without quantization for a clean A/B measurement.
 fn load_bf16_vocab(
     checkpoint: &Checkpoint,
     name: &str,
@@ -668,24 +668,24 @@ fn load_bf16_vocab(
 
     let info = checkpoint
         .info(name)
-        .ok_or_else(|| LoadError::Checkpoint(format!("нет {name}")))?;
+        .ok_or_else(|| LoadError::Checkpoint(format!("missing {name}")))?;
     let want = vec![VOCAB_SIZE, HIDDEN_SIZE];
     if info.shape != want {
         return Err(LoadError::Checkpoint(format!(
-            "{name}: форма {:?}, ожидалась {want:?}",
+            "{name}: shape {:?}, expected {want:?}",
             info.shape
         )));
     }
     if info.dtype != StDtype::Bf16 {
         return Err(LoadError::Checkpoint(format!(
-            "{name}: тип {}, ожидался bf16",
+            "{name}: type {}, expected bf16",
             info.dtype.name()
         )));
     }
 
     let raw = checkpoint
         .bytes(name)
-        .ok_or_else(|| LoadError::Checkpoint(format!("нет данных {name}")))?;
+        .ok_or_else(|| LoadError::Checkpoint(format!("no data for {name}")))?;
     let row_bytes = HIDDEN_SIZE * 2;
     let mut table = Bf16Vocab::zeroed(VOCAB_SIZE, HIDDEN_SIZE)?;
     let mut first_row = 0;
@@ -700,8 +700,8 @@ fn load_bf16_vocab(
     Ok(table)
 }
 
-/// Помощники для MTP-головы: она грузится отдельно от основного стека, но из
-/// того же чекпоинта и теми же проверками форм.
+/// Helpers for the MTP head: it's loaded separately from the main stack, but from
+/// the same checkpoint and with the same shape checks.
 pub(crate) fn bf16_host_tensor(
     checkpoint: &Checkpoint,
     name: &str,
@@ -730,27 +730,27 @@ pub(crate) fn load_norm_named(
     Ok(RmsNorm::from_host(&weight, RMS_NORM_EPS)?)
 }
 
-/// Копия BF16-тензора на хост. Срез mmap не выровнен под `u16`, поэтому
-/// байты собираются явно, а не приводятся указателем.
+/// A copy of a BF16 tensor to host. The mmap slice isn't aligned for `u16`, so
+/// the bytes are assembled explicitly rather than cast through a pointer.
 fn bf16_tensor(checkpoint: &Checkpoint, name: &str, elems: usize) -> Result<Vec<u16>, LoadError> {
     let info = checkpoint
         .info(name)
-        .ok_or_else(|| LoadError::Checkpoint(format!("нет {name}")))?;
+        .ok_or_else(|| LoadError::Checkpoint(format!("missing {name}")))?;
     if info.dtype != StDtype::Bf16 {
         return Err(LoadError::Checkpoint(format!(
-            "{name}: тип {}, ожидался bf16",
+            "{name}: type {}, expected bf16",
             info.dtype.name()
         )));
     }
     if info.elems() != elems {
         return Err(LoadError::Checkpoint(format!(
-            "{name}: {} элементов, ожидалось {elems}",
+            "{name}: {} elements, expected {elems}",
             info.elems()
         )));
     }
     let raw = checkpoint
         .bytes(name)
-        .ok_or_else(|| LoadError::Checkpoint(format!("нет данных {name}")))?;
+        .ok_or_else(|| LoadError::Checkpoint(format!("no data for {name}")))?;
     Ok(raw
         .as_chunks::<2>()
         .0
@@ -761,9 +761,9 @@ fn bf16_tensor(checkpoint: &Checkpoint, name: &str, elems: usize) -> Result<Vec<
 
 #[derive(Debug)]
 pub enum LoadError {
-    /// Чекпоинт разошёлся с архитектурой.
+    /// The checkpoint diverged from the architecture.
     Checkpoint(String),
-    /// Отказ CUDA, в том числе упор в потолок VRAM процесса.
+    /// A CUDA failure, including hitting the process's VRAM cap.
     Cuda(qwc_cuda::CudaError),
     Io(std::io::Error),
 }
@@ -783,9 +783,9 @@ impl From<std::io::Error> for LoadError {
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Checkpoint(m) => write!(f, "чекпоинт: {m}"),
+            Self::Checkpoint(m) => write!(f, "checkpoint: {m}"),
             Self::Cuda(e) => write!(f, "{e}"),
-            Self::Io(e) => write!(f, "ввод-вывод: {e}"),
+            Self::Io(e) => write!(f, "I/O: {e}"),
         }
     }
 }

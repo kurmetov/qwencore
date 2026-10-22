@@ -230,9 +230,9 @@ def run_text(command: Sequence[str]) -> str | None:
 
 
 def display_path(path: Path | str) -> str:
-    """Путь для run-header: дом — через `$HOME`. Артефакты уходят в публичный
-    репозиторий, и имя пользователя в каждом из них не нужно. Движок при этом
-    получает настоящий путь — подменяется только записываемая строка."""
+    """Path for the run header: home goes as `$HOME`. Artifacts go to a public
+    repository, and the username doesn't belong in each of them. The engine still
+    gets the real path — only the recorded string is substituted."""
     resolved = Path(path).expanduser().resolve()
     home = Path.home().resolve()
     try:

@@ -1,168 +1,168 @@
-# Сервер против eval и decode-внимание — отчёт 2026-09-24
+# Server vs eval and decode attention — report 2026-09-24
 
-## Итог
+## Summary
 
-- **Decode-внимание в `serve` выбирало разбиение контекста по ёмкости
-  исполнителя, а не по фактическому батчу.** При умолчаниях `--max-seqs 32`
-  ядро шло одной партицией даже для одного запроса. Выбор теперь делается на
-  каждом вызове по числу строк. Абляция на `serve` без спекуляции: **4.07x** к
-  decode-шагу на 30k при c=1 (66.49 → 16.34 мс), 3.67x при c=2, 1.96x на 8k.
-- **Спекуляция на длинном контексте сейчас проигрывает обычному decode**: на 30k
-  при c=1 33.5 tok/s против 61.2. Вероятная причина — проверка черновиков идёт
-  префилльным MMA-ядром, у которого на 4 строки 24 CTA без разбиения по
-  контексту. Пофазно не замерено.
-- **`serve` совпадает с `eval` бит в бит** при `--prefix-cache 0
-  --speculative 0` и одинаковом `--context`, и после починки — при любом
-  `--max-seqs`. Спекуляция добавляет шум уровня decode (MAE 0.04). **Кэш
-  префиксов не проходит порог дифф-eval на длинных промптах**: MAE 0.41, одна
-  развилка на 18 случаях. Это на порядок больше шума decode, причина не
-  разобрана.
+- **Decode attention in `serve` chose the context split by executor
+  capacity, not by the actual batch.** With the default `--max-seqs 32`
+  the kernel ran with one partition even for a single request. The choice is now made on
+  every call by the number of rows. Ablation on `serve` without speculation: **4.07x** on
+  the decode step at 30k with c=1 (66.49 → 16.34 ms), 3.67x at c=2, 1.96x at 8k.
+- **Speculation on long context currently loses to regular decode**: at 30k
+  with c=1 33.5 tok/s vs 61.2. The likely cause is that draft verification goes through
+  the prefill MMA kernel, which for 4 rows has 24 CTAs without splitting by
+  context. Not measured per phase.
+- **`serve` matches `eval` bit for bit** with `--prefix-cache 0
+  --speculative 0` and the same `--context`, and after the fix — at any
+  `--max-seqs`. Speculation adds decode-level noise (MAE 0.04). **The prefix
+  cache fails the diff-eval threshold on long prompts**: MAE 0.41, one
+  divergence in 18 cases. That's an order of magnitude more than decode noise, the cause is not
+  investigated.
 
-Коммит `32aa5c0` плюс незакоммиченные изменения (dirty), RTX 5090, драйвер
-595.91.07. На карте всё время висел посторонний процесс (python, 3 GB,
-загрузка 6–8%). Все числа — одна сессия, без доверительных интервалов.
+Commit `32aa5c0` plus uncommitted changes (dirty), RTX 5090, driver
+595.91.07. An unrelated process was on the card the whole time (python, 3 GB,
+6–8% load). All numbers are from one session, without confidence intervals.
 
-## 1. Абляция: разбиение decode-внимания по фактическому батчу
+## 1. Ablation: splitting decode attention by the actual batch
 
-### Механизм
+### Mechanism
 
-`PagedAttentionWorkspace::new(batch, max_context)` один раз выбирал ядро
-(`select_decode_kernel`) и число партиций (`partition_count`) по ёмкости. У
-исполнителя `serve` ёмкость — `--max-seqs`, по умолчанию 32:
-`partition_count(QueryHead, 32, 32768) = ⌈340 / (32·24)⌉ = 1`. При одном
-запросе decode-внимание запускало 24 CTA на 170 SM, и каждый CTA читал весь
-контекст в одиночку.
+`PagedAttentionWorkspace::new(batch, max_context)` chose the kernel
+(`select_decode_kernel`) and the number of partitions (`partition_count`) once, by capacity. For
+the `serve` executor the capacity is `--max-seqs`, 32 by default:
+`partition_count(QueryHead, 32, 32768) = ⌈340 / (32·24)⌉ = 1`. With one
+request decode attention launched 24 CTAs on 170 SMs, and each CTA read the whole
+context alone.
 
-Та же ошибка была ещё в двух местах:
-- decode-строки смешанного шага: их рабочая область размечена под 1024 строки;
-- черновик MTP-головы: размечен под 8 строк при фактической одной.
+The same bug was in two more places:
+- the decode rows of a mixed step: their workspace is sized for 1024 rows;
+- the MTP head draft: sized for 8 rows with an actual one.
 
-Починка: рабочая область выделяется под худший случай по всем числам строк
-до ёмкости, а ядро и партиции выбираются в `decode_impl` по фактическому
-`batch` (`PagedAttentionWorkspace::plan_for`). Выбор зависит только от числа
-строк и `max_context`, поэтому CUDA-граф на каждый batch остаётся
-корректным. Путь `with_kernel`/`with_partitions` для стендов не менялся.
+The fix: the workspace is allocated for the worst case over all row counts
+up to capacity, and the kernel and partitions are chosen in `decode_impl` by the actual
+`batch` (`PagedAttentionWorkspace::plan_for`). The choice depends only on the number of
+rows and `max_context`, so the CUDA graph for each batch stays
+correct. The `with_kernel`/`with_partitions` path for benches is unchanged.
 
-### Ядро, `attentionbench` (FP8 KV, 16 слоёв, мкс на слой)
+### Kernel, `attentionbench` (FP8 KV, 16 layers, µs per layer)
 
-| batch | контекст | партиций, как в `serve` | мкс | партиций после | мкс | разница |
+| batch | context | partitions as in `serve` | µs | partitions after | µs | difference |
 |---:|---:|---|---:|---|---:|---:|
 | 1 | 32 768 | QueryHead / 1 | 3606.45 | SharedKv / 43 | 230.05 | 15.7x |
 | 2 | 32 768 | QueryHead / 1 | 3598.04 | SharedKv / 22 | 444.37 | 8.1x |
 | 1 | 8 192 | QueryHead / 1 | 902.94 | QueryHead / 15 | 66.50 | 13.6x |
 | 4 | 8 192 | QueryHead / 1 | 894.14 | QueryHead / 4 | 236.41 | 3.8x |
 
-### Сквозняком, `serve --prefix-cache 0 --speculative 0`
+### End to end, `serve --prefix-cache 0 --speculative 0`
 
-Умолчания сервера: `--max-seqs 32 --context 32768`, `--kv-cache-gb 3`.
-Замер `bench/serve_decode.py`: наклон между запросами в 1 и 129 токенов,
-минимум из двух повторов, `ignore_eos`. «До» — та же сборка с выбором по
-ёмкости: переключалась одна строка (`adaptive`), всё остальное одинаково.
+Server defaults: `--max-seqs 32 --context 32768`, `--kv-cache-gb 3`.
+Measured with `bench/serve_decode.py`: the slope between 1-token and 129-token requests,
+minimum of two repeats, `ignore_eos`. "Before" is the same build with the choice by
+capacity: one line was toggled (`adaptive`), everything else the same.
 
-| промпт | c | до, мс/шаг | после, мс/шаг | до, tok/s | после, tok/s | ускорение |
+| prompt | c | before, ms/step | after, ms/step | before, tok/s | after, tok/s | speedup |
 |---:|---:|---:|---:|---:|---:|---:|
 | 8 192 | 1 | 27.72 | 14.14 | 36.1 | 70.7 | 1.96x |
 | 8 192 | 2 | 28.70 | 15.64 | 69.7 | 127.9 | 1.83x |
 | 30 000 | 1 | 66.49 | 16.34 | 15.0 | 61.2 | **4.07x** |
 | 30 000 | 2 | 72.65 | 19.77 | 27.5 | 101.2 | **3.67x** |
 
-Это ровно агентный режим: несколько диалогов на длинном контексте, каждый
-генерирует без спекуляции. `servebench` ошибку не видел: там исполнитель
-создаётся на `--concurrency` слотов, и ёмкость совпадает с фактическим
-батчем.
+This is exactly the agent mode: several dialogs on long context, each
+generating without speculation. `servebench` didn't see the bug: there the executor
+is created with `--concurrency` slots, and capacity matches the actual
+batch.
 
-### С умолчаниями (спекуляция k=3, шортлист 32K), c=1
+### With defaults (speculation k=3, shortlist 32K), c=1
 
-| промпт | до, мс/токен | после, мс/токен | до, tok/s | после, tok/s |
+| prompt | before, ms/token | after, ms/token | before, tok/s | after, tok/s |
 |---:|---:|---:|---:|---:|
 | 8 192 | 12.11 | 11.89 | 82.6 | 84.1 |
 | 30 000 | 34.13 | 29.83 | 29.3 | 33.5 |
 
-Черновик головы ускорился, но спекуляция на 30k медленнее обычного decode
-после починки: 33.5 против 61.2 tok/s. На 8k выигрыш 1.19x вместо 1.58x на
-коротких промптах (коммит `32aa5c0`).
+The head draft got faster, but speculation at 30k is slower than regular decode
+after the fix: 33.5 vs 61.2 tok/s. At 8k the gain is 1.19x instead of 1.58x on
+short prompts (commit `32aa5c0`).
 
-Вероятная причина — проверка черновиков. Она идёт через
-`prefill_gated_mma`, сетка которого `(4 KV-головы, ⌈строк/64⌉, 6)`: на 4
-строки проверки 24 CTA, каждый читает весь контекст без разбиения. Это та же
-болезнь, что выше, но в префилльном ядре. Пофазной разбивки шага нет, это
-вывод из сетки запуска.
+The likely cause is draft verification. It goes through
+`prefill_gated_mma`, whose grid is `(4 KV heads, ⌈rows/64⌉, 6)`: for 4
+verification rows that's 24 CTAs, each reading the whole context without splitting. It's the same
+disease as above, but in the prefill kernel. There's no per-phase step breakdown, this is
+an inference from the launch grid.
 
-### Корректность
+### Correctness
 
-- `tests/paged_attention.rs`: новый `workspace_partitions_follow_actual_rows`
-  и `oversized_workspace_matches_exact_one_bit_for_bit` (рабочая область на 32
-  строки при batch 1 даёт тот же ответ, что на 1). 13/13.
-- Дифф-eval: вывод `eval` с одним слотом после починки бит в бит тот же
-  (`core` и `state-length`, MAE 0.000); `serve` с 4 слотами совпадает с ним бит
-  в бит (раздел 2).
+- `tests/paged_attention.rs`: new `workspace_partitions_follow_actual_rows`
+  and `oversized_workspace_matches_exact_one_bit_for_bit` (a workspace for 32
+  rows at batch 1 gives the same answer as one for 1). 13/13.
+- Diff-eval: the output of single-slot `eval` after the fix is bit for bit the same
+  (`core` and `state-length`, MAE 0.000); `serve` with 4 slots matches it bit
+  for bit (section 2).
 
-## 2. `serve` против `eval`
+## 2. `serve` vs `eval`
 
-`serve` получил `/v1/completions`: промпт в id токенов, `logprobs` top-k,
-расширения vLLM `ignore_eos` и `return_tokens_as_token_ids`. Логвероятности
-считаются как в `eval`. Строка логитов сверяется с argmax карты, при
-несовпадении запрос падает, а не отдаёт чужие числа. Так `bench/diff_eval.py
---engine openai --openai-token-ids` сверяет сервер тем же конвейером, что и
-остальные движки.
+`serve` got `/v1/completions`: a prompt as token ids, top-k `logprobs`,
+the vLLM extensions `ignore_eos` and `return_tokens_as_token_ids`. Log-probabilities
+are computed as in `eval`. The logits row is checked against the card's argmax; on
+mismatch the request fails rather than returning someone else's numbers. This way `bench/diff_eval.py
+--engine openai --openai-token-ids` checks the server with the same pipeline as
+the other engines.
 
-Эталон — `eval --context 17408`. Сервер: `--context 17408 --kv-cache-gb 2`,
-корпуса `core` (14 случаев) и `state-length` (18 случаев до 16k), запросы
-по одному.
+The reference is `eval --context 17408`. Server: `--context 17408 --kv-cache-gb 2`,
+corpora `core` (14 cases) and `state-length` (18 cases up to 16k), requests
+one at a time.
 
-| конфигурация `serve` | корпус | точный префикс | top-1 | Jaccard | MAE | max Δ | порог |
+| `serve` configuration | corpus | exact prefix | top-1 | Jaccard | MAE | max Δ | threshold |
 |---|---|---:|---:|---:|---:|---:|---|
-| 1 слот, кэш и спекуляция выкл. | core / len | 1.000 / 1.000 | 1.000 / 1.000 | 1.000 / 1.000 | 0.000 / 0.000 | 0 / 0 | PASS |
-| 4 слота, выкл., **до** починки | core / len | 1.000 / 1.000 | 1.000 / 1.000 | 0.983 / 0.973 | 0.024 / 0.042 | 0.72 / 3.12 | PASS |
-| 4 слота, выкл., **после** | core / len | 1.000 / 1.000 | 1.000 / 1.000 | 1.000 / 1.000 | 0.000 / 0.000 | 0 / 0 | PASS |
-| 4 слота, спекуляция k=3, до | core / len | 1.000 / 1.000 | 1.000 / 1.000 | 0.981 / 0.971 | 0.035 / 0.043 | 1.44 / 0.94 | PASS |
-| 4 слота, кэш 8, до | core / len | 1.000 / **0.951** | 1.000 / 0.993 | 0.918 / **0.793** | 0.107 / **0.411** | 3.86 / 4.45 | **FAIL** |
-| умолчания (кэш + k=3), до | core / len | 1.000 / 0.951 | 1.000 / 0.993 | 0.920 / 0.792 | 0.115 / 0.412 | 4.18 / 4.16 | FAIL |
+| 1 slot, cache and speculation off | core / len | 1.000 / 1.000 | 1.000 / 1.000 | 1.000 / 1.000 | 0.000 / 0.000 | 0 / 0 | PASS |
+| 4 slots, off, **before** the fix | core / len | 1.000 / 1.000 | 1.000 / 1.000 | 0.983 / 0.973 | 0.024 / 0.042 | 0.72 / 3.12 | PASS |
+| 4 slots, off, **after** | core / len | 1.000 / 1.000 | 1.000 / 1.000 | 1.000 / 1.000 | 0.000 / 0.000 | 0 / 0 | PASS |
+| 4 slots, speculation k=3, before | core / len | 1.000 / 1.000 | 1.000 / 1.000 | 0.981 / 0.971 | 0.035 / 0.043 | 1.44 / 0.94 | PASS |
+| 4 slots, cache 8, before | core / len | 1.000 / **0.951** | 1.000 / 0.993 | 0.918 / **0.793** | 0.107 / **0.411** | 3.86 / 4.45 | **FAIL** |
+| defaults (cache + k=3), before | core / len | 1.000 / 0.951 | 1.000 / 0.993 | 0.920 / 0.792 | 0.115 / 0.412 | 4.18 / 4.16 | FAIL |
 
-Что из этого следует:
+What follows from this:
 
-1. **Бит в бит сервер совпадает с `eval` только при одинаковом `--context`.**
-   От `max_context` зависит сам выбор ядра (`batch == 1 && max_context >=
-   16384` — SharedKv) и потолок партиций. `eval` с контекстом по корпусу (609
-   для `core`) и с 17408 расходится: MAE 0.019.
-2. **Спекуляция вносит шум уровня decode**: MAE 0.035–0.043 против 0.024–0.042
-   от одного лишь разбиения внимания. Токены совпали все.
-3. **Кэш префиксов — главный источник расхождений.** В этих корпусах случаи
-   продолжают друг друга (`doc0-2048` начинается с `doc0-1024`), и сервер
-   поднимает снимок на 1024…8192 токенах, а потом доигрывает до 8192 токенов
-   хвоста. Уже на шаге 0 хвост top-20 уезжает на 1–4 ната, `doc0-4096`
-   расходится на шаге 1. Короткие хвосты тут ни при чём: они длинные. Шум
-   между вариантами самого `eval` (упаковка состояния, `qwc-len-*`) — 0.05–0.5
-   ната, изредка 1.6. Чтобы разделить «лишнюю границу чанка» и «подъём
-   bf16-снимка», нужен прогон `eval` с резом промпта на той же позиции без
-   кэша; его нет.
+1. **The server matches `eval` bit for bit only with the same `--context`.**
+   `max_context` affects the kernel choice itself (`batch == 1 && max_context >=
+   16384` — SharedKv) and the partition cap. `eval` with a corpus-sized context (609
+   for `core`) and with 17408 diverge: MAE 0.019.
+2. **Speculation adds decode-level noise**: MAE 0.035–0.043 vs 0.024–0.042
+   from attention splitting alone. All tokens matched.
+3. **The prefix cache is the main source of divergence.** In these corpora cases
+   continue each other (`doc0-2048` starts with `doc0-1024`), and the server
+   restores a snapshot at 1024…8192 tokens and then plays out up to 8192 tokens of
+   tail. Already at step 0 the top-20 tail drifts by 1–4 nats, `doc0-4096`
+   diverges at step 1. Short tails have nothing to do with it: they're long. The noise
+   between variants of `eval` itself (state packing, `qwc-len-*`) is 0.05–0.5
+   nats, occasionally 1.6. To separate "an extra chunk boundary" from "restoring a
+   bf16 snapshot" we need an `eval` run with the prompt cut at the same position without
+   the cache; there isn't one.
 
-Артефакты: `bench/results/serve-vs-eval-2026-09-24/`.
+Artifacts: `bench/results/serve-vs-eval-2026-09-24/`.
 
-## 3. Прочие изменения дня
+## 3. Other changes of the day
 
-- **Вытеснение кэша префиксов.** Раньше — чистый LRU. Под давлением на KV он
-  выкидывал запись идущего запроса: все её страницы общие с живой
-  последовательностью, освобождалось ноль страниц, а следующий ход диалога
-  промахивался. Теперь первыми уходят вложенные записи (префикс более
-  длинной записи), затем записи без живых владельцев страниц, внутри — по
-  давности. Ради страниц не трогаются записи, все страницы которых держат
-  живые последовательности. 4 новых теста в `cache.rs`; под старым LRU все
-  четыре падают.
-- **KV MTP-головы при смене диалога.** `bind_prompt` сбрасывал KV только при
-  пустом общем префиксе. Два диалога с общим системным промптом видели за
-  ним KV друг друга. Теперь KV обнуляется со страницы, где лежит позиция
-  `common − 1`: пара (h_t, токен t+1) последней общей позиции тоже чужая.
-  Сквозняком не замерено.
-- `Executor::logits_to_host` копирует одну строку, а не весь буфер логитов
+- **Prefix cache eviction.** It used to be pure LRU. Under KV pressure it
+  evicted the entry of an ongoing request: all its pages are shared with a live
+  sequence, zero pages were freed, and the next dialog turn
+  missed. Now nested entries go first (a prefix of a longer
+  entry), then entries with no live page owners, and within that by
+  age. Entries whose pages are all held by live sequences are not touched for the sake of pages.
+  4 new tests in `cache.rs`; under the old LRU all
+  four fail.
+- **MTP head KV on dialog change.** `bind_prompt` reset KV only when
+  the common prefix was empty. Two dialogs with a shared system prompt saw each other's
+  KV after it. Now KV is zeroed from the page holding position
+  `common − 1`: the pair (h_t, token t+1) of the last common position is foreign too.
+  Not measured end to end.
+- `Executor::logits_to_host` copies one row, not the whole logits buffer
   (32 × 248 320 float).
 
-## Что дальше
+## What's next
 
-1. ~~**Разбиение по контексту в префилльном MMA-ядре для малого числа строк.**~~
-   Сделано иначе — упакованным GQA-вниманием: спекуляция на 30k 33.7 → 165
-   tok/s, см. `packed-attention-2026-09-24.md`.
-2. Прогон `eval` с резом промпта на границе снимка — отделить подъём снимка
-   от лишней границы чанка.
-3. Перемерить сквозняком чередование диалогов с общим системным промптом
-   (acceptance головы до и после обрезки KV).
+1. ~~**Context splitting in the prefill MMA kernel for a small number of rows.**~~
+   Done differently — with packed GQA attention: speculation at 30k 33.7 → 165
+   tok/s, see `packed-attention-2026-09-24.md`.
+2. An `eval` run with the prompt cut at the snapshot boundary — to separate snapshot restore
+   from an extra chunk boundary.
+3. Re-measure end to end the interleaving of dialogs with a shared system prompt
+   (head acceptance before and after the KV trim).

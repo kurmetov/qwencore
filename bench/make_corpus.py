@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Корпус реальных промптов для servebench — вместо арифметической прогрессии.
+"""A corpus of real prompts for servebench — instead of an arithmetic progression.
 
-Синтетический `prompt_ids` — это `1000 + (id*7919 + i) % 20000`, то есть шаг с
-постоянным приращением. На нём черновая голова угадывает продолжение почти
-всегда (acceptance 0.97), и любая спекуляция выглядит лучше, чем она есть.
-Здесь промпты нарезаются из настоящего текста репозитория: проза документации
-и исходники — ровно то, что видит агентный сервер.
+Synthetic `prompt_ids` is `1000 + (id*7919 + i) % 20000`, i.e. a step with
+a constant increment. On it the draft head guesses the continuation almost
+always (acceptance 0.97), and any speculation looks better than it is.
+Here prompts are sliced from the repository's real text: documentation prose
+and sources — exactly what an agentic server sees.
 
     python bench/make_corpus.py --requests 200 --prompt-tokens 256
 
-Каждая запись — ровно `--prompt-tokens` токенов, куски не пересекаются, так
-что общий префикс не даст движку с prefix-кэшем пропустить префилл.
+Each record is exactly `--prompt-tokens` tokens, chunks don't overlap, so
+a shared prefix won't let an engine with a prefix cache skip prefill.
 """
 
 from __future__ import annotations
@@ -46,8 +46,8 @@ def main() -> int:
 
     tokenizer = Tokenizer.from_file(str(args.model / "tokenizer.json"))
 
-    # Куски режутся внутри файла, а файлы перемешиваются: так соседние запросы
-    # в батче приходят из разных мест, как у независимых пользователей.
+    # Chunks are cut within a file, and files are shuffled: so neighbouring requests
+    # in a batch come from different places, like independent users.
     chunks: list[tuple[str, list[int]]] = []
     for path in sources():
         text = path.read_text(errors="ignore")
@@ -60,8 +60,8 @@ def main() -> int:
 
     if len(chunks) < args.requests:
         raise SystemExit(
-            f"нарезалось {len(chunks)} кусков по {args.prompt_tokens} токенов, "
-            f"а нужно {args.requests}"
+            f"sliced {len(chunks)} chunks of {args.prompt_tokens} tokens, "
+            f"but {args.requests} are needed"
         )
     random.Random(args.seed).shuffle(chunks)
 
@@ -73,8 +73,8 @@ def main() -> int:
                 + "\n"
             )
     print(
-        f"{args.output}: {args.requests} промптов по {args.prompt_tokens} токенов "
-        f"(доступно было {len(chunks)})"
+        f"{args.output}: {args.requests} prompts of {args.prompt_tokens} tokens "
+        f"({len(chunks)} were available)"
     )
     return 0
 

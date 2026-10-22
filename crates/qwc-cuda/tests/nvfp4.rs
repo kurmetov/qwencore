@@ -1,5 +1,5 @@
-//! Сверка shared-weight NVFP4 x BF16 decode-проекции с CPU-oracle.
-//! Требует RTX 5090.
+//! Checks the shared-weight NVFP4 x BF16 decode projection against a CPU oracle.
+//! Requires an RTX 5090.
 
 use qwc_cuda::nvfp4::{self, Linear, QuantizedActivation, W4A4Workspace};
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
@@ -22,12 +22,12 @@ impl Rng {
 
 #[test]
 fn w4a16_matches_cpu_for_all_supported_batches() {
-    const OUT: usize = 37; // проверяет неполный последний tile из 16 строк
+    const OUT: usize = 37; // checks an incomplete last tile of 16 rows
     const IN: usize = 512;
     let mut rng = Rng(0x4a16_5090);
     let packed: Vec<u8> = (0..OUT * IN / 2).map(|_| rng.next_u8()).collect();
     let up_packed: Vec<u8> = (0..OUT * IN / 2).map(|_| rng.next_u8()).collect();
-    // Положительные конечные E4M3-шкалы: 0.5, 1.0, 1.5, 2.0.
+    // Positive finite E4M3 scales: 0.5, 1.0, 1.5, 2.0.
     let scale_values = [0x30u8, 0x38, 0x3c, 0x40];
     let scales: Vec<u8> = (0..OUT * IN / 16)
         .map(|i| scale_values[i % scale_values.len()])
@@ -68,7 +68,7 @@ fn w4a16_matches_cpu_for_all_supported_batches() {
             let tolerance = 0.035 + want.abs() * 0.012;
             assert!(
                 (got - want).abs() <= tolerance,
-                "batch={batch}, index={index}: GPU={got}, CPU={want}, допуск={tolerance}"
+                "batch={batch}, index={index}: GPU={got}, CPU={want}, tolerance={tolerance}"
             );
         }
 
@@ -104,7 +104,7 @@ fn w4a16_matches_cpu_for_all_supported_batches() {
             let tolerance = 0.075 + want.abs() * 0.025;
             assert!(
                 (got - want).abs() <= tolerance,
-                "fused batch={batch}, index={index}: GPU={got}, CPU={want}, допуск={tolerance}"
+                "fused batch={batch}, index={index}: GPU={got}, CPU={want}, tolerance={tolerance}"
             );
         }
     }
@@ -160,7 +160,7 @@ fn w4a4_tensor_core_matches_cpu_layout_oracle() {
         let tolerance = 0.02 + want.abs() * 0.012;
         assert!(
             (got - want).abs() <= tolerance,
-            "index={index}: GPU={got}, CPU={want}, допуск={tolerance}, workspace={} B",
+            "index={index}: GPU={got}, CPU={want}, tolerance={tolerance}, workspace={} B",
             workspace.bytes()
         );
     }
@@ -240,14 +240,14 @@ fn bf16_quantizer_and_w4a4_gemm_match_dequantized_oracle() {
         let tolerance = 0.02 + want.abs() * 0.012;
         assert!(
             (got - want).abs() <= tolerance,
-            "index={index}: GPU={got}, CPU={want}, допуск={tolerance}"
+            "index={index}: GPU={got}, CPU={want}, tolerance={tolerance}"
         );
     }
 }
 
-/// Строки за старым потолком в 1024. Разметка block-scale укладывает строки
-/// тайлами по 128, и до сегодняшнего чанка в 2048 ни один тест не предъявлял
-/// кернелам M больше 1024 — проверяется и квантователь, и сам GEMM.
+/// Rows beyond the old 1024 cap. The block-scale layout stacks rows
+/// in tiles of 128, and until today's 2048 chunk no test gave the
+/// kernels M above 1024 — this checks both the quantizer and the GEMM itself.
 #[test]
 fn quantizer_and_w4a4_match_oracle_past_the_old_row_cap() {
     const OUT: usize = 128;
@@ -263,7 +263,7 @@ fn quantizer_and_w4a4_match_oracle_past_the_old_row_cap() {
         Linear::from_host(&packed_weight, &weight_scales, weight_global_scale, OUT, IN).unwrap();
     let stream = Stream::new().unwrap();
 
-    // 1025 — первая строка следующего тайла, 2048 — потолок арены префилла.
+    // 1025 is the first row of the next tile, 2048 is the prefill arena cap.
     for rows in [1025usize, 2048] {
         let input: Vec<u16> = (0..rows * IN)
             .map(|i| bf16::from_f32(rng.next_f32() * (0.25 + (i % 29) as f32 / 12.0)))
@@ -277,8 +277,8 @@ fn quantizer_and_w4a4_match_oracle_past_the_old_row_cap() {
         stream.synchronize().unwrap();
         let (packed_input, input_scales) = quantized.to_host_logical().unwrap();
 
-        // Квантование построчно независимо, поэтому достаточно граничных строк:
-        // первой, последней и первой строки последнего тайла.
+        // Quantization is row-independent, so boundary rows are enough:
+        // the first, the last, and the first row of the last tile.
         for row in [0usize, rows - 128, rows - 1] {
             for group in 0..IN / 16 {
                 let scale =
@@ -325,7 +325,7 @@ fn quantizer_and_w4a4_match_oracle_past_the_old_row_cap() {
             let tolerance = 0.02 + want.abs() * 0.012;
             assert!(
                 (got - want).abs() <= tolerance,
-                "rows={rows}, index={index}: GPU={got}, CPU={want}, допуск={tolerance}"
+                "rows={rows}, index={index}: GPU={got}, CPU={want}, tolerance={tolerance}"
             );
         }
     }

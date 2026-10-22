@@ -1,19 +1,19 @@
-# Тулчейн: RTX 5090 / SM120 / CUDA
+# Toolchain: RTX 5090 / SM120 / CUDA
 
-## Что установлено
+## What is installed
 
 ```
 GPU        NVIDIA GeForce RTX 5090, sm_120, 170 SM
-драйвер    595.84 (рантайм CUDA 13.2)
-toolkit    CUDA 13.1.115 из репозиториев Ubuntu 26.04 (/usr/local/cuda-13.1)
+driver     595.84 (CUDA runtime 13.2)
+toolkit    CUDA 13.1.115 from the Ubuntu 26.04 repositories (/usr/local/cuda-13.1)
 rustc      1.98.1
-CUTLASS    4.8.0 (third_party/cutlass, не в гите — см. ниже)
+CUTLASS    4.8.0 (third_party/cutlass, not in git — see below)
 ```
 
-## Что нужно достать самому
+## What you need to fetch yourself
 
-Двух каталогов в `third_party/` нет в гите, и без них `qwc-cuda` не собирается
-(`crates/qwc-cuda/build.rs` требует оба):
+Two directories in `third_party/` are not in git, and `qwc-cuda` won't build without them
+(`crates/qwc-cuda/build.rs` requires both):
 
 ```bash
 git clone --depth 1 --branch v4.8.0 https://github.com/NVIDIA/cutlass third_party/cutlass
@@ -23,28 +23,28 @@ git clone --depth 1 --branch v4.8.0 https://github.com/NVIDIA/cutlass third_part
 ./scripts/gen-cuda-shim.sh third_party/cuda-shim
 ```
 
-Версия CUTLASS существенна: NVFP4-атом `SM120_16x8x64_TN_VS` и примеры `79b`,
-`91`, `93`, `112` появились в ветке 4.x. Проверить, что подтянулось именно
-4.8.0, можно по `third_party/cutlass/include/cutlass/version.h`.
+The CUTLASS version matters: the NVFP4 atom `SM120_16x8x64_TN_VS` and examples `79b`,
+`91`, `93`, `112` appeared in the 4.x branch. You can check that exactly
+4.8.0 was fetched via `third_party/cutlass/include/cutlass/version.h`.
 
-`nvcc` не лежит в `PATH` по умолчанию — его нужно добавить, иначе молча
-отваливаются и наша сборка, и FlashInfer у vLLM:
+`nvcc` is not on `PATH` by default — you need to add it, otherwise both our build
+and vLLM's FlashInfer silently fail:
 
 ```bash
 export PATH=/usr/local/cuda/bin:$PATH
 ```
 
-Чекпоинт качается отдельным скриптом (докачка поддерживается, можно прерывать):
+The checkpoint is fetched by a separate script (resuming is supported, it can be interrupted):
 
 ```bash
 ./scripts/fetch-checkpoint.sh
 ```
 
-## Почему toolkit из репозиториев Ubuntu
+## Why the toolkit comes from the Ubuntu repositories
 
-Toolkit взят из репозиториев Ubuntu, а не с сайта NVIDIA: версия 13.1 гарантированно
-попадает в поддержку драйвера 595.84 и не тянет за собой замену драйвера.
-Ставится минимальный набор, без nsight и его зависимостей:
+The toolkit is taken from the Ubuntu repositories rather than the NVIDIA site: version 13.1 is guaranteed
+to be supported by driver 595.84 and doesn't drag in a driver replacement.
+A minimal set is installed, without nsight and its dependencies:
 
 ```bash
 sudo apt install -y cuda-nvcc-13-1 cuda-crt-13-1 cuda-cudart-dev-13-1 \
@@ -52,88 +52,88 @@ sudo apt install -y cuda-nvcc-13-1 cuda-crt-13-1 cuda-cudart-dev-13-1 \
     cuda-nvtx-13-1 libcublas-dev-13-1
 ```
 
-## Измеренные лимиты железа
+## Measured hardware limits
 
 ```
 SM count                   170
 SM clock                   2.47 GHz
-память                     512 bit @ 28.00 Gbps -> 1792 GB/s
-L2 cache                   96 MiB          <- очень много, влияет на дизайн кернелов
+memory                     512 bit @ 28.00 Gbps -> 1792 GB/s
+L2 cache                   96 MiB          <- a lot, affects kernel design
 shared mem / SM            100 KB
-shared mem / block optin   99 KB           <- потолок тайла attention
+shared mem / block optin   99 KB           <- attention tile ceiling
 registers / SM             65536
 max threads / SM           1536
 copy engines               2
 ```
 
-### Следствие: head_dim = 256 и 99 KB shared memory
+### Consequence: head_dim = 256 and 99 KB of shared memory
 
-Бюджет тайла attention (Q в bf16, K и V вместе):
+Attention tile budget (Q in bf16, K and V together):
 
-| Q-тайл | KV 32 | KV 64 | KV 128 |
+| Q tile | KV 32 | KV 64 | KV 128 |
 |---|---|---|---|
-| 16 | 40 KB ok | 72 KB ok | 136 KB **нет** |
-| 32 | 48 KB ok | 80 KB ok | 144 KB **нет** |
-| 64 | 64 KB ok | 96 KB ok | 160 KB **нет** |
-| 128 | 96 KB ok | 128 KB **нет** | 192 KB **нет** |
+| 16 | 40 KB ok | 72 KB ok | 136 KB **no** |
+| 32 | 48 KB ok | 80 KB ok | 144 KB **no** |
+| 64 | 64 KB ok | 96 KB ok | 160 KB **no** |
+| 128 | 96 KB ok | 128 KB **no** | 192 KB **no** |
 
-Максимум в bf16 — `64x64` или `128x32`.
+The maximum in bf16 is `64x64` or `128x32`.
 
-**Неочевидное следствие:** квантизация KV-кэша увеличивает не только доступную VRAM,
-но и размер тайла. В fp8 тайл `128x64` занимает 96 KB и влезает, то есть даёт вдвое
-большую арифметическую интенсивность. Это самостоятельный аргумент за fp8/nvfp4 KV,
-помимо экономии памяти.
+**Non-obvious consequence:** quantizing the KV cache increases not only the available VRAM
+but also the tile size. In fp8 a `128x64` tile takes 96 KB and fits, i.e. gives twice
+the arithmetic intensity. That is an argument for fp8/nvfp4 KV in its own right,
+beyond the memory savings.
 
-## Баг CUDA 13.1 + glibc 2.43 и обход
+## CUDA 13.1 + glibc 2.43 bug and workaround
 
-Любой `.cu`, включающий `<cstdio>` или `cuda_runtime.h`, не компилируется:
+Any `.cu` that includes `<cstdio>` or `cuda_runtime.h` fails to compile:
 
 ```
 bits/mathcalls.h(206): error: exception specification is incompatible with
 that of previous function "rsqrt" (declared at line 629 of crt/math_functions.h)
 ```
 
-glibc >= 2.41 объявляет `rsqrt`/`rsqrtf` как `noexcept` (C23 IEC-60559, под `__USE_GNU`),
-CUDA 13.1 объявляет их без `noexcept`. В C++17 спецификация исключений входит в тип
-функции, поэтому это конфликт объявлений.
+glibc >= 2.41 declares `rsqrt`/`rsqrtf` as `noexcept` (C23 IEC-60559, under `__USE_GNU`),
+CUDA 13.1 declares them without `noexcept`. In C++17 the exception specification is part of the
+function type, so this is a declaration conflict.
 
-NVIDIA исправила это в CUDA 13.3 (`_NV_RSQRT_SPECIFIER`), но 13.3 в репозиториях
-Ubuntu пока нет.
+NVIDIA fixed this in CUDA 13.3 (`_NV_RSQRT_SPECIFIER`), but 13.3 is not yet in the Ubuntu
+repositories.
 
-Что **не** работает:
-* `-U_GNU_SOURCE` — чинит конфликт, но ломает libstdc++ (`<mutex>` требует
-  `clockid_t` и `pthread_mutex_clocklock`);
-* `--diag-suppress` — ошибка не подавляется;
-* `--pre-include` — не доходит до CUDA-фронтенда, `cuda_runtime.h` включается раньше;
-* отключение фичи glibc через `-D` — `libc-header-start.h` делает `#undef` перед `#define`.
+What does **not** work:
+* `-U_GNU_SOURCE` — fixes the conflict but breaks libstdc++ (`<mutex>` needs
+  `clockid_t` and `pthread_mutex_clocklock`);
+* `--diag-suppress` — the error can't be suppressed;
+* `--pre-include` — doesn't reach the CUDA frontend, `cuda_runtime.h` is included earlier;
+* disabling the glibc feature via `-D` — `libc-header-start.h` does `#undef` before `#define`.
 
-Что работает: `scripts/gen-cuda-shim.sh`. Строит теневое дерево include из симлинков
-на настоящий toolkit плюс одна пропатченная копия `crt/math_functions.h`. Приём
-опирается на то, что CUDA подключает этот файл как `"crt/math_functions.h"` — в
-кавычках, то есть относительно каталога включающего файла.
+What works: `scripts/gen-cuda-shim.sh`. It builds a shadow include tree of symlinks
+to the real toolkit plus one patched copy of `crt/math_functions.h`. The trick
+relies on CUDA including this file as `"crt/math_functions.h"` — in
+quotes, i.e. relative to the including file's directory.
 
 ```bash
 ./scripts/gen-cuda-shim.sh third_party/cuda-shim
 nvcc -arch=sm_120a -I third_party/cuda-shim ...
 ```
 
-Убрать, как только появится CUDA >= 13.3.
+Remove as soon as CUDA >= 13.3 is available.
 
-## NVFP4 на SM120: проверено
+## NVFP4 on SM120: verified
 
-SM120 использует SM80-style `mma.sync` с блочными шкалами, а **не** `tcgen05.mma`
-датацентрового Blackwell. Всё, что построено на tcgen05 (DeepGEMM, часть SM100-схем
-CUTLASS), на 5090 не соберётся.
+SM120 uses SM80-style `mma.sync` with block scales, **not** the datacenter
+Blackwell `tcgen05.mma`. Anything built on tcgen05 (DeepGEMM, some CUTLASS SM100 schemes)
+won't build on the 5090.
 
-Нужная инструкция в CUTLASS 4.8.0 есть:
+CUTLASS 4.8.0 has the instruction we need:
 
 ```
 mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4
-атом: SM120_16x8x64_TN_VS   (include/cute/arch/mma_sm120.hpp)
+atom: SM120_16x8x64_TN_VS   (include/cute/arch/mma_sm120.hpp)
 ```
 
-Пример `79b` (NVFP4 x NVFP4, то есть наш W4A4) собирается за 31 секунду и проходит
-верификацию на реальной 5090.
+Example `79b` (NVFP4 x NVFP4, i.e. our W4A4) builds in 31 seconds and passes
+verification on a real 5090.
 
 ```bash
 nvcc -arch=sm_120a -std=c++17 -O3 \
@@ -143,12 +143,12 @@ nvcc -arch=sm_120a -std=c++17 -O3 \
   -o gemm79b third_party/cutlass/examples/79_blackwell_geforce_gemm/79b_*.cu
 ```
 
-### Полезные примеры CUTLASS для проекта
+### Useful CUTLASS examples for the project
 
-| Пример | Зачем |
+| Example | Why |
 |---|---|
-| `79b_blackwell_geforce_nvfp4_nvfp4_gemm` | базовый W4A4 GEMM, наш основной путь |
-| `91_fp4_gemv` | decode при малом batch — GEMV, а не GEMM |
-| `93_blackwell_low_latency_gqa` | decode-attention для GQA |
-| `112_blackwell_ssd` | чанковый скан state-space, близко к Gated DeltaNet |
-| `87_blackwell_geforce_gemm_blockwise` | блочные шкалы |
+| `79b_blackwell_geforce_nvfp4_nvfp4_gemm` | basic W4A4 GEMM, our main path |
+| `91_fp4_gemv` | small-batch decode — GEMV, not GEMM |
+| `93_blackwell_low_latency_gqa` | decode attention for GQA |
+| `112_blackwell_ssd` | chunked state-space scan, close to Gated DeltaNet |
+| `87_blackwell_geforce_gemm_blockwise` | block scales |

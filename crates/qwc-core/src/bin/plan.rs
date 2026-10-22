@@ -1,4 +1,4 @@
-//! Печатает план VRAM для RTX 5090 под разные конфигурации кэша.
+//! Prints the RTX 5090 VRAM plan for different cache configurations.
 //! `cargo run -p qwc-core --bin plan`
 
 use qwc_core::arch::*;
@@ -13,70 +13,70 @@ fn gb(b: u64) -> f64 {
 fn main() {
     println!("Qwen3.8-27B / RTX 5090 32GB / text-only\n");
 
-    println!("Архитектура");
+    println!("Architecture");
     println!(
-        "  слоёв: {NUM_LAYERS}  ({NUM_LINEAR_LAYERS} DeltaNet + {NUM_FULL_LAYERS} full attention)"
+        "  layers: {NUM_LAYERS}  ({NUM_LINEAR_LAYERS} DeltaNet + {NUM_FULL_LAYERS} full attention)"
     );
     println!("  hidden {HIDDEN_SIZE}, intermediate {INTERMEDIATE_SIZE}, vocab {VOCAB_SIZE}");
     println!(
-        "  attention: {NUM_ATTN_HEADS}q / {NUM_KV_HEADS}kv, head_dim {ATTN_HEAD_DIM}, RoPE на {ROPE_DIM} из {ATTN_HEAD_DIM}"
+        "  attention: {NUM_ATTN_HEADS}q / {NUM_KV_HEADS}kv, head_dim {ATTN_HEAD_DIM}, RoPE on {ROPE_DIM} of {ATTN_HEAD_DIM}"
     );
     println!(
         "  DeltaNet: {LA_NUM_K_HEADS}k / {LA_NUM_V_HEADS}v, dim {LA_K_HEAD_DIM}, conv {LA_CONV_KERNEL}"
     );
-    println!("  параметров: {:.2} B\n", TEXT_PARAMS as f64 / 1e9);
+    println!("  parameters: {:.2} B\n", TEXT_PARAMS as f64 / 1e9);
 
     let ours = WeightPlan::default();
     let shipped = WeightPlan::as_shipped();
-    println!("Веса");
+    println!("Weights");
     println!(
-        "  чекпоинт как есть (грузит vLLM): {:>6.2} GB",
+        "  checkpoint as-is (vLLM loads):           {:>6.2} GB",
         gb(shipped.bytes())
     );
     println!(
-        "  наша загрузка (text-only, fp8 head/embed): {:>6.2} GB",
+        "  our load (text-only, fp8 head/embed):    {:>6.2} GB",
         gb(ours.bytes())
     );
     println!(
-        "  читается обычным decode b=1:             {:>6.2} GB",
+        "  read by plain decode b=1:                {:>6.2} GB",
         gb(ours.decode_weight_bytes(1))
     );
-    println!("  фора: {:>6.2} GB\n", gb(shipped.bytes() - ours.bytes()));
+    println!("  head start: {:>6.2} GB\n", gb(shipped.bytes() - ours.bytes()));
 
     let cfg = CacheConfig::default();
     println!(
-        "Кэш (kv {}, state {})",
+        "Cache (kv {}, state {})",
         cfg.kv_dtype.name(),
         cfg.state_dtype.name()
     );
     println!(
-        "  KV на токен (16 слоёв):        {:>8} B",
+        "  KV per token (16 layers):      {:>8} B",
         cfg.kv_bytes_per_token()
     );
     println!(
-        "  состояние на слот (48 слоёв):  {:>8.1} MB",
+        "  state per slot (48 layers):    {:>8.1} MB",
         cfg.state_bytes_per_slot() as f64 / 1e6
     );
     println!(
-        "  точка пересечения:             {:>8} токенов\n",
+        "  crossover point:               {:>8} tokens\n",
         cfg.crossover_tokens()
     );
 
     let b = rtx5090(ours.bytes(), 2 * GB);
-    println!("Бюджет");
-    println!("  всего VRAM      {:>6.2} GB", gb(b.total_vram));
+    println!("Budget");
+    println!("  total VRAM      {:>6.2} GB", gb(b.total_vram));
     println!(
-        "  зарезервировано {:>6.2} GB (десктоп + CUDA-контекст)",
+        "  reserved        {:>6.2} GB (desktop + CUDA context)",
         gb(b.reserved)
     );
-    println!("  веса            {:>6.2} GB", gb(b.weights));
+    println!("  weights         {:>6.2} GB", gb(b.weights));
     println!("  workspace       {:>6.2} GB", gb(b.workspace));
-    println!("  под кэш         {:>6.2} GB\n", gb(b.cache_available()));
+    println!("  for cache       {:>6.2} GB\n", gb(b.cache_available()));
 
-    println!("Максимальный concurrency по длине контекста");
+    println!("Max concurrency by context length");
     println!(
         "  {:>8} | {:>10} | {:>10} | {:>12}",
-        "контекст", "fp8 KV", "nvfp4 KV", "vLLM-like fp8"
+        "context", "fp8 KV", "nvfp4 KV", "vLLM-like fp8"
     );
     println!("  {:->8}-+-{:->10}-+-{:->10}-+-{:->12}", "", "", "", "");
     let fp4 = CacheConfig {
@@ -94,7 +94,7 @@ fn main() {
         );
     }
 
-    println!("\nЦелевая матрица бенчмарков");
+    println!("\nTarget benchmark matrix");
     for (name, conc, inp, out) in [
         ("single latency", 1usize, 512usize, 256usize),
         ("long context", 1, 16 * 1024, 512),
@@ -118,10 +118,10 @@ fn main() {
             }
         );
     }
-    println!("\nПотолок decode (memory-bound: за шаг читаются все веса)");
+    println!("\nDecode ceiling (memory-bound: each step reads all weights)");
     println!(
         "  {:>6} | {:>7} | {:>12} | {:>12} | {:>12}",
-        "batch", "ctx", "ITL идеал", "ITL @53%", "tok/s идеал"
+        "batch", "ctx", "ITL ideal", "ITL @53%", "tok/s ideal"
     );
     println!(
         "  {:->6}-+-{:->7}-+-{:->12}-+-{:->12}-+-{:->12}",
@@ -155,7 +155,7 @@ fn main() {
         );
     }
 
-    println!("\nИз чего состоит шаг decode (batch=32, ctx=2048)");
+    println!("\nWhat a decode step consists of (batch=32, ctx=2048)");
     let step = DecodeStep {
         batch: 32,
         context_len: 2048,
@@ -163,9 +163,9 @@ fn main() {
     };
     let c = step.cost(ours.decode_weight_bytes(step.batch), &cfg);
     for (name, bytes) in [
-        ("веса", c.weight_bytes),
-        ("состояние DeltaNet", c.state_bytes),
-        ("KV-кэш", c.kv_bytes),
+        ("weights", c.weight_bytes),
+        ("DeltaNet state", c.state_bytes),
+        ("KV cache", c.kv_bytes),
     ] {
         println!(
             "  {:<20} {:>7.2} GB  {:>4.0}%",
@@ -175,7 +175,7 @@ fn main() {
         );
     }
     println!(
-        "  переход в compute-bound при batch ~{:.0}",
+        "  compute-bound transition at batch ~{:.0}",
         compute_bound_batch(Dtype::Nvfp4)
     );
 }

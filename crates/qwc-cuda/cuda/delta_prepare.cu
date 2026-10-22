@@ -85,12 +85,12 @@ __global__ void causal_conv_split_kernel(
   }
 }
 
-// Свёртка на четыре отвода по токенам параллельна: последовательна только
-// переноска истории между чанками. Прежняя раскладка отдавала потоку канал
-// целиком и шла по токенам в программном порядке — это 40 блоков на 170 SM,
-// то есть меньше четверти чипа. Здесь поток считает один выход (канал, токен),
-// а хвост истории дописывает отдельный запуск: писать её здесь значило бы
-// гонку с блоками, которые ту же историю читают на первых трёх токенах.
+// The four-tap convolution over tokens is parallel: only carrying history
+// between chunks is sequential. The old layout gave a thread a whole
+// channel and walked tokens in program order — that's 40 blocks on 170 SMs,
+// i.e. less than a quarter of the chip. Here a thread computes one output (channel, token),
+// and a separate launch appends the history tail: writing it here would mean
+// racing with blocks that read the same history on the first three tokens.
 __device__ __forceinline__ float conv_input(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     const float* __restrict__ history,
@@ -142,9 +142,9 @@ __global__ void causal_conv_prefill_kernel(
   }
 }
 
-// Хвост чанка становится историей следующего. Поток владеет тремя значениями
-// своего канала и читает их до записи, поэтому чанк короче трёх токенов
-// доносит остаток прежней истории без гонки.
+// The chunk's tail becomes the next one's history. A thread owns three values
+// of its channel and reads them before writing, so a chunk shorter than three tokens
+// carries over the rest of the previous history without a race.
 __global__ void conv_state_prefill_kernel(
     const __nv_bfloat16* __restrict__ mixed_qkv,
     float* __restrict__ conv_state,
@@ -213,10 +213,10 @@ __global__ __launch_bounds__(kHeadDim) void normalize_and_gate_kernel(
   query[base + dimension] = normalized_q;
   key[base + dimension] = normalized_k;
 
-  // k . q не зависит от строки состояния: в скане его пересчитывали все 128
-  // строк каждой из трёх v-голов, то есть 384 раза одно число, и бабочка на
-  // него стоила трети shuffle-инструкций горячего цикла. Здесь оба вектора
-  // уже в регистрах, и редукция переиспользует ту же shared-память.
+  // k . q doesn't depend on the state row: the scan recomputed it in all 128
+  // rows of each of the three v heads, i.e. the same number 384 times, and the butterfly for
+  // it cost a third of the hot loop's shuffle instructions. Here both vectors
+  // are already in registers, and the reduction reuses the same shared memory.
   float kq_sum = warp_sum(normalized_q * normalized_k);
   if (lane == 0) {
     warp_q[warp] = kq_sum;
@@ -231,7 +231,7 @@ __global__ __launch_bounds__(kHeadDim) void normalize_and_gate_kernel(
 
   if (dimension < 3) {
     const int value_head = head * 3 + dimension;
-    // Гейты читаются из арены с её шагом, а alpha/beta пишутся плотно.
+    // Gates are read from the arena with its stride, while alpha/beta are written densely.
     const size_t gate_read = static_cast<size_t>(batch) * gate_stride + value_head;
     const size_t gate_offset = static_cast<size_t>(batch) * kVHeads + value_head;
     const float projected_a = __bfloat162float(a_projection[gate_read]);

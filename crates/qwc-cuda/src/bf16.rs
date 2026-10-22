@@ -1,6 +1,6 @@
-//! Минимальный bf16 без внешних зависимостей.
-//! bf16 — это старшие 16 бит f32, поэтому преобразование тривиально;
-//! важно лишь округлять так же, как `__float2bfloat16` на GPU (к ближайшему чётному).
+//! Minimal bf16 without external dependencies.
+//! bf16 is the upper 16 bits of an f32, so conversion is trivial;
+//! what matters is rounding the same way as `__float2bfloat16` on the GPU (round to nearest even).
 
 pub fn from_f32(x: f32) -> u16 {
     let bits = x.to_bits();

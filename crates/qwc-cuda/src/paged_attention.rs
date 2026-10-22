@@ -32,9 +32,9 @@ impl KvCacheDtype {
     }
 }
 
-/// Построчный путь обслуживает по строке на последовательность, поэтому его
-/// разметка партиций рассчитана на число слотов, а не на размер чанка
-/// префилла: чанк идёт отдельным ядром и workspace не трогает.
+/// The row-wise path serves one row per sequence, so its
+/// partition sizing is computed for the number of slots, not the prefill chunk
+/// size: a chunk goes through a separate kernel and doesn't touch the workspace.
 pub const MAX_DECODE_ROWS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,10 +77,10 @@ pub struct PagedAttentionWorkspace {
     max_context: usize,
     partitions: usize,
     kernel: DecodeKernel,
-    /// Ядро и партиции выбираются на каждом вызове по фактическому числу
-    /// строк, а не по ёмкости. Иначе исполнитель на 32 слота гонял бы
-    /// одиночный decode на 32K одной партицией: 24 CTA на 170 SM и 15x к
-    /// времени внимания против разбиения под batch 1.
+    /// The kernel and partitions are chosen on every call by the actual number
+    /// of rows, not by capacity. Otherwise a 32-slot executor would run
+    /// a single decode at 32K with one partition: 24 CTAs on 170 SMs and 15x the
+    /// attention time vs a split for batch 1.
     adaptive: bool,
 }
 
@@ -167,56 +167,56 @@ impl PagedAttentionWorkspace {
     }
 }
 
-/// Упакованных строк (строка запроса x голова группы) в тайле упакованного
-/// ядра не больше четырёх m16-тайлов.
+/// Packed rows (query row x group head) in a packed-kernel tile:
+/// at most four m16 tiles.
 const PACKED_MAX_TILE_SIZE: usize = 64;
-/// SM у RTX 5090: упакованное ядро держит один CTA на SM, shared у него
-/// 72-98 КиБ.
+/// SMs on the RTX 5090: the packed kernel holds one CTA per SM, its shared is
+/// 72-98 KiB.
 const PACKED_SMS: usize = 170;
-/// Четыре страницы: короче отрезок не окупает запись частичных сумм.
+/// Four pages: a shorter span doesn't pay for writing partial sums.
 const PACKED_MIN_TOKENS_PER_PARTITION: usize = 4 * PAGE_SIZE;
-/// Постоянные издержки CTA в ключах отрезка: укладка запроса, разгон
-/// конвейера, запись частичных сумм.
+/// Fixed CTA overhead in span keys: query staging, pipeline
+/// ramp-up, writing partial sums.
 const PACKED_CTA_OVERHEAD_KEYS: usize = 64;
-/// Потолок пар (строка, партиция): держит частичные суммы в 51 МБ. Выход
-/// партиции лежит в f16, и пар влезает вдвое больше, чем в fp32: 384 и 512
-/// строк берут P=7 — 6 и 8 почти полных волн — вместо P=1 (144 CTA на
-/// 170 SM) и P=4 (4.5 волны, пятая наполовину пуста).
+/// Cap on (row, partition) pairs: keeps partial sums within 51 MB. The partition
+/// output is in f16, and twice as many pairs fit as in fp32: 384 and 512
+/// rows take P=7 — 6 and 8 nearly full waves — instead of P=1 (144 CTAs on
+/// 170 SMs) and P=4 (4.5 waves, the fifth half empty).
 const PACKED_MAX_PARTIAL_ROWS: usize = 4096;
-/// Байт частичных сумм на пару (строка запроса x голова, партиция): max и
-/// sum в fp32, нормированный выход партиции в f16.
+/// Partial-sum bytes per (query row x head, partition) pair: max and
+/// sum in fp32, the normalized partition output in f16.
 const PACKED_PARTIAL_BYTES: usize = 2 * size_of::<f32>() + ATTN_HEAD_DIM * size_of::<u16>();
 
-/// Байт частичных сумм упакованного ядра на `rows` строк и `partitions`.
+/// Partial-sum bytes of the packed kernel for `rows` rows and `partitions`.
 fn packed_workspace_bytes(rows: usize, partitions: usize) -> usize {
     if partitions == 1 { 0 } else { rows * NUM_ATTN_HEADS * partitions * PACKED_PARTIAL_BYTES }
 }
 
-/// Чьи строки идут в упакованное ядро.
+/// Whose rows go into the packed kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackedShape {
-    /// Decode-строки разных последовательностей: у каждой своя таблица
-    /// страниц, тайл — одна строка.
+    /// Decode rows of different sequences: each has its own page
+    /// table, a tile is one row.
     Rows,
-    /// Сегмент одной последовательности: проверка черновиков, хвост промпта,
-    /// чанк. Тайл — несколько строк с общей таблицей.
+    /// A segment of one sequence: draft verification, prompt tail,
+    /// chunk. A tile is several rows with a shared table.
     Segment,
 }
 
-/// Упакованных строк в тайле упакованного ядра.
+/// Packed rows in a packed-kernel tile.
 pub fn packed_tile_size(shape: PackedShape, rows: usize) -> usize {
     assert!(rows > 0);
     match shape {
-        // Тайл — одна строка: у соседней своя таблица страниц.
+        // A tile is one row: the neighbor has its own page table.
         PackedShape::Rows => GQA_GROUP,
-        // Строки сегмента делят таблицу, и тайл режется по упакованным строкам
-        // без оглядки на границы строк запроса. До пяти строк сегмент ложится
-        // в один тайл на 16 или 32 строки.
+        // Segment rows share the table, and a tile is cut by packed rows
+        // regardless of query row boundaries. Up to five rows a segment fits
+        // in one tile of 16 or 32 rows.
         PackedShape::Segment => (rows * GQA_GROUP).min(PACKED_MAX_TILE_SIZE),
     }
 }
 
-/// m16-тайлов в тайле упакованного ядра на `tile_size` упакованных строк.
+/// m16 tiles in a packed-kernel tile for `tile_size` packed rows.
 fn packed_m_tiles(tile_size: usize) -> usize {
     match tile_size {
         0..=16 => 1,
@@ -225,25 +225,25 @@ fn packed_m_tiles(tile_size: usize) -> usize {
     }
 }
 
-/// Партиций контекста у упакованного ядра на `rows` строк с контекстом до
-/// `context`. Числа — `packedbench --sweep`, 16 слоёв, fp8.
+/// Context partitions of the packed kernel for `rows` rows with context up to
+/// `context`. Numbers are from `packedbench --sweep`, 16 layers, fp8.
 pub fn packed_partition_count(shape: PackedShape, rows: usize, context: usize) -> usize {
     assert!(rows > 0 && context > 0);
     let tile_size = packed_tile_size(shape, rows);
     let ctas = NUM_KV_HEADS * (rows * GQA_GROUP).div_ceil(tile_size);
     let most = packed_most_partitions(rows, context);
     if packed_m_tiles(tile_size) < 4 {
-        // Один-два m-тайла упираются в полосу памяти, и её насыщают 64 CTA на
-        // m-тайл; лишние партиции только пишут частичные суммы. Decode на 60k:
-        // P=16 — 84 мкс, P=42 — 91; проверка 4 строк на 30k: P=32 — 50, P=16 — 70.
+        // One or two m-tiles are memory-bandwidth bound, and 64 CTAs per
+        // m-tile saturate it; extra partitions only write partial sums. Decode at 60k:
+        // P=16 — 84 µs, P=42 — 91; verifying 4 rows at 30k: P=32 — 50, P=16 — 70.
         return (64 * packed_m_tiles(tile_size)).div_ceil(ctas).min(most);
     }
-    // Тайл в 64 строки упирается в тензорные ядра, CTA на SM один, и каждая
-    // начатая волна стоит целую. Время — волны x (отрезок + издержки CTA);
-    // издержки подогнаны по плотному свипу (`packedbench --dense`): 64 ключа.
-    // Лучшее P модель угадывает на 28 формах из 36, в среднем промах 1.8%;
-    // прежнее правило «3.5-6 волн» промахивалось на 14%, до 53%. 64 строки
-    // на 8k: P=7 (168 CTA, одна волна) — 81 мкс, P=28 — 109.
+    // A 64-row tile is tensor-core bound, one CTA per SM, and every
+    // started wave costs a full one. Time is waves x (span + CTA overhead);
+    // the overhead is fitted on a dense sweep (`packedbench --dense`): 64 keys.
+    // The model guesses the best P on 28 of 36 shapes, missing by 1.8% on average;
+    // the old "3.5-6 waves" rule missed by 14%, up to 53%. 64 rows
+    // at 8k: P=7 (168 CTAs, one wave) — 81 µs, P=28 — 109.
     (1..=most)
         .min_by_key(|&partitions| {
             let (used, span) = packed_split(context, partitions);
@@ -252,8 +252,8 @@ pub fn packed_partition_count(shape: PackedShape, rows: usize, context: usize) -
         .unwrap()
 }
 
-/// Больше партиций `packed_partition_count` не даёт: отрезок не короче
-/// четырёх страниц, пар (строка, партиция) не больше потолка.
+/// `packed_partition_count` gives no more partitions than this: a span no shorter than
+/// four pages, (row, partition) pairs no more than the cap.
 fn packed_most_partitions(rows: usize, context: usize) -> usize {
     context
         .div_ceil(PACKED_MIN_TOKENS_PER_PARTITION)
@@ -261,12 +261,12 @@ fn packed_most_partitions(rows: usize, context: usize) -> usize {
         .max(1)
 }
 
-/// Партиций, которых хватит `rows` строкам при любом контексте до
-/// `max_context`. Волновая модель по контексту не монотонна: восемь строк
-/// прогрева MTP берут на 32768 P=40, а на 32256 — P=42, и workspace по
-/// потолку контекста оказывался мал. Для неё граница — наибольшее допустимое
-/// P; у одного-двух m-тайлов P растёт с контекстом, и хватает значения на
-/// потолке.
+/// Partitions that will suffice for `rows` rows at any context up to
+/// `max_context`. The wave model isn't monotonic in context: eight MTP priming
+/// rows take P=40 at 32768 but P=42 at 32256, and a workspace sized by
+/// the context cap turned out too small. For it the bound is the largest allowed
+/// P; for one or two m-tiles P grows with context, and the value at the cap
+/// suffices.
 fn packed_partition_bound(shape: PackedShape, rows: usize, max_context: usize) -> usize {
     if packed_m_tiles(packed_tile_size(shape, rows)) < 4 {
         packed_partition_count(shape, rows, max_context)
@@ -275,8 +275,8 @@ fn packed_partition_bound(shape: PackedShape, rows: usize, max_context: usize) -
     }
 }
 
-/// Байт частичных сумм, которых хватит любому вызову форм `shapes` до
-/// `max_rows` строк с контекстом до `max_context`.
+/// Partial-sum bytes that will suffice for any call of shapes `shapes` up to
+/// `max_rows` rows with context up to `max_context`.
 fn packed_workspace_capacity(shapes: &[PackedShape], max_rows: usize, max_context: usize) -> usize {
     (1..=max_rows)
         .flat_map(|rows| {
@@ -288,36 +288,36 @@ fn packed_workspace_capacity(shapes: &[PackedShape], max_rows: usize, max_contex
         .unwrap_or(0)
 }
 
-/// Сколько партиций получат ключи и какой длины отрезок, если контекст
-/// `context` режется на `partitions`: ядро округляет отрезок до страницы.
+/// How many partitions get keys and what span length, if context
+/// `context` is split into `partitions`: the kernel rounds the span to a page.
 fn packed_split(context: usize, partitions: usize) -> (usize, usize) {
     let span = context.div_ceil(partitions * PAGE_SIZE) * PAGE_SIZE;
     (context.div_ceil(span), span)
 }
 
-/// Частичные суммы упакованного внимания.
+/// Partial sums of packed attention.
 pub struct PackedAttentionWorkspace {
     storage: DeviceBuffer<u8>,
     bytes: usize,
     max_rows: usize,
     max_context: usize,
-    /// Число партиций для стендов и тестов; `None` — по форме вызова.
+    /// Number of partitions for benches and tests; `None` — by call shape.
     forced: Option<usize>,
 }
 
-/// План вызова упакованного ядра. Отрезок партиции ядро считает само, по
-/// фактическому контексту тайла.
+/// Call plan for the packed kernel. The kernel computes the partition span itself, from
+/// the tile's actual context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackedPlan {
-    /// Упакованных строк в тайле.
+    /// Packed rows in a tile.
     pub tile_size: usize,
     pub partitions: usize,
 }
 
 impl PackedAttentionWorkspace {
-    /// Под любой вызов форм `shapes` до `max_rows` строк с контекстом до
-    /// `max_context`. Decode-строкам хватает килобайт, сегментам нужно до
-    /// 51 МБ.
+    /// For any call of shapes `shapes` up to `max_rows` rows with context up to
+    /// `max_context`. Decode rows need kilobytes, segments need up to
+    /// 51 MB.
     pub fn new(shapes: &[PackedShape], max_rows: usize, max_context: usize) -> Result<Self> {
         assert!(max_rows > 0 && max_context > 0 && !shapes.is_empty());
         let bytes = packed_workspace_capacity(shapes, max_rows, max_context);
@@ -346,7 +346,7 @@ impl PackedAttentionWorkspace {
         })
     }
 
-    /// Тайл и партиции для вызова.
+    /// Tile and partitions for a call.
     pub fn plan_for(&self, shape: PackedShape, rows: usize, context: usize) -> PackedPlan {
         assert!(rows > 0 && rows <= self.max_rows);
         assert!(context > 0 && context <= self.max_context);
@@ -361,14 +361,14 @@ impl PackedAttentionWorkspace {
     }
 }
 
-/// Внимание с упакованной GQA-группой по fp8-кэшу: CTA на KV-голову, шесть
-/// голов группы идут строками одного MMA-тайла, и KV читается один раз.
+/// Attention with a packed GQA group over the fp8 cache: a CTA per KV head, the six
+/// heads of a group go as rows of one MMA tile, and KV is read once.
 ///
-/// `context` выбирает число партиций и должен быть не меньше наибольшего
-/// контекста строк; сами отрезки ядро режет по фактическому контексту. Под
-/// CUDA-графом сюда стоит отдавать потолок контекста, а не текущий. Строки
-/// `row_base..row_base + rows`; для [`PackedShape::Segment`] у них общая
-/// таблица страниц.
+/// `context` picks the number of partitions and must be at least the largest
+/// context of the rows; the kernel cuts the spans itself by the actual context. Under
+/// a CUDA graph the context cap should be passed here, not the current one. Rows are
+/// `row_base..row_base + rows`; for [`PackedShape::Segment`] they share a
+/// page table.
 #[allow(clippy::too_many_arguments)]
 pub fn gated_packed(
     query: &DeviceBuffer<u16>,
@@ -396,7 +396,7 @@ pub fn gated_packed(
     assert!(context_lengths.len() >= end);
     assert!(block_tables.len() >= end * max_blocks_per_sequence);
     let cache_bytes = num_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
-    assert_eq!(key_cache.len(), cache_bytes, "упакованное ядро только для fp8-кэша");
+    assert_eq!(key_cache.len(), cache_bytes, "the packed kernel is fp8-cache only");
     assert_eq!(value_cache.len(), cache_bytes);
     check(unsafe {
         ffi::qwc_paged_attention_packed_fp8(
@@ -584,15 +584,15 @@ fn decode_impl(
 
 /// Causal attention over a contiguous chunk of prefill rows of one sequence.
 ///
-/// Decode-ядро обслуживает одну строку запроса за проход и потому перечитывает
-/// страницы KV столько раз, сколько в чанке токенов. Здесь один проход по KV
-/// обслуживает тайл строк, так что трафик падает кратно размеру тайла.
-/// Строки должны идти подряд и принадлежать одной последовательности: тайл
-/// делит между собой таблицу блоков, а маска остаётся причинной за счёт того,
-/// что у каждой строки свой `context_lengths`.
+/// The decode kernel serves one query row per pass and so re-reads
+/// KV pages as many times as there are tokens in the chunk. Here one KV pass
+/// serves a tile of rows, so traffic drops by a multiple of the tile size.
+/// Rows must be consecutive and belong to one sequence: the tile
+/// shares a block table, and the mask stays causal because
+/// each row has its own `context_lengths`.
 ///
-/// Редукции здесь варповые. Ядро оставлено как эталон: тесты сверяют с ним
-/// ядро на тензорных ядрах.
+/// Reductions here are warp-level. The kernel is kept as a reference: tests check
+/// the tensor-core kernel against it.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_gated(
     query: &DeviceBuffer<u16>,
@@ -643,11 +643,11 @@ pub fn prefill_gated(
     })
 }
 
-/// То же самое на тензорных ядрах: QK^T и PV идут через mma.m16n8k16, а не
-/// через варповые редукции.
+/// The same on tensor cores: QK^T and PV go through mma.m16n8k16 rather than
+/// warp reductions.
 ///
-/// Тайл строк должен лежать в одной последовательности — таблица страниц
-/// берётся у первой строки тайла. Чанк префилла это условие выполняет.
+/// A tile of rows must lie in one sequence — the page table
+/// is taken from the tile's first row. A prefill chunk satisfies this condition.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_gated_mma(
     query: &DeviceBuffer<u16>,
@@ -712,8 +712,8 @@ mod tests {
         assert_eq!(select_decode_kernel(32, 8_192), DecodeKernel::QueryHead);
     }
 
-    /// Лучшие точки `packedbench --sweep` на 60k: выбор партиций должен в них
-    /// попадать.
+    /// The best points of `packedbench --sweep` at 60k: the partition choice must
+    /// hit them.
     #[test]
     fn packed_partitions_follow_the_measured_sweep() {
         let rows_plan = |rows| packed_partition_count(PackedShape::Rows, rows, 60_000);
@@ -721,29 +721,29 @@ mod tests {
         let segment_plan = |rows| packed_partition_count(PackedShape::Segment, rows, 60_000);
         assert_eq!(segment_plan(1), 16);
         assert_eq!(segment_plan(4), 32);
-        // Один тайл: полная волна из 164 CTA.
+        // One tile: a full wave of 164 CTAs.
         assert_eq!(segment_plan(8), 41);
-        // Тайлы по 64 строки — 24 CTA на партицию, и 7 партиций дают 168 CTA:
-        // одна почти полная волна или целое их число.
+        // 64-row tiles are 24 CTAs per partition, and 7 partitions give 168 CTAs:
+        // one nearly full wave or a whole number of them.
         assert_eq!([64, 128, 192, 256].map(segment_plan), [7, 7, 7, 7]);
-        // 384 и 512 строк — 144 и 192 CTA на партицию: P=7 даёт 6 и 8 почти
-        // полных волн. В fp32 частичные суммы пускали их только до P=5 и P=4.
+        // 384 and 512 rows are 144 and 192 CTAs per partition: P=7 gives 6 and 8 nearly
+        // full waves. In fp32 the partial sums allowed them only up to P=5 and P=4.
         assert_eq!([384, 512].map(segment_plan), [7, 7]);
-        // Дальше P упирается в потолок частичных сумм.
+        // Beyond that P hits the partial-sum cap.
         assert_eq!(segment_plan(1_024), 3);
         assert_eq!(segment_plan(2_048), 1);
-        // Короткий контекст не режется мельче четырёх страниц.
+        // A short context isn't cut finer than four pages.
         assert_eq!(packed_partition_count(PackedShape::Segment, 4, 1_000), 4);
-        // Частичные суммы не выходят за потолок пар (строка, партиция).
+        // Partial sums don't exceed the (row, partition) pair cap.
         for rows in 1..=2_048 {
             let partitions = segment_plan(rows);
             assert!(partitions == 1 || rows * partitions <= PACKED_MAX_PARTIAL_ROWS, "{rows}");
         }
     }
 
-    /// Workspace, размеченный по потолку контекста, должен вмещать вызов с
-    /// любым меньшим контекстом: прогрев MTP восемью строками на 32256
-    /// просил P=42 при P=40 на потолке 32768 и падал на проверке размера.
+    /// A workspace sized by the context cap must fit a call with
+    /// any smaller context: MTP priming with eight rows at 32256
+    /// asked for P=42 with P=40 at the 32768 cap and failed the size check.
     #[test]
     fn packed_workspace_covers_every_context_below_the_ceiling() {
         for (shapes, max_rows) in [
@@ -760,13 +760,13 @@ mod tests {
                         let partitions = packed_partition_count(shape, rows, context);
                         assert!(
                             packed_workspace_bytes(rows, partitions) <= capacity,
-                            "{shape:?}: {rows} строк на {context}, P={partitions}"
+                            "{shape:?}: {rows} rows at {context}, P={partitions}"
                         );
                     }
                 }
             }
         }
-        // Восемь строк сегмента: 12.8 МБ, а не 51, как у арены префилла.
+        // Eight segment rows: 12.8 MB, not 51 as for the prefill arena.
         assert_eq!(packed_workspace_capacity(&[PackedShape::Segment], 8, 32_768), 8 * 24 * 128 * 520);
         assert_eq!(
             packed_workspace_capacity(&[PackedShape::Rows, PackedShape::Segment], 2_048, 32_768),

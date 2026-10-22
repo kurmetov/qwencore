@@ -1,5 +1,5 @@
-//! Потоки и события CUDA. События нужны прежде всего для замеров:
-//! точность порядка микросекунд, чего хватает для профилирования кернелов.
+//! CUDA streams and events. Events are needed primarily for measurements:
+//! microsecond-order precision, which is enough for profiling kernels.
 
 use crate::error::{Result, check};
 use crate::ffi;
@@ -49,7 +49,7 @@ impl Event {
         check(unsafe { ffi::cudaEventSynchronize(self.0) })
     }
 
-    /// Миллисекунды между двумя событиями.
+    /// Milliseconds between two events.
     pub fn elapsed_ms(start: &Event, end: &Event) -> Result<f32> {
         let mut ms = 0.0f32;
         check(unsafe { ffi::cudaEventElapsedTime(&mut ms, start.0, end.0) })?;

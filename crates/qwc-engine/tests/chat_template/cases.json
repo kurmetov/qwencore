@@ -1,0 +1,274 @@
+[
+ {
+  "name": "plain",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Привет"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>user\nПривет<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "system_thinking",
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": " Будь краток. "
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nБудь краток.<|im_end|>\n<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "empty_system",
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "  "
+    },
+    {
+     "role": "user",
+     "content": "x"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>user\nx<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "history",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "a"
+    },
+    {
+     "role": "assistant",
+     "content": "b"
+    },
+    {
+     "role": "user",
+     "content": "c"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "expected": "<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "tools_round",
+  "request": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Ты помощник."
+    },
+    {
+     "role": "user",
+     "content": "Python на удалёнке?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "search_vacancies",
+        "arguments": {
+         "query": "python",
+         "salary_from": 500000,
+         "remote": true
+        }
+       }
+      },
+      {
+       "id": "c2",
+       "type": "function",
+       "function": {
+        "name": "get_vacancy",
+        "arguments": {
+         "vacancy_id": "hh-1"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "{\"total\": 3}"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c2",
+     "content": "{\"id\": \"hh-1\"}"
+    }
+   ],
+   "enable_thinking": false,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search_vacancies",
+      "description": "Поиск вакансий «по снимку».",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string",
+         "description": "слова"
+        },
+        "salary_from": {
+         "type": "integer"
+        },
+        "remote": {
+         "type": "boolean"
+        },
+        "category": {
+         "type": "string",
+         "enum": [
+          "backend",
+          "qa"
+         ]
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_vacancy",
+      "description": "Карточка по id.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "vacancy_id": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "vacancy_id"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search_vacancies\", \"description\": \"Поиск вакансий «по снимку».\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"слова\"}, \"salary_from\": {\"type\": \"integer\"}, \"remote\": {\"type\": \"boolean\"}, \"category\": {\"type\": \"string\", \"enum\": [\"backend\", \"qa\"]}}, \"required\": [\"query\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_vacancy\", \"description\": \"Карточка по id.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"vacancy_id\": {\"type\": \"string\"}}, \"required\": [\"vacancy_id\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nТы помощник.<|im_end|>\n<|im_start|>user\nPython на удалёнке?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=search_vacancies>\n<parameter=query>\npython\n</parameter>\n<parameter=salary_from>\n500000\n</parameter>\n<parameter=remote>\ntrue\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_vacancy>\n<parameter=vacancy_id>\nhh-1\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"total\": 3}\n</tool_response>\n<tool_response>\n{\"id\": \"hh-1\"}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "name": "tools_text_before_call",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "content": "Сейчас поищу.",
+     "reasoning_content": "нужен поиск",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "search_vacancies",
+        "arguments": {
+         "query": "python",
+         "salary_from": 500000,
+         "remote": true
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "[]"
+    },
+    {
+     "role": "assistant",
+     "content": "Ничего нет."
+    },
+    {
+     "role": "user",
+     "content": "ещё"
+    }
+   ],
+   "enable_thinking": true,
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search_vacancies",
+      "description": "Поиск вакансий «по снимку».",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string",
+         "description": "слова"
+        },
+        "salary_from": {
+         "type": "integer"
+        },
+        "remote": {
+         "type": "boolean"
+        },
+        "category": {
+         "type": "string",
+         "enum": [
+          "backend",
+          "qa"
+         ]
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_vacancy",
+      "description": "Карточка по id.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "vacancy_id": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "vacancy_id"
+       ]
+      }
+     }
+    }
+   ]
+  },
+  "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"search_vacancies\", \"description\": \"Поиск вакансий «по снимку».\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \"слова\"}, \"salary_from\": {\"type\": \"integer\"}, \"remote\": {\"type\": \"boolean\"}, \"category\": {\"type\": \"string\", \"enum\": [\"backend\", \"qa\"]}}, \"required\": [\"query\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"get_vacancy\", \"description\": \"Карточка по id.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"vacancy_id\": {\"type\": \"string\"}}, \"required\": [\"vacancy_id\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\nнужен поиск\n</think>\n\nСейчас поищу.\n\n<tool_call>\n<function=search_vacancies>\n<parameter=query>\npython\n</parameter>\n<parameter=salary_from>\n500000\n</parameter>\n<parameter=remote>\ntrue\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n[]\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nНичего нет.<|im_end|>\n<|im_start|>user\nещё<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+]

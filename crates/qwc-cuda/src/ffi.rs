@@ -1,4 +1,4 @@
-//! Прямые объявления CUDA Runtime API. Только то, что используется.
+//! Direct CUDA Runtime API declarations. Only what's used.
 
 use std::ffi::{c_char, c_int, c_void};
 
@@ -51,12 +51,12 @@ unsafe extern "C" {
     pub fn cudaEventSynchronize(event: Event) -> c_int;
     pub fn cudaEventElapsedTime(ms: *mut f32, start: Event, end: Event) -> c_int;
 
-    // Кернелы из cuda/bandwidth.cu
+    // Kernels from cuda/bandwidth.cu
     pub fn qwc_bw_read(src: *const c_void, bytes: usize, out: *mut f32, stream: Stream) -> c_int;
     pub fn qwc_bw_copy(src: *const c_void, dst: *mut c_void, bytes: usize, stream: Stream)
     -> c_int;
 
-    // Кернелы из cuda/vocab_fp8.cu
+    // Kernels from cuda/vocab_fp8.cu
     pub fn qwc_fp8_quantize_rows(
         input: *const c_void,
         output: *mut c_void,
@@ -102,7 +102,7 @@ unsafe extern "C" {
         stream: Stream,
     ) -> c_int;
 
-    /// Логиты только по списку строк словаря — для черновой головы.
+    /// Logits only over a list of vocab rows — for the draft head.
     #[allow(clippy::too_many_arguments)]
     pub fn qwc_fp8_lm_head_subset(
         weights: *const c_void,
@@ -143,7 +143,7 @@ unsafe extern "C" {
 
     pub fn qwc_fp8_max_batched_logits() -> c_int;
 
-    // Кернел из cuda/delta_net.cu
+    // Kernel from cuda/delta_net.cu
     #[allow(clippy::too_many_arguments)]
     pub fn qwc_delta_decode(
         state: *mut c_void,
@@ -347,7 +347,7 @@ unsafe extern "C" {
         stream: Stream,
     ) -> c_int;
 
-    // NVFP4 weight-only decode projection из cuda/nvfp4.cu.
+    // NVFP4 weight-only decode projection from cuda/nvfp4.cu.
     #[allow(clippy::too_many_arguments)]
     pub fn qwc_nvfp4_w4a16(
         packed: *const c_void,
@@ -361,7 +361,7 @@ unsafe extern "C" {
         stream: Stream,
     ) -> c_int;
 
-    /// Свиповая точка входа: геометрия задаётся снаружи. Движок её не зовёт.
+    /// Sweep entry point: geometry is set from outside. The engine doesn't call it.
     #[allow(clippy::too_many_arguments)]
     pub fn qwc_nvfp4_w4a16_tuned(
         packed: *const c_void,

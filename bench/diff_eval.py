@@ -98,9 +98,9 @@ def package_version(name: str) -> str:
 
 
 def display_path(path: Path | str) -> str:
-    """Путь для run-header: дом — через `$HOME`. Артефакты уходят в публичный
-    репозиторий, и имя пользователя в каждом из них не нужно. Движок при этом
-    получает настоящий путь — подменяется только записываемая строка."""
+    """Path for the run header: home goes as `$HOME`. Artifacts go to a public
+    repository, and the username doesn't belong in each of them. The engine still
+    gets the real path — only the recorded string is substituted."""
     resolved = Path(path).expanduser().resolve()
     home = Path.home().resolve()
     try:
@@ -262,32 +262,32 @@ def run_vllm(args: argparse.Namespace) -> None:
         enforce_eager=args.eager,
         disable_log_stats=True,
         max_logprobs=max(args.top_k, 20),
-        # Случаи идут по одному, и каждый считается с нуля. В state-length
-        # короткий промпт — префикс длинного того же документа: с кэшем vLLM
-        # поднял бы его KV и состояние DeltaNet вместо префилла.
+        # Cases run one at a time, and each is computed from scratch. In state-length
+        # the short prompt is a prefix of the long one from the same document: with caching vLLM
+        # would pick up its KV and DeltaNet state instead of prefilling.
         enable_prefix_caching=False,
-        # Чекпоинт мультимодальный, корпус текстовый. vision tower (0.92 ГБ) и
-        # профиль энкодера на картинке максимального размера текстового пути
-        # не касаются, а на общей карте 16k-шаг и без них влезает впритык.
+        # The checkpoint is multimodal, the corpus is text. The vision tower (0.92 GB) and
+        # the encoder profile on a max-size image don't concern the text path,
+        # and on a shared card the 16k step barely fits even without them.
         language_model_only=not args.vllm_keep_vision,
-        # Перед захватом CUDA-графов vLLM размечает KV на min(max_num_seqs, 512)
-        # блоков, а блок гибридной модели — состояние DeltaNet одной
-        # последовательности: при умолчании 256 это 784 MiB на каждый из 64
-        # слоёв. Случаи идут по одному, decode — граф размера 1 при любом числе.
+        # Before capturing CUDA graphs vLLM sizes KV for min(max_num_seqs, 512)
+        # blocks, and a hybrid model's block is the DeltaNet state of one
+        # sequence: at the default 256 that's 784 MiB for each of the 64
+        # layers. Cases run one at a time; decode is a size-1 graph regardless.
         max_num_seqs=args.vllm_max_num_seqs,
     )
     if args.vllm_kv_cache_dtype != "auto":
         llm_options["kv_cache_dtype"] = args.vllm_kv_cache_dtype
-    # Шаг префилла: по умолчанию на 5090 — 8192 токена, и промпт длиннее
-    # режется на чанки со своими границами состояния.
+    # Prefill step: the 5090 default is 8192 tokens, and a longer prompt
+    # is cut into chunks with their own state boundaries.
     if args.vllm_max_batched_tokens:
         llm_options["max_num_batched_tokens"] = args.vllm_max_batched_tokens
     llm = LLM(**llm_options)
     load_seconds = time.perf_counter() - started
-    # В артефакт идёт итог конфигурации, а не запрос: значения по умолчанию
-    # зависят от карты и версии vLLM.
+    # The artifact records the resulting configuration, not the request: defaults
+    # depend on the card and the vLLM version.
     engine_config = llm.llm_engine.vllm_config
-    # "auto" берёт `mamba_ssm_dtype` из config.json, у этой модели — float32.
+    # "auto" takes `mamba_ssm_dtype` from config.json; for this model it's float32.
     ssm_dtype = str(engine_config.cache_config.mamba_ssm_cache_dtype)
     if ssm_dtype == "auto":
         ssm_dtype = str(

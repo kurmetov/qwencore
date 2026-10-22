@@ -1,9 +1,9 @@
-//! Замер рекуррентного шага Gated DeltaNet.
+//! Measures the Gated DeltaNet recurrent step.
 //! `cargo run --release -p qwc-cuda --bin deltabench`
 //!
-//! Проход идёт по 48 отдельным буферам состояния подряд — так же, как в
-//! настоящем decode-шаге. Гонять один буфер в цикле нельзя: он осядет в
-//! 96 MiB L2 и даст завышенную цифру.
+//! The pass goes over 48 separate state buffers in a row — the same as in
+//! a real decode step. Looping over one buffer won't do: it would settle in
+//! the 96 MiB L2 and give an inflated number.
 
 use qwc_core::arch::NUM_LINEAR_LAYERS;
 use qwc_core::roofline::ACHIEVABLE_BANDWIDTH;
@@ -14,16 +14,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dev = Device::init(0)?;
     let stream = Stream::new()?;
 
-    // Потолок для операции «чтение + запись» измерен отдельно: 1408 GB/s.
+    // The ceiling for the "read + write" operation is measured separately: 1408 GB/s.
     const COPY_CEILING: f64 = 1408e9;
 
-    println!("Gated DeltaNet, рекуррентный шаг decode");
+    println!("Gated DeltaNet, recurrent decode step");
     println!(
-        "состояние на слой на последовательность: {:.2} MB",
+        "state per layer per sequence: {:.2} MB",
         (STATE_ELEMS * 2) as f64 / 1e6
     );
     println!(
-        "паспортный пик {:.0} GB/s, достижимое чтение {:.0} GB/s, чтение+запись {:.0} GB/s\n",
+        "spec peak {:.0} GB/s, achievable read {:.0} GB/s, read+write {:.0} GB/s\n",
         dev.peak_bandwidth() / 1e9,
         ACHIEVABLE_BANDWIDTH / 1e9,
         COPY_CEILING / 1e9
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!(
         "  {:>5} | {:>10} | {:>9} | {:>9} | {:>8} | {:>7}",
-        "batch", "раб. мн-во", "на слой", "48 слоёв", "GB/s", "% пика"
+        "batch", "work set", "per layer", "48 layers", "GB/s", "% peak"
     );
     println!(
         "  {:->5}-+-{:->10}-+-{:->9}-+-{:->9}-+-{:->8}-+-{:->7}",
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let alpha = DeviceBuffer::from_slice(&vec![0.95f32; batch * GATE_ELEMS])?;
         let beta = DeviceBuffer::from_slice(&vec![0.7f32; batch * GATE_ELEMS])?;
         let mut out = DeviceBuffer::<f32>::zeroed(batch * V_ELEMS)?;
-        // k.q для постоянных q = k = 0.088 на 128 измерениях.
+        // k.q for constant q = k = 0.088 over 128 dimensions.
         let kq = DeviceBuffer::from_slice(&vec![128.0f32 * 0.088 * 0.088; batch * KQ_ELEMS])?;
         let inputs = DeltaInputs {
             q: &q,
@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kq: &kq,
         };
 
-        // Прогрев.
+        // Warmup.
         for s in states.iter_mut() {
             delta_net::decode(s, &inputs, &mut out, batch, &stream)?;
         }

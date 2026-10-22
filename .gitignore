@@ -4,7 +4,7 @@
 __pycache__/
 *.py[cod]
 
-# Веса модели: качаются scripts/fetch-checkpoint.sh, в репозитории им не место.
+# Model weights: fetched by scripts/fetch-checkpoint.sh, they do not belong in the repo.
 /models/
 *.safetensors
 *.gguf

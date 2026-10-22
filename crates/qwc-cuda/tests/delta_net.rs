@@ -1,5 +1,5 @@
-//! Сверка GPU-кернела Gated DeltaNet с эталоном на CPU.
-//! Требует RTX 5090.
+//! Checks the Gated DeltaNet GPU kernel against a CPU reference.
+//! Requires an RTX 5090.
 
 use qwc_core::arch::{LA_CONV_CHANNELS, LA_K_HEAD_DIM, LA_NUM_K_HEADS, LA_V_HEAD_DIM};
 use qwc_cuda::delta_net::{
@@ -8,7 +8,7 @@ use qwc_cuda::delta_net::{
 };
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
 
-/// Детерминированный генератор, чтобы падения воспроизводились.
+/// A deterministic generator so failures are reproducible.
 struct Rng(u64);
 
 impl Rng {
@@ -21,8 +21,8 @@ impl Rng {
     }
 }
 
-/// k.q на каждую строку и k-голову — ровно то, что считает prepare на GPU.
-/// Скан читает этот скаляр вместо того, чтобы пересчитывать его в каждом варпе.
+/// k.q for every row and k head — exactly what prepare computes on the GPU.
+/// The scan reads this scalar instead of recomputing it in every warp.
 fn kq_rows(q: &[f32], k: &[f32]) -> Vec<f32> {
     assert_eq!(q.len(), k.len());
     (0..q.len() / LA_K_HEAD_DIM)
@@ -57,7 +57,7 @@ fn matches_cpu_reference() {
     l2_normalize_heads(&mut q, LA_NUM_K_HEADS, LA_K_HEAD_DIM);
     l2_normalize_heads(&mut k, LA_NUM_K_HEADS, LA_K_HEAD_DIM);
     let v: Vec<f32> = (0..batch * V_ELEMS).map(|_| rng.next_f32()).collect();
-    // alpha — затухание в (0,1), beta — сила записи в (0,1).
+    // alpha is decay in (0,1), beta is write strength in (0,1).
     let alpha: Vec<f32> = (0..batch * GATE_ELEMS)
         .map(|_| 0.9 + rng.next_f32() * 0.09)
         .collect();
@@ -65,7 +65,7 @@ fn matches_cpu_reference() {
         .map(|_| 0.5 + rng.next_f32() * 0.4)
         .collect();
 
-    // Эталон.
+    // Reference.
     let mut ref_state = state.clone();
     let mut ref_out = vec![0.0f32; batch * V_ELEMS];
     delta_net::reference::decode(
@@ -104,16 +104,16 @@ fn matches_cpu_reference() {
     let gpu_out = d_out.to_vec().unwrap();
     state = d_state.to_vec().unwrap();
 
-    // Выход считается в fp32, расхождение возможно только от порядка суммирования.
+    // The output is computed in fp32, a mismatch is only possible from summation order.
     let mut worst_out = 0.0f32;
     for (g, r) in gpu_out.iter().zip(&ref_out) {
         let d = (g - r).abs() / r.abs().max(1e-3);
         worst_out = worst_out.max(d);
     }
-    assert!(worst_out < 2e-3, "выход расходится на {worst_out:.2e}");
+    assert!(worst_out < 2e-3, "output diverges by {worst_out:.2e}");
 
-    // Состояние хранится в bf16: допускаем расхождение в один ULP (~0.8%),
-    // возникающее когда fp32-результат попадает на границу округления.
+    // The state is stored in bf16: we allow a one-ULP mismatch (~0.8%),
+    // which occurs when the fp32 result lands on a rounding boundary.
     let mut worst_state = 0.0f32;
     let mut ulp_diffs = 0usize;
     for (g, r) in state.iter().zip(&ref_state) {
@@ -126,18 +126,18 @@ fn matches_cpu_reference() {
     let frac = ulp_diffs as f64 / state.len() as f64;
     assert!(
         worst_state < 1e-2,
-        "состояние расходится на {worst_state:.2e}"
+        "state diverges by {worst_state:.2e}"
     );
     assert!(
         frac < 0.02,
-        "слишком много расхождений в состоянии: {:.2}%",
+        "too many mismatches in the state: {:.2}%",
         frac * 100.0
     );
 }
 
 #[test]
 fn decay_shrinks_state_when_write_disabled() {
-    // При beta = 0 запись отключена и состояние должно просто затухать в alpha раз.
+    // With beta = 0 the write is disabled and the state must simply decay by alpha.
     let batch = 1;
     let mut rng = Rng(7);
     let state: Vec<u16> = (0..STATE_ELEMS)
@@ -177,7 +177,7 @@ fn decay_shrinks_state_when_write_disabled() {
     let after = d_state.to_vec().unwrap();
     for (before, now) in state.iter().zip(&after) {
         let expect = bf16::from_f32(0.5 * bf16::to_f32(*before));
-        assert_eq!(*now, expect, "затухание применено неверно");
+        assert_eq!(*now, expect, "decay applied incorrectly");
     }
 }
 
@@ -341,9 +341,9 @@ fn chunk_prefill_matches_repeated_recurrent_decode() {
     assert_eq!(&actual_pool[..STATE_ELEMS], &initial[..STATE_ELEMS]);
 }
 
-/// FP32-режим chunk-скана: состояние остаётся в регистрах до конца chunk.
-/// Сверяется с отдельным CPU-эталоном и обязан отличаться от BF16-режима,
-/// иначе переключатель ничего не изолирует.
+/// FP32 mode of the chunk scan: the state stays in registers until the end of the chunk.
+/// Checked against a separate CPU reference and must differ from the BF16 mode,
+/// otherwise the switch isolates nothing.
 #[test]
 fn chunk_prefill_fp32_state_matches_fp32_reference_and_differs_from_bf16() {
     // 65 crosses the usual 64-token boundary and catches state carry bugs.
@@ -693,8 +693,8 @@ fn delta_preprocessor_matches_cpu_and_updates_only_selected_conv_slots() {
         ("v", prepared.v.to_vec().unwrap(), v, 2e-5),
         ("alpha", prepared.alpha.to_vec().unwrap(), alpha, 2e-4),
         ("beta", prepared.beta.to_vec().unwrap(), beta, 2e-4),
-        // Скан больше не считает k.q сам, а читает его отсюда: если prepare
-        // посчитает не то, разойдётся весь линейный слой, а не одна фаза.
+        // The scan no longer computes k.q itself but reads it from here: if prepare
+        // computes the wrong thing, the whole linear layer diverges, not one phase.
         ("kq", prepared.kq.to_vec().unwrap(), expected_kq, 2e-5),
     ] {
         for (index, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
@@ -768,12 +768,12 @@ fn gated_rmsnorm_matches_qwen_dtype_boundaries() {
     assert!(worst <= 0.008, "gated RMSNorm max error {worst}");
 }
 
-/// Чанковая (WY) форма скана против рекуррентной — обе на CPU, обе в fp32.
+/// The chunked (WY) form of the scan vs the recurrent one — both on CPU, both in fp32.
 ///
-/// Это проверка вывода, а не кернела: если формы расходятся здесь, спорить с
-/// GPU дальше не о чем. Длина берётся не кратной чанку, чтобы хвост считался
-/// тем же кодом, и с alpha далеко от единицы — там, где отношения gamma между
-/// далёкими токенами уходят в ноль.
+/// This checks the derivation, not the kernel: if the forms diverge here, there's nothing
+/// to argue about with the GPU. The length is not a multiple of the chunk so the tail is computed
+/// by the same code, and alpha is far from one — where gamma ratios between
+/// distant tokens go to zero.
 #[test]
 fn chunked_wy_form_matches_the_recurrent_scan() {
     use qwc_core::arch::{LA_NUM_V_HEADS, LA_V_HEAD_DIM as DV};
@@ -789,7 +789,7 @@ fn chunked_wy_form_matches_the_recurrent_scan() {
             .map(|_| rng.next_f32() * 0.5)
             .collect();
         let v: Vec<f32> = (0..tokens * HV * DV).map(|_| rng.next_f32()).collect();
-        // alpha в (0, 1], beta в (0, 2) — как после сигмоиды и softplus.
+        // alpha in (0, 1], beta in (0, 2) — as after sigmoid and softplus.
         let alpha: Vec<f32> = (0..tokens * HV)
             .map(|_| decay * (0.5 + 0.5 * (rng.next_f32() * 0.5 + 0.5)))
             .collect();
@@ -833,7 +833,7 @@ fn chunked_wy_form_matches_the_recurrent_scan() {
             worst = worst.max((got - want).abs());
             assert!(
                 (got - want).abs() <= tolerance,
-                "токенов {tokens}, чанк {chunk}: выход {index}: WY={got}, рекуррентно={want}"
+                "tokens {tokens}, chunk {chunk}: output {index}: WY={got}, recurrent={want}"
             );
         }
         for (index, (&got, &want)) in chunked_state.iter().zip(&recurrent_state).enumerate() {
@@ -841,25 +841,25 @@ fn chunked_wy_form_matches_the_recurrent_scan() {
             let tolerance = 1e-2 + want.abs() * 1e-2;
             assert!(
                 (got - want).abs() <= tolerance,
-                "токенов {tokens}, чанк {chunk}: состояние {index}: WY={got}, рекуррентно={want}"
+                "tokens {tokens}, chunk {chunk}: state {index}: WY={got}, recurrent={want}"
             );
         }
-        println!("токенов {tokens}, чанк {chunk}, decay {decay}: худшее по выходу {worst:.3e}");
+        println!("tokens {tokens}, chunk {chunk}, decay {decay}: worst output {worst:.3e}");
     }
 }
 
-/// WY-скан на GPU против чанкового эталона на CPU.
+/// The WY scan on GPU vs the chunked reference on CPU.
 ///
-/// Эталон здесь именно чанковый: `prefill_chunked_fp32` с тем же чанком
-/// `WY_CHUNK_SIZE`, то есть с тем же порядком операций. Расхождение с
-/// рекуррентной формой проверено отдельно на CPU
-/// (`chunked_wy_form_matches_the_recurrent_scan`) — смешивать две проверки
-/// значит не знать, что именно сломалось.
+/// The reference here is specifically chunked: `prefill_chunked_fp32` with the same chunk
+/// `WY_CHUNK_SIZE`, i.e. with the same order of operations. The divergence from the
+/// recurrent form is checked separately on CPU
+/// (`chunked_wy_form_matches_the_recurrent_scan`) — mixing the two checks
+/// means not knowing what exactly broke.
 ///
-/// Длины берутся вокруг границы чанка, а затухание — до 0.05 на токен.
-/// Слабое затухание ничего не проверяет: при alpha около единицы любая форма
-/// накопления gamma сходится. Ломается всё на сильном, где произведение
-/// alpha по чанку уходит под fp32.
+/// Lengths are taken around the chunk boundary, and decay down to 0.05 per token.
+/// Weak decay checks nothing: with alpha near one any form of
+/// gamma accumulation converges. Everything breaks on strong decay, where the product of
+/// alpha over a chunk underflows fp32.
 #[test]
 fn wy_prefill_matches_the_chunked_reference() {
     for (tokens, decay) in [
@@ -946,13 +946,13 @@ fn check_wy_prefill(tokens: usize, decay: f32) {
     let pool = device_state.to_vec().unwrap();
     let actual_state = &pool[slot * STATE_ELEMS..][..STATE_ELEMS];
 
-    // Эталон считает в FP32, ядро кладёт q, k и состояние в BF16 ради MMA,
-    // поэтому поэлементная относительная ошибка бессмысленна: на выходе есть
-    // значения около нуля, где она произвольно велика. Порог абсолютный:
-    // входы нормированы (|q| = |k| = 1, v порядка 0.2), и на всех проверяемых
-    // формах ошибка держится около 4e-4 — это пол BF16, а не расхождение
-    // алгоритмов. Ошибки, которые здесь ловились раньше, были в 200 раз
-    // больше: неверная форма давала 9.9e-2, NaN от нуля в gamma — столько же.
+    // The reference computes in FP32, the kernel puts q, k and the state in BF16 for MMA,
+    // so element-wise relative error is meaningless: the output has
+    // values near zero where it's arbitrarily large. The threshold is absolute:
+    // inputs are normalized (|q| = |k| = 1, v of order 0.2), and on all checked
+    // shapes the error stays around 4e-4 — that's the BF16 floor, not a divergence
+    // of algorithms. Bugs caught here before were 200 times
+    // larger: a wrong form gave 9.9e-2, NaN from a zero in gamma — the same.
     let scale = expected_out.iter().fold(0.0f32, |a, b| a.max(b.abs()));
     let mut worst = 0.0f32;
     let mut worst_index = 0usize;
@@ -968,9 +968,9 @@ fn check_wy_prefill(tokens: usize, decay: f32) {
     let rmse = (squared / actual_out.len() as f64).sqrt();
     assert!(
         worst <= 8e-4 && rmse <= 1.5e-4,
-        "WY-выход расходится с эталоном на {worst:.2e} (RMSE {rmse:.2e}) \
-         при масштабе {scale:.2e} \
-         в позиции {worst_index}: токен {}, голова {}, строка {}: gpu={}, cpu={}",
+        "WY output diverges from the reference by {worst:.2e} (RMSE {rmse:.2e}) \
+         at scale {scale:.2e} \
+         at position {worst_index}: token {}, head {}, row {}: gpu={}, cpu={}",
         worst_index / V_ELEMS,
         (worst_index % V_ELEMS) / LA_V_HEAD_DIM,
         worst_index % LA_V_HEAD_DIM,
@@ -988,20 +988,20 @@ fn check_wy_prefill(tokens: usize, decay: f32) {
     }
     assert!(
         state_worst <= 1e-3,
-        "WY-состояние расходится с эталоном на {state_worst:.2e} при масштабе {state_scale:.2e}"
+        "WY state diverges from the reference by {state_worst:.2e} at scale {state_scale:.2e}"
     );
     assert_eq!(&pool[..STATE_ELEMS], &initial[..STATE_ELEMS]);
     println!(
-        "токенов {tokens}, затухание {decay}: выход max {worst:.3e}, \
-         RMSE {rmse:.3e} при масштабе {scale:.3e}; \
-         состояние max {state_worst:.3e} при масштабе {state_scale:.3e}"
+        "tokens {tokens}, decay {decay}: output max {worst:.3e}, \
+         RMSE {rmse:.3e} at scale {scale:.3e}; \
+         state max {state_worst:.3e} at scale {state_scale:.3e}"
     );
 }
 
-/// Слитый шаг кладёт несколько последовательностей в одну арену токенов, и
-/// WY-скан обязан читать и писать только свой отрезок. Та же форма, что
-/// когда-то прятала неверный префилл внимания: со сдвигом ничего не
-/// проверялось, потому что со сдвигом ничего и не тестировалось.
+/// The fused step puts several sequences into one token arena, and
+/// the WY scan must read and write only its own span. The same shape that
+/// once hid a wrong attention prefill: nothing was checked with an offset,
+/// because nothing was tested with an offset.
 #[test]
 fn wy_prefill_row_offset_reads_and_writes_only_its_slice() {
     use qwc_cuda::delta_net::{DeltaPrefillWorkspace, KQ_ELEMS};
@@ -1029,7 +1029,7 @@ fn wy_prefill_row_offset_reads_and_writes_only_its_slice() {
     let kq = kq_rows(&q, &k);
     let mut workspace = DeltaPrefillWorkspace::new().unwrap();
 
-    // Тот же отрезок, поданный с нулевого смещения, — эталон для сдвинутого.
+    // The same span, fed from zero offset, is the reference for the shifted one.
     let mut run = |row_offset: usize, rows: usize| {
         let slice =
             |data: &[f32], width: usize| data[row_offset * width..][..rows * width].to_vec();
@@ -1105,32 +1105,32 @@ fn wy_prefill_row_offset_reads_and_writes_only_its_slice() {
     {
         assert_eq!(
             got, want,
-            "сдвинутый запуск разошёлся с несдвинутым в позиции {index}"
+            "the shifted run diverged from the unshifted one at position {index}"
         );
     }
     assert!(
         actual[..offset * V_ELEMS].iter().all(|&x| x == sentinel),
-        "скан записал строки до своего отрезка"
+        "the scan wrote rows before its span"
     );
     assert!(
         actual[(offset + tokens) * V_ELEMS..]
             .iter()
             .all(|&x| x == sentinel),
-        "скан записал строки после своего отрезка"
+        "the scan wrote rows after its span"
     );
     assert_eq!(state.to_vec().unwrap(), expected_state);
 }
 
-/// Построчный int8 должен совпадать с эталоном на CPU поэлементно и быть
-/// заметно точнее e4m3 при том же байте: строки состояния плоские, и четыре
-/// бита экспоненты им не нужны. Это свойство — единственная причина выбрать
-/// int8, поэтому оно проверяется, а не принимается на веру.
+/// Per-row int8 must match the CPU reference element-wise and be
+/// noticeably more accurate than e4m3 at the same byte: state rows are flat, and they don't need four
+/// exponent bits. This property is the only reason to choose
+/// int8, so it's checked rather than taken on faith.
 #[test]
 fn state_requantize_matches_host_and_beats_e4m3() {
     const SLOTS: usize = 2;
     let mut rng = Rng(0x51ed_2701);
-    // Масштаб на строку разный: иначе поголовный и построчный масштаб
-    // неразличимы и тест не проверяет, что масштаб действительно построчный.
+    // The per-row scale differs: otherwise per-head and per-row scales are
+    // indistinguishable and the test doesn't check that the scale is really per row.
     let mut original = vec![0.0f32; SLOTS * STATE_ELEMS];
     for (row, chunk) in original.chunks_mut(LA_K_HEAD_DIM).enumerate() {
         let scale = 2.0f32.powi((row % 7) as i32 - 3);
@@ -1154,11 +1154,11 @@ fn state_requantize_matches_host_and_beats_e4m3() {
             .map(|&x| bf16::to_f32(x))
             .collect();
 
-        // Слот 0 кернел не трогает.
+        // The kernel doesn't touch slot 0.
         assert_eq!(
             &got[..STATE_ELEMS],
             &original[..STATE_ELEMS],
-            "{} задел чужой слот",
+            "{} touched another slot",
             quant.as_str()
         );
 
@@ -1175,19 +1175,19 @@ fn state_requantize_matches_host_and_beats_e4m3() {
             let peak = before.iter().fold(0.0f32, |m, x| m.max(x.abs()));
             for (index, (&x, &y)) in before.iter().zip(now).enumerate() {
                 let expected = if quant == delta_net::StateQuant::Int8 {
-                    // Арифметика повторяет кернел по операциям: он умножает
-                    // на обратный шаг и округляет к чётному, и на полушаге
-                    // деление с округлением от нуля даёт другую ступень.
+                    // The arithmetic repeats the kernel operation by operation: it multiplies
+                    // by the inverse step and rounds to even, and at the half step
+                    // division with round-half-away-from-zero gives a different step.
                     let step = peak * (1.0 / 127.0);
                     let inverse = 1.0 / step;
                     let level = (x * inverse).round_ties_even().clamp(-127.0, 127.0);
                     bf16::to_f32(bf16::from_f32(level * step))
                 } else {
-                    y // e4m3 сверяется по величине ошибки, а не поэлементно
+                    y // e4m3 is checked by error magnitude, not element-wise
                 };
                 assert!(
                     (y - expected).abs() <= 1.0e-6 * peak.max(1.0e-6),
-                    "{} строка {row} элемент {index}: {y} против {expected}",
+                    "{} row {row} element {index}: {y} vs {expected}",
                     quant.as_str()
                 );
                 worst = worst.max((y - x).abs() / peak.max(1.0e-9));
@@ -1196,10 +1196,10 @@ fn state_requantize_matches_host_and_beats_e4m3() {
             }
         }
         let relative = (numerator / denominator).sqrt() as f32;
-        // Шаг сетки — peak/127 у int8 и до peak/8 в старшей бинаде у e4m3.
-        // Сверху ложится округление обратной записи в bf16 (2^-9 от
-        // величины): настоящее хранение деквантует в fp32-регистры и этой
-        // надбавки не имеет, поэтому замер через кернел — оценка сверху.
+        // The grid step is peak/127 for int8 and up to peak/8 in the top binade for e4m3.
+        // On top of that comes the rounding of writing back to bf16 (2^-9 of
+        // magnitude): real storage dequantizes into fp32 registers and doesn't have
+        // this extra, so a measurement through the kernel is an upper bound.
         const BF16_WRITEBACK: f32 = 1.0 / 512.0;
         let ceiling = BF16_WRITEBACK
             + if quant == delta_net::StateQuant::Int8 {
@@ -1209,7 +1209,7 @@ fn state_requantize_matches_host_and_beats_e4m3() {
             };
         assert!(
             worst <= ceiling * 1.01,
-            "{}: элемент уехал на {worst} долей пика при потолке {ceiling}",
+            "{}: element drifted by {worst} fractions of peak with a ceiling of {ceiling}",
             quant.as_str()
         );
         errors.push(relative);
@@ -1218,15 +1218,15 @@ fn state_requantize_matches_host_and_beats_e4m3() {
     let (int8, e4m3) = (errors[0], errors[1]);
     assert!(
         e4m3 > int8 * 2.5,
-        "int8 должен быть заметно точнее e4m3: {int8:.3e} против {e4m3:.3e}"
+        "int8 must be noticeably more accurate than e4m3: {int8:.3e} vs {e4m3:.3e}"
     );
-    eprintln!("состояние: int8 {int8:.3e}, e4m3 {e4m3:.3e} относительной ошибки");
+    eprintln!("state: int8 {int8:.3e}, e4m3 {e4m3:.3e} relative error");
 }
 
-/// Упаковка и распаковка слота должны быть согласованы: распакованное
-/// состояние — это ровно то, что прочитает 8-битный decode. Расхождение
-/// между этими двумя путями означало бы, что промпт и его продолжение видят
-/// разное состояние, а сверка выхода на одном шаге этого не ловит.
+/// Packing and unpacking a slot must agree: the unpacked
+/// state is exactly what the 8-bit decode will read. A mismatch
+/// between these two paths would mean the prompt and its continuation see
+/// different states, and checking the output of one step doesn't catch that.
 #[test]
 fn packed_state_round_trip_matches_the_grid() {
     const CAPACITY: usize = 2;
@@ -1269,27 +1269,27 @@ fn packed_state_round_trip_matches_the_grid() {
             let expected = bf16::to_f32(bf16::from_f32(level * step));
             assert!(
                 (y - expected).abs() <= 1.0e-6 * peak.max(1.0e-6),
-                "распаковка {y} против ожидаемого {expected}"
+                "unpacked {y} vs expected {expected}"
             );
             worst = worst.max((y - x).abs() / peak.max(1.0e-9));
         }
     }
-    // Шаг сетки плюс округление распаковки в bf16.
+    // Grid step plus the rounding of unpacking to bf16.
     assert!(
         worst <= 0.5 / 127.0 + 1.0 / 512.0,
-        "элемент уехал на {worst}"
+        "element drifted by {worst}"
     );
 
-    // Нулевой слот пула не тронут, и нули представимы без масштаба.
+    // The pool's zero slot is untouched, and zeros are representable without a scale.
     let mut zeroed = DeviceBuffer::<u16>::zeroed(STATE_ELEMS).unwrap();
     delta_net::unpack_state_slot(&pool, 0, &mut zeroed, 1, 0, &stream).unwrap();
     stream.synchronize().unwrap();
     assert!(zeroed.to_vec().unwrap().iter().all(|&x| x == 0));
 }
 
-/// Восьмибитный decode должен совпадать с bf16-путём, у которого состояние
-/// посажено на ту же сетку: разойтись они могут только математикой шага, а
-/// она у обоих — одна и та же функция.
+/// The 8-bit decode must match the bf16 path whose state is
+/// snapped onto the same grid: they can diverge only in the step math, and
+/// it's the same function for both.
 #[test]
 fn packed_decode_matches_bf16_decode_on_the_same_grid() {
     const CAPACITY: usize = 2;
@@ -1313,8 +1313,8 @@ fn packed_decode_matches_bf16_decode_on_the_same_grid() {
     let mut pool = delta_net::PackedStatePool::zeroed(CAPACITY).unwrap();
     delta_net::pack_state_slot(&source, 1, 0, &mut pool, SLOT, &stream).unwrap();
 
-    // bf16-путь стартует с распакованного состояния, иначе первый же шаг
-    // разойдётся на самой упаковке, а не на математике.
+    // The bf16 path starts from the unpacked state, otherwise the very first step
+    // would diverge on the packing itself, not on the math.
     let mut wide = DeviceBuffer::<u16>::zeroed(CAPACITY * STATE_ELEMS).unwrap();
     delta_net::unpack_state_slot(&pool, SLOT, &mut wide, CAPACITY, SLOT, &stream).unwrap();
 
@@ -1363,9 +1363,9 @@ fn packed_decode_matches_bf16_decode_on_the_same_grid() {
             &stream,
         )
         .unwrap();
-        // bf16-путь держит состояние в bf16, поэтому после каждого шага его
-        // надо вернуть на ту же 8-битную сетку — иначе сравниваются разные
-        // хранения, а не разные кернелы.
+        // The bf16 path keeps the state in bf16, so after every step it
+        // must be put back onto the same 8-bit grid — otherwise different
+        // storages are compared, not different kernels.
         delta_net::requantize_state_slots(
             &mut wide,
             &slots,
@@ -1385,8 +1385,8 @@ fn packed_decode_matches_bf16_decode_on_the_same_grid() {
         }
         assert!(
             worst < 5.0e-2,
-            "шаг {step}: 8-битный decode разошёлся с bf16 на {worst}"
+            "step {step}: 8-bit decode diverged from bf16 by {worst}"
         );
     }
-    eprintln!("8-битный decode против bf16 на той же сетке: {worst:.2e}");
+    eprintln!("8-bit decode vs bf16 on the same grid: {worst:.2e}");
 }

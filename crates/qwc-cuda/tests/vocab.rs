@@ -1,4 +1,4 @@
-//! FP8-словарь: квантизация строк, выборка эмбеддингов и логиты.
+//! FP8 vocab: row quantization, embedding lookup and logits.
 
 use qwc_cuda::nvfp4::reference::e4m3;
 use qwc_cuda::vocab::{Bf16Vocab, Fp8Vocab, MAX_BATCHED_LOGITS, MAX_LOGITS_BATCH, reference};
@@ -16,8 +16,8 @@ impl Rng {
     }
 }
 
-/// Строки с разным масштабом: смысл шкалы на строку в том, что «тихая» строка
-/// не теряет точность из-за «громкой» соседней.
+/// Rows with different scales: the point of a per-row scale is that a "quiet" row
+/// doesn't lose precision because of a "loud" neighbor.
 fn table(rows: usize, cols: usize) -> Vec<u16> {
     let mut rng = Rng(0x5090_0806);
     (0..rows * cols)
@@ -34,8 +34,8 @@ fn table(rows: usize, cols: usize) -> Vec<u16> {
 }
 
 fn upload(rows: usize, cols: usize, host: &[u16], chunk_rows: usize) -> (Fp8Vocab, Stream) {
-    let stream = Stream::new().expect("поток");
-    let mut vocab = Fp8Vocab::zeroed(rows, cols).expect("матрица");
+    let stream = Stream::new().expect("stream");
+    let mut vocab = Fp8Vocab::zeroed(rows, cols).expect("matrix");
     let mut staging = DeviceBuffer::<u8>::zeroed(chunk_rows * cols * 2).expect("staging");
     let bytes: Vec<u8> = host.iter().flat_map(|value| value.to_le_bytes()).collect();
     let mut first = 0;
@@ -48,10 +48,10 @@ fn upload(rows: usize, cols: usize, host: &[u16], chunk_rows: usize) -> (Fp8Voca
                 &mut staging,
                 &stream,
             )
-            .expect("квантизация");
+            .expect("quantization");
         first += count;
     }
-    stream.synchronize().expect("синхронизация");
+    stream.synchronize().expect("synchronization");
     (vocab, stream)
 }
 
@@ -61,7 +61,7 @@ fn per_row_scale_keeps_e4m3_error_local() {
     const COLS: usize = 5120;
     let host = table(ROWS, COLS);
     let (vocab, _stream) = upload(ROWS, COLS, &host, 32);
-    let (data, scales) = vocab.to_host().expect("копия на хост");
+    let (data, scales) = vocab.to_host().expect("copy to host");
 
     for (row, &scale) in scales.iter().enumerate().take(ROWS) {
         let base = row * COLS;
@@ -73,18 +73,18 @@ fn per_row_scale_keeps_e4m3_error_local() {
         assert_eq!(
             scale,
             absolute_max / 448.0,
-            "строка {row}: шкала не равна absmax/448"
+            "row {row}: scale is not absmax/448"
         );
 
-        // E4M3 держит 3 бита мантиссы: относительная ошибка нормального
-        // числа не больше 2^-4, а денормалов — абсолютная в 2^-9 шкалы.
+        // E4M3 holds 3 mantissa bits: the relative error of a normal
+        // number is at most 2^-4, and for denormals it's absolute at 2^-9 of the scale.
         for column in 0..COLS {
             let expected = bf16::to_f32(source[column]);
             let actual = e4m3(data[base + column]) * scale;
             let bound = expected.abs() * 0.0625 + scale * 2f32.powi(-9);
             assert!(
                 (actual - expected).abs() <= bound,
-                "строка {row}, столбец {column}: {actual} против {expected}"
+                "row {row}, column {column}: {actual} vs {expected}"
             );
         }
     }
@@ -96,19 +96,19 @@ fn gather_matches_dequantized_table() {
     const COLS: usize = 5120;
     let host = table(ROWS, COLS);
     let (vocab, stream) = upload(ROWS, COLS, &host, 16);
-    let (data, scales) = vocab.to_host().expect("копия на хост");
+    let (data, scales) = vocab.to_host().expect("copy to host");
 
     let ids: Vec<u32> = vec![0, 96, 5, 5, 42, 13];
-    let tokens = DeviceBuffer::from_slice(&ids).expect("идентификаторы");
-    let mut output = DeviceBuffer::<u16>::zeroed(ids.len() * COLS).expect("выход");
+    let tokens = DeviceBuffer::from_slice(&ids).expect("ids");
+    let mut output = DeviceBuffer::<u16>::zeroed(ids.len() * COLS).expect("output");
     vocab
         .gather(&tokens, &mut output, &stream)
-        .expect("выборка");
-    stream.synchronize().expect("синхронизация");
+        .expect("lookup");
+    stream.synchronize().expect("synchronization");
 
     let mut expected = vec![0u16; ids.len() * COLS];
     reference::gather(&data, &scales, &ids, COLS, &mut expected);
-    assert_eq!(output.to_vec().expect("копия"), expected);
+    assert_eq!(output.to_vec().expect("copy"), expected);
 }
 
 #[test]
@@ -117,22 +117,22 @@ fn logits_match_dequantized_oracle_including_batch_split() {
     const COLS: usize = 1280;
     let host = table(ROWS, COLS);
     let (vocab, stream) = upload(ROWS, COLS, &host, 64);
-    let (data, scales) = vocab.to_host().expect("копия на хост");
+    let (data, scales) = vocab.to_host().expect("copy to host");
 
-    // 1 и 8 идут узким кернелом, дальше батчевым: 12 и 33 попадают на
-    // неполный тайл, 96 — на максимальный, 100 снова режется на группы.
+    // 1 and 8 go through the narrow kernel, beyond that the batched one: 12 and 33 land on
+    // an incomplete tile, 96 on the max one, 100 is split into groups again.
     for batch in [1usize, MAX_LOGITS_BATCH, 12, 16, 33, 64, MAX_BATCHED_LOGITS, 100] {
         let mut rng = Rng(0x4242 + batch as u64);
         let hidden: Vec<u16> = (0..batch * COLS)
             .map(|_| bf16::from_f32(rng.next_f32()))
             .collect();
-        let device_hidden = DeviceBuffer::from_slice(&hidden).expect("скрытое состояние");
-        let mut device_logits = DeviceBuffer::<f32>::zeroed(batch * ROWS).expect("логиты");
+        let device_hidden = DeviceBuffer::from_slice(&hidden).expect("hidden state");
+        let mut device_logits = DeviceBuffer::<f32>::zeroed(batch * ROWS).expect("logits");
         vocab
             .logits(&device_hidden, &mut device_logits, batch, &stream)
-            .expect("логиты");
-        stream.synchronize().expect("синхронизация");
-        let actual = device_logits.to_vec().expect("копия");
+            .expect("logits");
+        stream.synchronize().expect("synchronization");
+        let actual = device_logits.to_vec().expect("copy");
 
         let mut expected = vec![0.0f32; batch * ROWS];
         reference::logits(&data, &scales, &hidden, batch, COLS, ROWS, &mut expected);
@@ -141,7 +141,7 @@ fn logits_match_dequantized_oracle_including_batch_split() {
         for (index, (&got, &want)) in actual.iter().zip(expected.iter()).enumerate() {
             assert!(
                 (got - want).abs() <= magnitude * 2e-3,
-                "batch {batch}, элемент {index}: {got} против {want}"
+                "batch {batch}, element {index}: {got} vs {want}"
             );
         }
     }
@@ -154,21 +154,21 @@ fn bf16_lm_head_matches_cpu_oracle_including_batch_split() {
     let host = table(ROWS, COLS);
     let bytes: Vec<u8> = host.iter().flat_map(|value| value.to_le_bytes()).collect();
     let mut head = Bf16Vocab::zeroed(ROWS, COLS).expect("bf16 lm_head");
-    head.copy_rows(0, &bytes).expect("загрузка bf16 lm_head");
-    assert_eq!(head.to_host().expect("копия"), bytes);
-    let stream = Stream::new().expect("поток");
+    head.copy_rows(0, &bytes).expect("loading bf16 lm_head");
+    assert_eq!(head.to_host().expect("copy"), bytes);
+    let stream = Stream::new().expect("stream");
 
     for batch in [1usize, MAX_LOGITS_BATCH, 12] {
         let mut rng = Rng(0xb16f + batch as u64);
         let hidden: Vec<u16> = (0..batch * COLS)
             .map(|_| bf16::from_f32(rng.next_f32()))
             .collect();
-        let device_hidden = DeviceBuffer::from_slice(&hidden).expect("скрытое состояние");
-        let mut device_logits = DeviceBuffer::<f32>::zeroed(batch * ROWS).expect("логиты");
+        let device_hidden = DeviceBuffer::from_slice(&hidden).expect("hidden state");
+        let mut device_logits = DeviceBuffer::<f32>::zeroed(batch * ROWS).expect("logits");
         head.logits(&device_hidden, &mut device_logits, batch, &stream)
-            .expect("логиты");
-        stream.synchronize().expect("синхронизация");
-        let actual = device_logits.to_vec().expect("копия");
+            .expect("logits");
+        stream.synchronize().expect("synchronization");
+        let actual = device_logits.to_vec().expect("copy");
 
         for b in 0..batch {
             for row in 0..ROWS {
@@ -182,7 +182,7 @@ fn bf16_lm_head_matches_cpu_oracle_including_batch_split() {
                 let tolerance = expected.abs().max(1.0) * 2e-4;
                 assert!(
                     (got - expected).abs() <= tolerance,
-                    "batch {batch}, строка {row}: {got} против {expected}"
+                    "batch {batch}, row {row}: {got} vs {expected}"
                 );
             }
         }
@@ -196,16 +196,16 @@ fn bf16_embedding_gather_is_bit_exact() {
     let host = table(ROWS, COLS);
     let bytes: Vec<u8> = host.iter().flat_map(|value| value.to_le_bytes()).collect();
     let mut table = Bf16Vocab::zeroed(ROWS, COLS).expect("bf16 embedding");
-    table.copy_rows(0, &bytes).expect("загрузка");
-    let stream = Stream::new().expect("поток");
+    table.copy_rows(0, &bytes).expect("loading");
+    let stream = Stream::new().expect("stream");
     let ids = [40u32, 0, 17, 17];
-    let device_ids = DeviceBuffer::from_slice(&ids).expect("токены");
-    let mut output = DeviceBuffer::<u16>::zeroed(ids.len() * COLS).expect("выход");
+    let device_ids = DeviceBuffer::from_slice(&ids).expect("tokens");
+    let mut output = DeviceBuffer::<u16>::zeroed(ids.len() * COLS).expect("output");
     table
         .gather(&device_ids, &mut output, &stream)
         .expect("gather");
-    stream.synchronize().expect("синхронизация");
-    let actual = output.to_vec().expect("копия");
+    stream.synchronize().expect("synchronization");
+    let actual = output.to_vec().expect("copy");
     for (index, &token) in ids.iter().enumerate() {
         assert_eq!(
             &actual[index * COLS..(index + 1) * COLS],
@@ -214,11 +214,11 @@ fn bf16_embedding_gather_is_bit_exact() {
     }
 }
 
-/// Шортлист обязан давать те же логиты, что полный проход, — иначе черновик
-/// врёт не из-за неполноты списка, а из-за арифметики.
+/// The shortlist must give the same logits as the full pass — otherwise the draft
+/// lies not because the list is incomplete, but because of arithmetic.
 ///
-/// Список специально не отсортирован и берёт строки из разных тайлов: кернел
-/// читает строку по индексу, и порядок не должен ни на что влиять.
+/// The list is deliberately unsorted and takes rows from different tiles: the kernel
+/// reads a row by index, and the order must not affect anything.
 #[test]
 fn subset_logits_match_full_pass_rows() {
     const ROWS: usize = 517;
@@ -228,34 +228,34 @@ fn subset_logits_match_full_pass_rows() {
 
     let mut rng = Rng(0x51_0715);
     let hidden: Vec<u16> = (0..COLS).map(|_| bf16::from_f32(rng.next_f32())).collect();
-    let device_hidden = DeviceBuffer::from_slice(&hidden).expect("скрытое состояние");
+    let device_hidden = DeviceBuffer::from_slice(&hidden).expect("hidden state");
 
-    let mut full = DeviceBuffer::<f32>::zeroed(ROWS).expect("полные логиты");
+    let mut full = DeviceBuffer::<f32>::zeroed(ROWS).expect("full logits");
     vocab
         .logits(&device_hidden, &mut full, 1, &stream)
-        .expect("полный проход");
+        .expect("full pass");
 
     let ids: Vec<u32> = [516u32, 0, 300, 1, 255, 256, 7, 129, 511, 64]
         .into_iter()
         .cycle()
         .take(70)
         .collect();
-    let device_ids = DeviceBuffer::from_slice(&ids).expect("список строк");
-    let mut subset = DeviceBuffer::<f32>::zeroed(ids.len()).expect("логиты шортлиста");
+    let device_ids = DeviceBuffer::from_slice(&ids).expect("row list");
+    let mut subset = DeviceBuffer::<f32>::zeroed(ids.len()).expect("shortlist logits");
     vocab
         .logits_subset(&device_hidden, &device_ids, &mut subset, ids.len(), &stream)
-        .expect("шортлист");
-    stream.synchronize().expect("синхронизация");
+        .expect("shortlist");
+    stream.synchronize().expect("synchronization");
 
-    let full = full.to_vec().expect("копия");
-    let subset = subset.to_vec().expect("копия");
+    let full = full.to_vec().expect("copy");
+    let subset = subset.to_vec().expect("copy");
     let magnitude = full.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
     for (slot, &row) in ids.iter().enumerate() {
         let want = full[row as usize];
         let got = subset[slot];
         assert!(
             (got - want).abs() <= magnitude * 2e-3,
-            "строка {row} в слоте {slot}: {got} против {want}"
+            "row {row} in slot {slot}: {got} vs {want}"
         );
     }
 }

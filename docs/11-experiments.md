@@ -1,27 +1,27 @@
-# Экспериментальный протокол: абляции, roofline и сравнение с vLLM
+# Experiment protocol: ablations, roofline and comparison with vLLM
 
-Цель этого протокола — отделить инженерный результат от случайной удачной
-цифры. Публикуется не лучший прогон, а все независимые trials, точная команда,
-состояние GPU до и после прогона и 95% доверительный интервал.
+The purpose of this protocol is to separate an engineering result from a lucky
+number. What gets published is not the best run but all independent trials, the exact command,
+GPU state before and after the run, and a 95% confidence interval.
 
-## Что именно утверждаем
+## What exactly we claim
 
-У проекта три разных утверждения, и их нельзя смешивать в один множитель:
+The project makes three different claims, and they must not be merged into one multiplier:
 
-1. **Batch-1 decode:** насколько близко обычный шаг подходит к bandwidth
-   roofline и выигрывает ли он у vLLM без спекуляции.
-2. **Batch-1 MTP:** сколько accepted tokens получается на один проход весов;
-   сравниваются лучшие MTP-конфигурации обоих движков.
-3. **Serving под бюджетом:** aggregate throughput, TTFT и ITL при одинаковом
-   общем VRAM budget. Здесь меньший resident footprint является частью
-   результата, но не называется преимуществом CUDA-ядер.
+1. **Batch-1 decode:** how close a regular step gets to the bandwidth
+   roofline, and whether it beats vLLM without speculation.
+2. **Batch-1 MTP:** how many accepted tokens one pass over the weights yields;
+   the best MTP configurations of both engines are compared.
+3. **Serving under a budget:** aggregate throughput, TTFT and ITL under the same
+   total VRAM budget. Here a smaller resident footprint is part of the
+   result, but is not called an advantage of the CUDA kernels.
 
-Prefill публикуется отдельно: он compute-bound и не подчиняется decode
+Prefill is published separately: it is compute-bound and doesn't follow the decode
 roofline.
 
 ## Roofline
 
-Знаменатель decode — байты, реально прочитанные шагом, а не вся занятая VRAM:
+The decode denominator is the bytes actually read by a step, not all occupied VRAM:
 
 ```text
 resident weights                           17.08 GB
@@ -32,40 +32,40 @@ ideal ITL                                  ~9.42 ms
 ideal throughput                            ~106 tok/s
 ```
 
-MTP имеет другой знаменатель: один основной проход может подтвердить больше
-одного токена. Для него рядом с tok/s обязательно публикуются accepted
-tokens/step, draft time и verification time; делить MTP tok/s на обычный
-single-token roofline нельзя.
+MTP has a different denominator: one main pass can confirm more than
+one token. For it, accepted tokens/step, draft time and verification time must be published
+next to tok/s; dividing MTP tok/s by the regular
+single-token roofline is not allowed.
 
-Числа генерируются из кода:
+Numbers are generated from code:
 
 ```bash
 cargo run -q -p qwc-core --bin plan
 ```
 
-## Повторные прогоны и интервалы
+## Repeated runs and intervals
 
-`bench/experiments.py` запускает каждый trial в новом процессе. Порядок
-вариантов циклически меняется между trials, чтобы прогрев карты и thermal drift
-не доставались всегда одному движку. Сырой JSONL дописывается после каждого
-прогона с `fsync`, поэтому длинный эксперимент можно продолжить `--resume`.
+`bench/experiments.py` runs each trial in a new process. The order of
+variants rotates between trials so that card warm-up and thermal drift
+don't always land on the same engine. Raw JSONL is appended after each
+run with `fsync`, so a long experiment can be continued with `--resume`.
 
-Отчёт показывает percentile-bootstrap 95% CI среднего по независимым
-процессным прогонам, 20 000 resamples с фиксированным seed. Для относительного
-ускорения применяется paired bootstrap по одинаковым номерам trials. Минимум —
-3 повтора, нормальный публикуемый запуск — 7 или больше.
+The report shows a percentile-bootstrap 95% CI of the mean over independent
+process runs, 20 000 resamples with a fixed seed. For relative
+speedup a paired bootstrap over matching trial numbers is used. The minimum is
+3 repeats; a normal publishable run is 7 or more.
 
-По умолчанию runner отказывается стартовать, если до эксперимента занято больше
-8 GiB VRAM. Это защита от случайного сравнения рядом с чужим inference job.
-Порог меняется через `--max-background-memory-gb`; флаг `--allow-busy-gpu`
-оставлен только для диагностических, заведомо загрязнённых прогонов и записывается
-в artifact.
+By default the runner refuses to start if more than 8 GiB of VRAM is in use before the experiment.
+This protects against accidentally comparing next to someone else's inference job.
+The threshold is changed via `--max-background-memory-gb`; the `--allow-busy-gpu` flag
+is kept only for diagnostic, knowingly contaminated runs and is recorded
+in the artifact.
 
 ```bash
-# Сначала проверить точные команды.
+# First check the exact commands.
 python3 bench/experiments.py run --suite comparison --dry-run
 
-# Честное сравнение. Нужен Python из vLLM venv.
+# Fair comparison. Needs Python from the vLLM venv.
 ~/.venvs/baseline/bin/python bench/experiments.py run \
   --suite comparison --repeats 7 \
   --output bench/results/comparison-trials.jsonl
@@ -75,14 +75,14 @@ python3 bench/experiments.py report \
   --output bench/results/comparison-with-ci.md
 ```
 
-Comparison suite фиксирует одинаковые checkpoint, corpus, KV dtype, context,
-число запросов, длины и общий memory budget. CUDA graphs включены, prefix
-caching явно выключен, перед записью есть warmup. Для c=32 используются
-одинаковые token budgets 2048. Для чистого prefill публикуются заранее выбранные
-лучшие значения из свипа: chunk 2048 у QwenCore и
-`max_num_batched_tokens=4096` у vLLM.
+The comparison suite pins the same checkpoint, corpus, KV dtype, context,
+number of requests, lengths and total memory budget. CUDA graphs are on, prefix
+caching is explicitly off, there's a warmup before recording. For c=32 the same
+token budgets of 2048 are used. For pure prefill the pre-chosen
+best values from the sweep are published: chunk 2048 for QwenCore and
+`max_num_batched_tokens=4096` for vLLM.
 
-## Абляции
+## Ablations
 
 ```bash
 ~/.venvs/baseline/bin/python bench/experiments.py run \
@@ -94,30 +94,30 @@ python3 bench/experiments.py report \
   --output bench/results/ablations-with-ci.md
 ```
 
-Матрица устроена так, чтобы соседние строки меняли один фактор:
+The matrix is arranged so that adjacent rows change one factor:
 
-| сценарий | переход | что изолируется |
+| scenario | transition | what is isolated |
 |---|---|---|
 | `ablate-speculation` | base -> MTP k=3 | speculative decoding |
-| | MTP k=3 -> + shortlist 32K | неполный draft `lm_head` |
-| `ablate-prefill-scan` | recurrent BF16 -> recurrent FP32 -> WY | округление и затем алгоритм DeltaNet scan |
-| `ablate-prefill-chunk` | 512 -> 2048 | token budget шага |
-| `ablate-kv` | BF16 -> FP8 | формат KV при неизменном workload |
+| | MTP k=3 -> + shortlist 32K | incomplete draft `lm_head` |
+| `ablate-prefill-scan` | recurrent BF16 -> recurrent FP32 -> WY | rounding and then the DeltaNet scan algorithm |
+| `ablate-prefill-chunk` | 512 -> 2048 | step token budget |
+| `ablate-kv` | BF16 -> FP8 | KV format under an unchanged workload |
 
-Int8 DeltaNet state пока не входит в автоматическую матрицу: в текущем дереве
-нет runtime-переключателя обратно на BF16. Его существующая A/B сделана двумя
-сборками. Публиковать её следует отдельной строкой с двумя commit/diff hashes,
-а не делать вид, что это тот же исполняемый файл.
+Int8 DeltaNet state is not yet in the automatic matrix: the current tree
+has no runtime switch back to BF16. Its existing A/B was done with two
+builds. It should be published as a separate row with two commit/diff hashes,
+not pretend it's the same executable.
 
-## Правила публикации
+## Publication rules
 
-* Не удалять failed trials из JSONL. Отчёт считает только успешные, но явно
-  показывает число исключённых ошибок.
-* Не запускать publishable серию при посторонней вычислительной нагрузке на
-  GPU. Desktop footprint допустим, если он одинаков и записан в artifact.
-* Не выбирать лучший из повторов. Публикуются среднее, CI и все raw trials.
-* Любой post-hoc выбор batch/token budget сначала уходит в tuning sweep, затем
-  подтверждается новой серией trials.
-* Speed ablation сопровождается quality A/B теми же token IDs. Для
-  приближённых форматов одного совпадения greedy недостаточно: сохраняются
-  top-k overlap и logprob error.
+* Don't remove failed trials from JSONL. The report counts only successful ones, but explicitly
+  shows the number of excluded errors.
+* Don't run a publishable series with unrelated compute load on the
+  GPU. A desktop footprint is acceptable if it's the same and recorded in the artifact.
+* Don't pick the best of the repeats. The mean, CI and all raw trials are published.
+* Any post-hoc choice of batch/token budget first goes into a tuning sweep, then
+  is confirmed by a new series of trials.
+* A speed ablation comes with a quality A/B on the same token IDs. For
+  approximate formats one greedy match is not enough: top-k overlap and
+  logprob error are saved.

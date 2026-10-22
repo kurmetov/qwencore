@@ -1,121 +1,120 @@
-# Token loop: prefill, CUDA graphs и continuous batching
+# Token loop: prefill, CUDA graphs and continuous batching
 
 ```bash
 IDS=$(scripts/tok.py encode "The capital of France is")
 cargo run --release -p qwc-engine --bin generate -- --prompt-ids "$IDS" --max-new 24
-scripts/tok.py decode "<выданные id>"
+scripts/tok.py decode "<returned ids>"
 ```
 
-## Полный тракт
+## The full path
 
-`Executor` держит адреса decode-буферов постоянными и захватывает отдельный
-CUDA graph для каждого встретившегося размера batch. Один шаг проходит все 64
-слоя:
+`Executor` keeps decode buffer addresses constant and captures a separate
+CUDA graph for every batch size it encounters. One step goes through all 64
+layers:
 
-* FP8 embedding сразу выдаёт BF16;
-* 48 Gated DeltaNet слоёв обновляют conv-history и рекуррентный state slot;
-* 16 full-attention слоёв записывают FP8 paged KV и считают gated GQA;
-* MLP выполняет SwiGLU и down projection;
-* residual-add совмещён с RMSNorm следующего блока;
-* FP8 `lm_head` выдаёт логиты, двухступенчатый GPU argmax возвращает только
-  четырёхбайтовый token ID.
+* the FP8 embedding outputs BF16 directly;
+* 48 Gated DeltaNet layers update the conv history and the recurrent state slot;
+* 16 full-attention layers write FP8 paged KV and compute gated GQA;
+* the MLP runs SwiGLU and the down projection;
+* residual-add is fused with the next block's RMSNorm;
+* the FP8 `lm_head` produces logits, a two-stage GPU argmax returns only
+  a four-byte token ID.
 
-Batch 1..4 использует W4A16 и fused gate/up. Batch 5..32 автоматически
-переходит на W4A4 tensor-core GEMM; для него gate и up считаются двумя GEMM с
-небольшим BF16 SwiGLU-кернелом между ними.
+Batch 1..4 uses W4A16 and fused gate/up. Batch 5..32 automatically
+switches to the W4A4 tensor-core GEMM; there gate and up are computed by two GEMMs with
+a small BF16 SwiGLU kernel between them.
 
 ## Causal prefill
 
-Промпт разбивается на чанки с фиксированным `M=128`. Все NVFP4-проекции и MLP
-считают 128 строк одним W4A4 GEMM. В неполном последнем чанке лишние строки
-являются padding и не попадают в причинные операции.
+The prompt is split into chunks of fixed `M=128`. All NVFP4 projections and the MLP
+compute 128 rows in one W4A4 GEMM. In an incomplete last chunk the extra rows
+are padding and don't take part in causal operations.
 
-Рекуррентную ось нельзя трактовать как batch. Поэтому prefill имеет два
-специализированных скана:
+The recurrent axis can't be treated as a batch. So prefill has two
+specialized scans:
 
-* один CUDA thread ведёт трёхэлементную conv-history одного канала через весь
-  чанк;
-* один warp держит строку DeltaNet-state в регистрах через все токены чанка.
-  После каждого шага state округляется в BF16, поэтому результат совпадает с
-  последовательным decode, но 1.5 MB состояния слоя читаются и пишутся один
-  раз на чанк, а не 128 раз.
+* one CUDA thread carries the three-element conv history of one channel through the whole
+  chunk;
+* one warp holds a DeltaNet state row in registers across all tokens of the chunk.
+  After every step the state is rounded to BF16, so the result matches
+  sequential decode, but the layer's 1.5 MB of state is read and written once
+  per chunk, not 128 times.
 
-Full attention сначала параллельно записывает K/V всех токенов чанка, затем
-использует общую физическую page table и отдельную `context_len` для каждой
-query-строки. Это даёт обычную causal mask без отдельного dense attention
-буфера. Логиты считаются только для последнего живого токена.
+Full attention first writes the K/V of all chunk tokens in parallel, then
+uses the shared physical page table and a separate `context_len` for each
+query row. This gives an ordinary causal mask without a separate dense attention
+buffer. Logits are computed only for the last live token.
 
-На RTX 5090 601-токенный prompt прошёл за **171.9 ms**, или **0.286
-ms/token**. Старый token-by-token путь занимал около 8 s. После prefill модель
-корректно продолжила повторяющуюся панграмму (`…The` → ` quick`) и затем начала
-её разбор.
+On the RTX 5090 a 601-token prompt ran in **171.9 ms**, or **0.286
+ms/token**. The old token-by-token path took about 8 s. After prefill the model
+correctly continued the repeated pangram (`…The` → ` quick`) and then started
+analyzing it.
 
-## Decode и sampling, batch 1
+## Decode and sampling, batch 1
 
 | | |
 |---|---:|
-| шаг decode с CUDA graph, медиана | **14.17 ms (70.5 tok/s)** |
+| decode step with CUDA graph, median | **14.17 ms (70.5 tok/s)** |
 | GPU argmax | **0.03 ms** |
-| полный такт | **14.20 ms (70.4 tok/s)** |
-| прежний host argmax | 0.38 ms и 1 MB PCIe readback |
+| full cycle | **14.20 ms (70.4 tok/s)** |
+| previous host argmax | 0.38 ms and 1 MB PCIe readback |
 
-Первый шаг конкретного batch-size захватывает graph и поэтому не входит в
-steady-state медиану. Позиции, длины, state slots и page tables находятся в
-резидентных device buffers: перед повторным launch меняется их содержимое, но
-не адреса.
+The first step of a given batch size captures the graph and so is not part of the
+steady-state median. Positions, lengths, state slots and page tables live in
+resident device buffers: before a repeated launch their contents change, but
+not their addresses.
 
-Контекст 30 и 601 токен по-прежнему имеет одинаковый ITL: на batch 1 тракт
-упирается в 15 GB весов и состояния за шаг, а не в десятки мегабайт KV.
+Contexts of 30 and 601 tokens still have the same ITL: at batch 1 the path
+is bound by 15 GB of weights and state per step, not by tens of megabytes of KV.
 
 ## W4A4 decode, batch 8
 
-Восемь одинаковых промптов после независимого prefill дали одинаковые токены:
+Eight identical prompts after independent prefill gave identical tokens:
 
 ```text
  Paris.
 The capital of Germany is Berlin.
 ```
 
-Медиана decode — **24.90 ms**, то есть **321.3 tok/s goodput**; вместе с GPU
-argmax — **319.3 tok/s**. Это сквозная проверка dispatcher, а не изолированный
+Decode median — **24.90 ms**, i.e. **321.3 tok/s goodput**; together with the GPU
+argmax — **319.3 tok/s**. This is an end-to-end check of the dispatcher, not an isolated
 projection benchmark.
 
-## Связка с runtime
+## Wiring to the runtime
 
-`Executor::execute_layout` принимает `qwc_runtime::BatchLayout`. Decode-часть
-batch получает реальные `state_slots`, позиции, длины контекста и физические
-KV page IDs. Prefill-чанки используют те же произвольные slots/pages, после
-чего GPU argmax возвращает `(SeqId, token)` для каждого элемента batch.
+`Executor::execute_layout` takes a `qwc_runtime::BatchLayout`. The decode part
+of the batch gets real `state_slots`, positions, context lengths and physical
+KV page IDs. Prefill chunks use the same arbitrary slots/pages, after
+which the GPU argmax returns `(SeqId, token)` for each batch element.
 
-Пример полного цикла admission → prefill → decode → completion:
+An example of the full admission → prefill → decode → completion loop:
 
 ```bash
 cargo run --release -p qwc-engine --bin scheduled -- --requests 8 --max-new 8
 ```
 
-Проверочный запуск завершил восемь запросов, все результаты совпали. При новом
-prompt с offset 0 переиспользованный DeltaNet/conv slot обнуляется на GPU;
-страницы KV не требуют очистки, потому что видимость задаётся `context_len`.
+The check run finished eight requests, all results matched. For a new
+prompt with offset 0 the reused DeltaNet/conv slot is zeroed on the GPU;
+KV pages need no clearing because visibility is set by `context_len`.
 
-## Проверка
+## Verification
 
 ```bash
 cargo test --workspace -- --test-threads=1
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Сейчас проходят 68 тестов, включая GPU-oracle для chunked DeltaNet scan и
-детерминированного argmax. Отдельно выполнены end-to-end запуски 27B checkpoint
-для batch 1, batch 8 и scheduler-driven page tables. Пошаговое сравнение
-token IDs и top-k log-probabilities с внешними runtime описано в
+68 tests currently pass, including a GPU oracle for the chunked DeltaNet scan and
+deterministic argmax. End-to-end runs of the 27B checkpoint were done separately
+for batch 1, batch 8 and scheduler-driven page tables. Step-by-step comparison of
+token IDs and top-k log-probabilities against external runtimes is described in
 [`10-differential-eval.md`](10-differential-eval.md).
 
-## Ограничения decode-пути
+## Decode path limitations
 
-* несколько prefill-последовательностей смешанного batch исполняются
-  последовательно, хотя каждый их чанк использует tensor cores;
-* W4A4 gate/up перечитывают нормализованную активацию: общего fused mainloop
-  у них нет;
-* нет preemption, prefix snapshots и corpus-level perplexity eval;
-* `scripts/tok.py` использует ASCII-приближение pre-tokenizer; для Unicode
-  нужен полный tokenizer.
+* several prefill sequences of a mixed batch run
+  sequentially, although each of their chunks uses tensor cores;
+* W4A4 gate/up re-read the normalized activation: they have no shared fused mainloop;
+* no preemption, prefix snapshots or corpus-level perplexity eval;
+* `scripts/tok.py` uses an ASCII approximation of the pre-tokenizer; Unicode
+  needs the full tokenizer.

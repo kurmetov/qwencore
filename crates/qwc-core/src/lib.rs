@@ -1,10 +1,10 @@
-//! Ядро qwencore: архитектура Qwen3.8-27B как compile-time константы
-//! и арифметика планирования памяти под одну RTX 5090.
+//! The qwencore core: the Qwen3.8-27B architecture as compile-time constants
+//! and memory-planning arithmetic for a single RTX 5090.
 //!
-//! Здесь нет ни одной runtime-конфигурируемой размерности модели — это
-//! осознанная специализация. Всё, что зависит от нагрузки (concurrency,
-//! длина контекста, dtype кэша), настраивается; всё, что зависит от модели,
-//! зашито в константы и проверяется компилятором.
+//! There's not a single runtime-configurable model dimension here — this is
+//! deliberate specialization. Everything that depends on the load (concurrency,
+//! context length, cache dtype) is configurable; everything that depends on the model
+//! is baked into constants and checked by the compiler.
 
 pub mod arch;
 pub mod dtype;

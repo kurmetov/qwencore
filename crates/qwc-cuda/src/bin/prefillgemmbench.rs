@@ -1,8 +1,8 @@
-//! Проекции W4A4 на формах префилла: сколько стоит чанк и что даёт рост M.
+//! W4A4 projections on prefill shapes: what a chunk costs and what growing M gives.
 //! `cargo run --release -p qwc-cuda --bin prefillgemmbench`
 //!
-//! Каждая форма меряется на четырёх копиях весов: одна копия оседает в L2 и
-//! показывает не ту цену, что шаг движка, где веса приходят из DRAM.
+//! Each shape is measured on four copies of the weights: a single copy settles in L2 and
+//! shows a different cost than an engine step, where weights come from DRAM.
 
 use qwc_core::arch::{
     HIDDEN_SIZE, INTERMEDIATE_SIZE, LA_CONV_CHANNELS, LA_NUM_V_HEADS, LA_V_PROJ_DIM,
@@ -11,7 +11,7 @@ use qwc_core::arch::{
 use qwc_cuda::nvfp4::{Linear, QuantizedActivation, W4A4Workspace};
 use qwc_cuda::{Device, DeviceBuffer, Event, Stream, bf16};
 
-/// Сколько раз форма встречается за один проход по всем 64 слоям.
+/// How many times a shape occurs in one pass over all 64 layers.
 struct Shape {
     name: &'static str,
     out_features: usize,
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!(
-        "W4A4 на формах префилла, RTX 5090 ({} SM)\n",
+        "W4A4 on prefill shapes, RTX 5090 ({} SM)\n",
         device.sm_count
     );
 
@@ -54,15 +54,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("M = {rows}");
         println!(
             "  {:>12} | {:>8} | {:>8} | {:>10} | {:>10} | {:>9}",
-            "проекция", "N", "K", "quant", "GEMM", "TFLOP/s"
+            "projection", "N", "K", "quant", "GEMM", "TFLOP/s"
         );
         println!(
             "  {:->12}-+-{:->8}-+-{:->8}-+-{:->10}-+-{:->10}-+-{:->9}",
             "", "", "", "", "", ""
         );
 
-        // Цена шага складывается из GEMM всех слоёв плюс квантование входа
-        // каждой проекции: на префилле оно идёт по live-строкам, не по арене.
+        // The step cost is the GEMM of all layers plus quantizing the input
+        // of each projection: on prefill it runs over live rows, not the arena.
         let mut step_us = 0.0f64;
         let mut step_flops = 0.0f64;
         for shape in &shapes {
@@ -133,7 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!(
-            "  проекции всего шага: {:.2} мс, {:.1} мкс/токен, {:.0} TFLOP/s средних\n",
+            "  projections of the whole step: {:.2} ms, {:.1} us/token, {:.0} TFLOP/s average\n",
             step_us / 1e3,
             step_us / rows as f64,
             step_flops / (step_us * 1e-6) / 1e12,

@@ -1,8 +1,8 @@
-//! Подъём весов модели в VRAM: время, реальная VRAM и потолок host-RAM.
-//! `cargo run --release -p qwc-engine --bin load -- [каталог] [--vram-gb N] [--mtp]`
+//! Loading model weights into VRAM: time, actual VRAM and the host-RAM ceiling.
+//! `cargo run --release -p qwc-engine --bin load -- [directory] [--vram-gb N] [--mtp]`
 //!
-//! `--mtp` дополнительно поднимает draft-голову: обычный decode её не читает,
-//! но спекулятивный путь держит её в той же VRAM, и бюджет надо считать с ней.
+//! `--mtp` additionally loads the draft head: regular decode doesn't read it,
+//! but the speculative path keeps it in the same VRAM, and the budget has to be counted with it.
 
 use qwc_core::arch::{HIDDEN_SIZE, NUM_FULL_LAYERS, NUM_LAYERS, NUM_LINEAR_LAYERS, VOCAB_SIZE};
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
@@ -12,8 +12,8 @@ use qwc_model::Checkpoint;
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// Потолок по умолчанию: веса плюс запас под кэш, но заметно ниже 32 GB —
-/// чтобы упор в лимит был виден в тесте, а не только на пустой карте.
+/// Default cap: weights plus headroom for cache, but noticeably below 32 GB —
+/// so that hitting the limit shows up in a test, not only on an empty card.
 const DEFAULT_VRAM_GB: f64 = 24.0;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--vram-gb" => {
                 vram_gb = args
                     .next()
-                    .ok_or("--vram-gb требует значение")?
+                    .ok_or("--vram-gb requires a value")?
                     .parse::<f64>()?;
             }
             other => dir = Some(PathBuf::from(other)),
@@ -40,9 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limit = (vram_gb * 1e9) as usize;
     qwc_cuda::set_memory_limit(limit)?;
 
-    println!("чекпоинт: {}", dir.display());
+    println!("checkpoint: {}", dir.display());
     println!(
-        "GPU: {} SM, VRAM свободно {:.2} / {:.2} GB, потолок процесса {:.2} GB\n",
+        "GPU: {} SM, VRAM free {:.2} / {:.2} GB, process cap {:.2} GB\n",
         device.sm_count,
         free_before as f64 / 1e9,
         total as f64 / 1e9,
@@ -55,14 +55,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for problem in problems.iter().take(10) {
             println!("  {problem}");
         }
-        return Err(format!("чекпоинт разошёлся с архитектурой: {}", problems.len()).into());
+        return Err(format!("checkpoint diverged from the architecture: {}", problems.len()).into());
     }
 
     let started = Instant::now();
     let weights = ModelWeights::load_with_progress(&checkpoint, |index, stats| {
         if index % 8 == 7 || index + 1 == NUM_LAYERS {
             println!(
-                "  слой {:>2}/{NUM_LAYERS}  {:>6.2} GB  {:>6.1} s",
+                "  layer {:>2}/{NUM_LAYERS}  {:>6.2} GB  {:>6.1} s",
                 index + 1,
                 stats.resident_bytes() as f64 / 1e9,
                 started.elapsed().as_secs_f64()
@@ -75,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let started = Instant::now();
         let head = qwc_engine::mtp::load(&checkpoint)?;
         println!(
-            "  MTP-голова     {:>6.2} GB  {:>6.1} s",
+            "  MTP head       {:>6.2} GB  {:>6.1} s",
             head.resident_bytes() as f64 / 1e9,
             started.elapsed().as_secs_f64()
         );
@@ -89,67 +89,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (free_after, _) = qwc_cuda::Device::mem_info()?;
     let expected = checkpoint_stats.packed_bytes + checkpoint_stats.scale_bytes;
 
-    println!("\nЗагружено");
+    println!("\nLoaded");
     println!(
-        "  слоёв                 {} ({} linear + {} full)",
+        "  layers                {} ({} linear + {} full)",
         stats.layers, NUM_LINEAR_LAYERS, NUM_FULL_LAYERS
     );
-    println!("  квантованных проекций {}", stats.projections);
+    println!("  quantized projections {}", stats.projections);
     println!(
-        "  веса NVFP4 + шкалы    {:>7.2} GB",
+        "  NVFP4 weights + scales{:>7.2} GB",
         stats.quantized_bytes as f64 / 1e9
     );
     println!(
-        "                        {:>7.2} GB в чекпоинте (разница {:+.0} MB — padding scale-layout)",
+        "                        {:>7.2} GB in checkpoint (diff {:+.0} MB — scale-layout padding)",
         expected as f64 / 1e9,
         (stats.quantized_bytes as f64 - expected as f64) / 1e6
     );
     println!(
-        "  нормы, conv1d, гейты  {:>7.2} MB",
+        "  norms, conv1d, gates  {:>7.2} MB",
         stats.plain_bytes as f64 / 1e6
     );
     println!(
-        "  embed + lm_head в fp8 {:>7.2} GB  (в чекпоинте bf16 {:.2} GB)",
+        "  embed + lm_head fp8   {:>7.2} GB  (bf16 in checkpoint {:.2} GB)",
         stats.vocab_bytes as f64 / 1e9,
         (checkpoint_stats.embed_bytes + checkpoint_stats.lm_head_bytes) as f64 / 1e9
     );
     println!(
-        "  всего в VRAM          {:>7.2} GB",
+        "  total in VRAM         {:>7.2} GB",
         stats.resident_bytes() as f64 / 1e9
     );
     match &mtp {
         Some(head) => println!(
-            "  + MTP-голова          {:>7.2} GB  -> {:.2} GB с ней",
+            "  + MTP head            {:>7.2} GB  -> {:.2} GB with it",
             head.resident_bytes() as f64 / 1e9,
             (stats.resident_bytes() + head.resident_bytes()) as f64 / 1e9
         ),
-        None => println!("  MTP-голова            не грузилась (--mtp)"),
+        None => println!("  MTP head              not loaded (--mtp)"),
     }
 
-    println!("\nПамять");
+    println!("\nMemory");
     println!(
-        "  учтено потолком       {:>7.2} GB из {:.2} GB",
+        "  counted by the cap    {:>7.2} GB of {:.2} GB",
         usage.used as f64 / 1e9,
         usage.limit as f64 / 1e9
     );
     let occupied = (free_before - free_after) as f64;
     println!(
-        "  занято на карте       {:>7.2} GB  (свободно {:.2} -> {:.2} GB)",
+        "  used on the card      {:>7.2} GB  (free {:.2} -> {:.2} GB)",
         occupied / 1e9,
         free_before as f64 / 1e9,
         free_after as f64 / 1e9
     );
-    // Потолок считает только наши буферы; разница — контекст CUDA и
-    // гранулярность аллокатора драйвера, их движок не контролирует.
+    // The cap counts only our buffers; the difference is the CUDA context and
+    // the driver allocator's granularity, which the engine doesn't control.
     println!(
-        "  контекст CUDA         {:>7.2} GB",
+        "  CUDA context          {:>7.2} GB",
         (occupied - usage.used as f64) / 1e9
     );
-    println!("  пик host-RAM          {:>7.2} GB", peak_rss_bytes() / 1e9);
+    println!("  peak host RAM         {:>7.2} GB", peak_rss_bytes() / 1e9);
 
-    println!("\nВремя");
+    println!("\nTime");
     println!(
-        "  загрузка              {:>7.1} s  ({:.2} GB/s)",
+        "  load                  {:>7.1} s  ({:.2} GB/s)",
         elapsed,
         stats.resident_bytes() as f64 / 1e9 / elapsed
     );
@@ -159,59 +159,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Сверка одной поднятой проекции с чекпоинтом байт в байт: без неё отчёт
-/// подтверждает только объём, но не то, что в VRAM лежат те самые веса.
+/// A byte-for-byte check of one loaded projection against the checkpoint: without it the report
+/// confirms only the size, not that the right weights are in VRAM.
 fn verify_first_projection(
     checkpoint: &Checkpoint,
     weights: &ModelWeights,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let layer = &weights.layers[0];
     let Mixer::Linear(mixer) = &layer.mixer else {
-        return Err("слой 0 должен быть linear-attention".into());
+        return Err("layer 0 must be linear-attention".into());
     };
     let name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_packed";
     let expected = checkpoint
         .bytes(name)
-        .ok_or("нет in_proj_qkv.weight_packed")?;
-    // qkv лежит в начале слитой входной проекции: сверка заодно проверяет,
-    // что склейка не переставила части местами.
+        .ok_or("missing in_proj_qkv.weight_packed")?;
+    // qkv lies at the start of the fused input projection: the check also verifies
+    // that the concatenation didn't swap parts.
     let fused = mixer.in_proj.linear.packed_to_host()?;
     let actual = fused
         .get(..expected.len())
-        .ok_or("слитая проекция короче in_proj_qkv")?;
+        .ok_or("fused projection is shorter than in_proj_qkv")?;
     if actual != expected {
         return Err(format!(
-            "in_proj_qkv слоя 0 разошёлся с чекпоинтом ({} байт)",
+            "in_proj_qkv of layer 0 diverged from the checkpoint ({} bytes)",
             actual.len()
         )
         .into());
     }
     println!(
-        "\nСверка: in_proj_qkv слоя 0 совпадает с началом слитой проекции \
-         побайтно ({:.1} MB из {:.1} MB)",
+        "\nCheck: in_proj_qkv of layer 0 matches the start of the fused projection \
+         byte for byte ({:.1} MB of {:.1} MB)",
         actual.len() as f64 / 1e6,
         fused.len() as f64 / 1e6
     );
     Ok(())
 }
 
-/// Ошибка перевода словарных матриц в FP8 на настоящих весах: без этих
-/// цифр экономия 2.54 GB — обещание, а не измеренный размен.
+/// The error of converting the vocab matrices to FP8 on real weights: without these
+/// numbers the 2.54 GB saving is a promise, not a measured trade-off.
 fn verify_vocab(
     checkpoint: &Checkpoint,
     weights: &ModelWeights,
 ) -> Result<(), Box<dyn std::error::Error>> {
     const TOKENS: [u32; 6] = [0, 1, 151_643, 1000, 100_000, 248_319];
-    /// Столько строк lm_head сверяется с точной BF16-арифметикой на CPU.
+    /// This many lm_head rows are checked against exact BF16 arithmetic on CPU.
     const CHECKED_ROWS: usize = 2048;
 
     let stream = Stream::new()?;
     let embed_source = checkpoint
         .bytes("model.language_model.embed_tokens.weight")
-        .ok_or("нет embed_tokens")?;
-    let head_source = checkpoint.bytes("lm_head.weight").ok_or("нет lm_head")?;
+        .ok_or("missing embed_tokens")?;
+    let head_source = checkpoint.bytes("lm_head.weight").ok_or("missing lm_head")?;
 
-    // Выборка эмбеддингов против BF16 из чекпоинта.
+    // Embedding lookup vs BF16 from the checkpoint.
     let tokens = DeviceBuffer::from_slice(&TOKENS)?;
     let mut gathered = DeviceBuffer::<u16>::zeroed(TOKENS.len() * HIDDEN_SIZE)?;
     weights.embed.gather(&tokens, &mut gathered, &stream)?;
@@ -230,14 +230,14 @@ fn verify_vocab(
             sum_embed += error;
         }
     }
-    println!("\nFP8 против BF16 (настоящие веса)");
+    println!("\nFP8 vs BF16 (real weights)");
     println!(
-        "  embed: макс {:.2}% от размаха строки, средняя {:.3}%",
+        "  embed: max {:.2}% of row range, mean {:.3}%",
         worst_embed * 100.0,
         sum_embed / (TOKENS.len() * HIDDEN_SIZE) as f64 * 100.0
     );
 
-    // Логиты: эталон считается в BF16-арифметике на подмножестве строк.
+    // Logits: the reference is computed in BF16 arithmetic on a subset of rows.
     let hidden = bf16_row(embed_source, 1000, HIDDEN_SIZE)
         .iter()
         .map(|&value| bf16::from_f32(value))
@@ -266,7 +266,7 @@ fn verify_vocab(
         .map(|(&want, &got)| (want - got).abs())
         .fold(0.0f32, f32::max);
     println!(
-        "  lm_head: макс отклонение логита {:.4} при размахе {:.2} ({:.2}%), строк сверено {CHECKED_ROWS}",
+        "  lm_head: max logit deviation {:.4} at range {:.2} ({:.2}%), rows checked {CHECKED_ROWS}",
         worst,
         magnitude,
         worst / magnitude * 100.0
@@ -275,11 +275,11 @@ fn verify_vocab(
     let top_exact = argmax(&expected);
     let top_fp8 = argmax(&actual[..CHECKED_ROWS]);
     println!(
-        "  argmax на этом подмножестве: точный {top_exact}, fp8 {top_fp8}{}",
+        "  argmax on this subset: exact {top_exact}, fp8 {top_fp8}{}",
         if top_exact == top_fp8 {
             ""
         } else {
-            "  <- разошлись"
+            "  <- diverged"
         }
     );
     Ok(())
@@ -294,7 +294,7 @@ fn argmax(values: &[f32]) -> usize {
         .unwrap_or(0)
 }
 
-/// Строка BF16-матрицы из mmap как f32.
+/// A row of a BF16 matrix from mmap as f32.
 fn bf16_row(raw: &[u8], row: usize, cols: usize) -> Vec<f32> {
     let start = row * cols * 2;
     raw[start..start + cols * 2]
@@ -305,7 +305,7 @@ fn bf16_row(raw: &[u8], row: usize, cols: usize) -> Vec<f32> {
         .collect()
 }
 
-/// VmHWM — пик резидентной памяти процесса с момента старта.
+/// VmHWM — the process's peak resident memory since start.
 fn peak_rss_bytes() -> f64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()

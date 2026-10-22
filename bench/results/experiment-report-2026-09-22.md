@@ -1,94 +1,94 @@
-# Экспериментальный контур — отчёт 2026-09-22
+# Experiment harness — report 2026-09-22
 
-## Итог
+## Summary
 
-Проект получил воспроизводимый контур для абляций и честного сравнения с vLLM:
+The project got a reproducible harness for ablations and fair comparison with vLLM:
 
-- каждый trial запускается в отдельном процессе;
-- порядок вариантов меняется между trials;
-- сохраняются raw JSONL, полная команда, commit, dirty-state, hash исходников и
-  состояние GPU до/после запуска;
-- отчёт считает bootstrap 95% CI среднего и paired 95% CI относительного
-  ускорения;
-- publishable запуск блокируется, если до старта занято больше 8 GiB VRAM;
-- vLLM запускается с CUDA graphs, явно выключенным prefix caching, тем же
-  checkpoint, corpus, KV dtype, context, длинами и общим VRAM budget.
+- each trial runs in a separate process;
+- variant order rotates between trials;
+- raw JSONL, the full command, commit, dirty state, source hash and
+  GPU state before/after the run are saved;
+- the report computes a bootstrap 95% CI of the mean and a paired 95% CI of the relative
+  speedup;
+- a publishable run is blocked if more than 8 GiB of VRAM is in use before start;
+- vLLM runs with CUDA graphs, prefix caching explicitly off, the same
+  checkpoint, corpus, KV dtype, context, lengths and total VRAM budget.
 
-Реализация: `bench/experiments.py`. Методика: `docs/11-experiments.md`.
+Implementation: `bench/experiments.py`. Methodology: `docs/11-experiments.md`.
 
-## Исправленный roofline
+## Corrected roofline
 
-Старая модель смешивала resident footprint и трафик decode-шага.
+The old model mixed up the resident footprint and decode-step traffic.
 
-| величина | значение |
+| quantity | value |
 |---|---:|
 | resident weights | 17.08 GB |
-| веса, реально читаемые ordinary decode | **14.96 GB** |
-| измеренная устойчивая полоса DRAM | **1.605 TB/s** |
-| идеальный ITL, batch=1, ctx=2048 | **9.42 ms** |
-| физический потолок | **106 tok/s** |
+| weights actually read by ordinary decode | **14.96 GB** |
+| measured sustained DRAM bandwidth | **1.605 TB/s** |
+| ideal ITL, batch=1, ctx=2048 | **9.42 ms** |
+| physical ceiling | **106 tok/s** |
 
-MTP-голова не читается обычным шагом, а embedding делает lookup одной строки,
-поэтому обе величины исключены из полного весового прохода. Расчёт теперь
-живёт в `WeightPlan::decode_weight_bytes` и используется `qwc-core plan`.
+The MTP head isn't read by a regular step, and the embedding does a one-row lookup,
+so both are excluded from the full weight pass. The calculation now
+lives in `WeightPlan::decode_weight_bytes` and is used by `qwc-core plan`.
 
-Последний ранее измеренный ordinary decode 79.2 tok/s соответствует примерно
-75% исправленного roofline. Спекулятивный decode нельзя делить на этот потолок:
-один проход основной модели подтверждает несколько токенов.
+The last previously measured ordinary decode of 79.2 tok/s corresponds to roughly
+75% of the corrected roofline. Speculative decode can't be divided by this ceiling:
+one main-model pass confirms several tokens.
 
-## Матрица сравнений
+## Comparison matrix
 
-Comparison suite заранее фиксирует четыре режима:
+The comparison suite pins four modes in advance:
 
-| сценарий | QwenCore | vLLM |
+| scenario | QwenCore | vLLM |
 |---|---|---|
-| batch-1 без MTP | ordinary decode | ordinary decode |
-| batch-1 с MTP | k=3 + shortlist 32K | Qwen3.5 MTP k=3 |
+| batch 1 without MTP | ordinary decode | ordinary decode |
+| batch 1 with MTP | k=3 + shortlist 32K | Qwen3.5 MTP k=3 |
 | serving c=32 | chunk 2048 | max batched tokens 2048 |
 | prefill 4096/8 | chunk 2048 | max batched tokens 4096 |
 
-Во всех строках используются реальные неповторяющиеся prompt token IDs.
+All rows use real non-repeating prompt token IDs.
 
-## Матрица абляций
+## Ablation matrix
 
-| переход | изолированный фактор |
+| transition | isolated factor |
 |---|---|
 | base -> MTP k=3 | speculative decoding |
-| MTP k=3 -> shortlist 32K | сокращённый draft `lm_head` |
-| recurrent BF16 -> recurrent FP32 | округление состояния внутри prefill |
-| recurrent FP32 -> WY | алгоритм DeltaNet scan |
-| prefill chunk 512 -> 2048 | token budget шага |
-| BF16 KV -> FP8 KV | формат KV-кэша |
+| MTP k=3 -> shortlist 32K | reduced draft `lm_head` |
+| recurrent BF16 -> recurrent FP32 | state rounding inside prefill |
+| recurrent FP32 -> WY | DeltaNet scan algorithm |
+| prefill chunk 512 -> 2048 | step token budget |
+| BF16 KV -> FP8 KV | KV cache format |
 
-Int8 DeltaNet state пока остаётся cross-build абляцией: runtime-переключателя
-назад на BF16 нет. Существующий измеренный результат — 25.72 -> 24.67 ms при
-batch=32 и −1.13 GB VRAM; он не смешивается с одно-бинарными абляциями.
+Int8 DeltaNet state remains a cross-build ablation for now: there's no runtime switch
+back to BF16. The existing measured result is 25.72 -> 24.67 ms at
+batch=32 and −1.13 GB of VRAM; it isn't mixed with single-binary ablations.
 
-## Проверки
+## Checks
 
 - Python unit tests: **7/7 passed**.
 - `cargo test -p qwc-core`: **16/16 passed**.
-- `cargo check -p qwc-engine --bin servebench`: **passed** в отдельном target.
+- `cargo check -p qwc-engine --bin servebench`: **passed** in a separate target.
 - `git diff --check`: **passed**.
-- Обе experiment suites прошли dry-run; все команды и корпуса разрешаются.
-- Общий `cargo fmt --check` остаётся красным на существующих незакоммиченных
-  файлах вне этого изменения; автоматическое переформатирование чужого дерева
-  не выполнялось.
+- Both experiment suites passed dry-run; all commands and corpora resolve.
+- The overall `cargo fmt --check` stays red on existing uncommitted
+  files outside this change; automatic reformatting of someone else's tree
+  was not performed.
 
-## Почему нет новой CI-таблицы
+## Why there's no new CI table
 
-Во время работы RTX 5090 была занята на 28.9 из 32.6 GiB. Основные потребители:
+During the work the RTX 5090 had 28.9 of 32.6 GiB in use. Main consumers:
 
 - `VLLM::EngineCore`: 24.2 GiB;
-- отдельный Python-процесс: 3.1 GiB.
+- a separate Python process: 3.1 GiB.
 
-Запуск 26-GB сравнения в таком состоянии был бы либо OOM, либо измерением
-конкуренции с чужим workload. Старые одиночные точки нельзя превратить в
-доверительные интервалы постфактум, поэтому новые цифры не выдумывались.
+Running the 26 GB comparison in that state would have been either OOM or a measurement of
+contention with someone else's workload. Old single points can't be turned into
+confidence intervals after the fact, so no new numbers were made up.
 
-## Команды для финального прогона
+## Commands for the final run
 
-После освобождения GPU:
+After the GPU is freed:
 
 ```bash
 ~/.venvs/baseline/bin/python bench/experiments.py run \

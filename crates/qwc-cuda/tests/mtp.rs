@@ -1,4 +1,4 @@
-//! Сверка BF16-линейки draft-головы с эталоном на CPU.
+//! Checks the draft head's BF16 linear layers against a CPU reference.
 
 use qwc_cuda::mtp;
 use qwc_cuda::{DeviceBuffer, Stream, bf16};
@@ -15,9 +15,9 @@ impl Rng {
     }
 }
 
-/// Формы взяты из головы как она лежит в чекпоинте: fc [5120, 10240],
-/// q_proj [12288, 5120], down_proj [5120, 17408]. Строк до четырёх — столько
-/// несёт проверка черновиков.
+/// Shapes are taken from the head as it sits in the checkpoint: fc [5120, 10240],
+/// q_proj [12288, 5120], down_proj [5120, 17408]. Up to four rows — that's how many
+/// draft verification carries.
 #[test]
 fn bf16_linear_matches_cpu_on_head_shapes() {
     let stream = Stream::new().unwrap();
@@ -60,13 +60,13 @@ fn bf16_linear_matches_cpu_on_head_shapes() {
                 scale = scale.max(sum.abs());
             }
         }
-        // Выход кладётся в BF16, поэтому порог — его собственный шаг
-        // округления, около 0.4% величины.
+        // The output is stored in BF16, so the threshold is its own rounding
+        // step, about 0.4% of the magnitude.
         assert!(
             worst <= 6e-3 * scale,
-            "формы {rows}x{k}x{n}: расхождение {worst:.3e} при масштабе {scale:.3e}"
+            "shapes {rows}x{k}x{n}: divergence {worst:.3e} at scale {scale:.3e}"
         );
-        println!("{rows}x{k}x{n}: max {worst:.3e} при масштабе {scale:.3e}");
+        println!("{rows}x{k}x{n}: max {worst:.3e} at scale {scale:.3e}");
     }
 }
 
@@ -94,7 +94,7 @@ fn swiglu_and_concat_match_cpu() {
         let got = bf16::to_f32(out[index]);
         assert!(
             (got - want).abs() <= 6e-3 * want.abs().max(1e-2),
-            "swiglu[{index}]: {got} против {want}"
+            "swiglu[{index}]: {got} vs {want}"
         );
     }
     let joined = device_concat.to_vec().unwrap();

@@ -1,10 +1,10 @@
-// MTP draft-голова: линейные слои в BF16.
+// MTP draft head: linear layers in BF16.
 //
-// Голова лежит в чекпоинте неквантованной (`ignored: .*mtp.*`), поэтому все
-// её матрицы идут мимо NVFP4-пути. Черновой шаг делает восемь таких умножений
-// при M <= 8 строк — задача чисто полосовая: 849 МБ весов за проход, то есть
-// 475 мкс на потолке карты. Значит и форма кернела нужна полосовая: варп
-// владеет строкой весов и читает её подряд, вход лежит в shared.
+// The head sits in the checkpoint unquantized (`ignored: .*mtp.*`), so all
+// its matrices bypass the NVFP4 path. A draft step does eight such multiplications
+// at M <= 8 rows — a purely bandwidth-bound task: 849 MB of weights per pass, i.e.
+// 475 us at the card's ceiling. So the kernel shape must be bandwidth-oriented too: a warp
+// owns a weight row and reads it sequentially, the input sits in shared.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -15,9 +15,9 @@ namespace {
 constexpr int kWarpSize = 32;
 constexpr int kThreads = 256;
 constexpr int kWarps = kThreads / kWarpSize;
-// Ширина куска входа в shared. 1024 float на строку — это 4 КБ, при восьми
-// строках 32 КБ, то есть два блока на SM.
-constexpr int kChunk = 1024;   // кратен вектору из восьми
+// Width of the input chunk in shared. 1024 floats per row is 4 KB, with eight
+// rows 32 KB, i.e. two blocks per SM.
+constexpr int kChunk = 1024;   // a multiple of an eight-wide vector
 
 constexpr int kMaxRows = 8;
 
@@ -62,8 +62,8 @@ __global__ __launch_bounds__(kThreads) void bf16_linear_kernel(
     if (!active) {
       continue;
     }
-    // Восемь элементов на дорожку: варп за раз забирает 512 байт вместо 64.
-    // Поэлементное чтение давало около 575 ГБ/с из 1790 возможных.
+    // Eight elements per lane: a warp fetches 512 bytes at a time instead of 64.
+    // Element-wise reads gave about 575 GB/s of 1790 possible.
     constexpr int kVector = 8;
     const int vectors = width / kVector;
     for (int index = lane; index < vectors; index += kWarpSize) {
@@ -101,7 +101,7 @@ __global__ __launch_bounds__(kThreads) void bf16_linear_kernel(
   }
 }
 
-// SwiGLU по месту: down_proj читает произведение silu(gate) * up.
+// SwiGLU in place: down_proj reads the product silu(gate) * up.
 __global__ void swiglu_kernel(
     const __nv_bfloat16* __restrict__ gate,
     const __nv_bfloat16* __restrict__ up,
@@ -116,8 +116,8 @@ __global__ void swiglu_kernel(
   out[index] = __float2bfloat16(g / (1.0f + __expf(-g)) * u);
 }
 
-// Вход fc: две нормированные половины подряд. Норму считает rmsnorm, здесь
-// только склейка — отдельный кернел дешевле лишнего прохода по памяти.
+// fc input: two normalized halves back to back. The norm is computed by rmsnorm, here
+// only concatenation — a separate kernel is cheaper than an extra memory pass.
 __global__ void concat_kernel(
     const __nv_bfloat16* __restrict__ left,
     const __nv_bfloat16* __restrict__ right,

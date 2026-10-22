@@ -1,49 +1,49 @@
-# Слитая входная проекция миксера — 2026-09-12
+# Fused mixer input projection — 2026-09-12
 
-## Откуда взялось
+## Where it came from
 
-Разбивка `gemm.la_qkvab` на отдельные фазы показала: две проекции
-`in_proj_a` и `in_proj_b` формы [48, 5120] стоят 2.37 мс — больше, чем qkv
-(1.56, N=10240) и z (1.37, N=6144) вместе. При тайле 128x128 проекция с N=48
-даёт один блок на 170 SM.
+Splitting `gemm.la_qkvab` into separate phases showed: the two projections
+`in_proj_a` and `in_proj_b` of shape [48, 5120] cost 2.37 ms — more than qkv
+(1.56, N=10240) and z (1.37, N=6144) combined. With a 128x128 tile a projection with N=48
+gives one block on 170 SMs.
 
-## Что сделано
+## What was done
 
-qkv, z, a и b читают один и тот же вход и склеены в одну матрицу
-[16480, 5120] на загрузке. Склейка точна побитово: во всех 48 слоях у них
-совпадают и `weight_global_scale`, и `input_global_scale` (проверено по всем
-пяти шардам), а alpha GEMM'а — один скаляр на запуск, так что разные шкалы
-склеить было бы нечем. Расхождение шкал теперь ошибка загрузки, а не случай,
-который поддерживается.
+qkv, z, a and b read the same input and are concatenated into one matrix
+[16480, 5120] at load. The concatenation is bit-exact: in all 48 layers they
+share both `weight_global_scale` and `input_global_scale` (checked across all
+five shards), and the GEMM alpha is one scalar per launch, so there would be no way to
+merge different scales. A scale mismatch is now a load error, not a supported
+case.
 
-Потребители получают не отдельный буфер, а `RowView` — вид на столбцы арены
-с её шагом. Свёртка, нормировка с гейтами и gated RMSNorm научены читать
-входы с произвольным шагом; выходы у них как были, плотные.
+Consumers get not a separate buffer but a `RowView` — a view onto the arena's columns
+with its stride. Convolution, gated normalization and gated RMSNorm were taught to read
+inputs with an arbitrary stride; their outputs stay dense as before.
 
-Побочно: четыре запуска на слой превратились в один, и вход квантуется один
-раз вместо четырёх.
+As a side effect: four launches per layer became one, and the input is quantized once
+instead of four times.
 
-## Замер
+## Measurement
 
-| | до | после |
+| | before | after |
 |---|---:|---:|
-| фазы qkv + z + ab, decode c=64 | 5.30 мс | 2.14 мс |
-| шаг чистого decode, c=64 | 32.87 мс | 30.12 мс |
-| смешанный шаг (сегмент 448) | 73.9 мс | 70.3 мс |
+| qkv + z + ab phases, decode c=64 | 5.30 ms | 2.14 ms |
+| pure decode step, c=64 | 32.87 ms | 30.12 ms |
+| mixed step (segment 448) | 73.9 ms | 70.3 ms |
 
-Сквозная пропускная способность, все замеры одной сессии:
+End-to-end throughput, all measurements from one session:
 
-| concurrency | HEAD | + stream-K | + слитая проекция |
+| concurrency | HEAD | + stream-K | + fused projection |
 |---|---:|---:|---:|
 | 32 | — | — | 959.36 |
 | 64 | 1206.25 | 1223.64 | 1317.97 |
 | 80 | — | — | 1478.09 |
 
-На c=64 это +9.3% к HEAD сессии.
+At c=64 that's +9.3% over the session's HEAD.
 
-## Сверка
+## Verification
 
-`bin/load` сверяет первые 26.2 МБ слитой матрицы с `in_proj_qkv` чекпоинта
-побайтно — заодно проверяет, что склейка не переставила части местами.
-Генерация на batch 1 (путь W4A16, без шага) и на batch 8 (путь W4A4, со
-смещёнными чтениями) даёт одну и ту же последовательность токенов.
+`bin/load` checks the first 26.2 MB of the fused matrix against the checkpoint's `in_proj_qkv`
+byte by byte — which also checks that the concatenation didn't swap parts.
+Generation at batch 1 (W4A16 path, no stride) and at batch 8 (W4A4 path, with
+offset reads) gives the same token sequence.

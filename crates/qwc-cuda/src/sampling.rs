@@ -48,10 +48,10 @@ impl Argmax {
         })
     }
 
-    /// Argmax по первым `count` значениям одной строки, сразу на хост.
+    /// Argmax over the first `count` values of one row, straight to host.
     ///
-    /// Нужен шортлисту черновой головы: его выход плотный и короче словаря,
-    /// поэтому возвращается место в списке, а не идентификатор токена.
+    /// Needed by the draft head's shortlist: its output is dense and shorter than the vocab,
+    /// so it returns the position in the list, not a token id.
     pub fn sample_prefix(
         &mut self,
         logits: &DeviceBuffer<f32>,

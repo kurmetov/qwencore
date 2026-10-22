@@ -1,132 +1,132 @@
-# Чанковый (WY) скан DeltaNet на префилле — 2026-09-16
+# Chunked (WY) DeltaNet scan in prefill — 2026-09-16
 
-Рекуррентный скан идёт по токенам последовательно и тензорных ядер не
-касается: 4.7 MFLOP на токен и слой, около 10 TFLOP/s. Чанковая форма считает
-те же 64 токена матрицами — FLOP-ов примерно в полтора раза больше, но они
-ложатся на MMA. Бюджет префилла (`prefill-budget-2026-09-14.md`) ставил скан
-первым в очереди: 23.8 мкс/токен из ~97.
+The recurrent scan goes over tokens sequentially and doesn't touch the tensor
+cores: 4.7 MFLOP per token and layer, about 10 TFLOP/s. The chunked form computes
+the same 64 tokens with matrices — roughly one and a half times more FLOPs, but they
+land on MMA. The prefill budget (`prefill-budget-2026-09-14.md`) put the scan
+first in the queue: 23.8 µs/token of ~97.
 
-## Итог
+## Summary
 
-Микробенч `deltaprefillbench`, одна последовательность, 48 слоёв, замеры
-подряд в одной сессии:
+Microbenchmark `deltaprefillbench`, one sequence, 48 layers, measurements
+back to back in one session:
 
-| токенов | рекуррентный | WY | |
+| tokens | recurrent | WY | |
 |---:|---:|---:|---|
-| 128 | 23.13 мкс/токен | 23.42 | 0.99x |
+| 128 | 23.13 µs/token | 23.42 | 0.99x |
 | 256 | 22.74 | 13.93 | 1.63x |
 | 512 | 22.34 | **10.19** | 2.19x |
 | 1024 | 21.69 | **10.48** | 2.07x |
 
-На 128 токенах выигрыша нет: это два чанка, и шесть запусков подготовки на
-слой не окупаются. С 512 токенов форма выходит на свои 1.9x.
+At 128 tokens there's no gain: that's two chunks, and six prep launches per
+layer don't pay off. From 512 tokens on the form reaches its 1.9x.
 
-Шаг движка, `stepprofile --concurrency 2 --prefill-tokens 2046
+Engine step, `stepprofile --concurrency 2 --prefill-tokens 2046
 --prefill-start 3584 --context 8192`:
 
-| | рекуррентный | WY |
+| | recurrent | WY |
 |---|---:|---:|
-| delta.scan_prefill | 50.04 мс (20.3%) | **20.96 мс (9.7%)** |
-| шаг целиком | 245.97 мс | **213.86 мс** |
+| delta.scan_prefill | 50.04 ms (20.3%) | **20.96 ms (9.7%)** |
+| whole step | 245.97 ms | **213.86 ms** |
 
-Сквозной префилл, `servebench --prompt-tokens 4096 --max-new 8
---concurrency 16 --prefill-chunk 2048`, bf16 KV, медиана трёх прогонов:
+End-to-end prefill, `servebench --prompt-tokens 4096 --max-new 8
+--concurrency 16 --prefill-chunk 2048`, bf16 KV, median of three runs:
 
-| | рекуррентный | WY | |
+| | recurrent | WY | |
 |---|---:|---:|---|
 | prefill | 9195 tok/s | **10627 tok/s** | +15.6% |
-| TTFT p50 | 7262 мс | **6251 мс** | −14% |
+| TTFT p50 | 7262 ms | **6251 ms** | −14% |
 
-Чат-точка 256/128 c=80 (промпт короче двух чанков): 1643 против 1669 tok/s,
-ITL 33.0 против 32.8 — в пределах шума, регресса нет.
+Chat point 256/128 c=80 (prompt shorter than two chunks): 1643 vs 1669 tok/s,
+ITL 33.0 vs 32.8 — within noise, no regression.
 
-Численно путь эквивалентен прежнему: дифф-eval против сохранённого прогона
-vLLM 0.28 даёт top-1 1.000 на всех 14 случаях, Jaccard 0.790 против 0.782,
-logprob MAE 0.367 против 0.364. Вердикт FAIL там у обоих и по известной
-причине — эталон сам квантует активации в FP4
+Numerically the path is equivalent to the old one: diff-eval against a saved
+vLLM 0.28 run gives top-1 1.000 on all 14 cases, Jaccard 0.790 vs 0.782,
+logprob MAE 0.367 vs 0.364. The verdict there is FAIL for both, for a known
+reason — the reference itself quantizes activations to FP4
 (`numerics-findings.md`).
 
-## Из чего сложилось
+## How it came together
 
-Первая рабочая версия была **в 4.6 раза медленнее** рекуррентной (100
-мкс/токен). Три шага по замеру, а не по интуиции:
+The first working version was **4.6x slower** than the recurrent one (100
+µs/token). Three steps driven by measurement, not intuition:
 
-1. **Прямая подстановка в пространстве значений — 66 из 102 мкс/токен.**
-   Решала систему на 128 измерений значений сразу, перечитывая коэффициенты
-   из глобальной памяти: 50 МБ на чанк слоя. Заменена на явную обратную к
-   единично-нижнетреугольной матрице (64x64, целиком в shared) плюс MMA на
-   неё. 102 -> 55.
-2. **Запуски.** Фазы, не зависящие от состояния, считались на каждый чанк:
-   14 запусков на чанк, то есть 7680 на шаг из 1024 токенов при пусковой
-   задержке 1.3-3.1 мкс (замерено отдельно). Вынесены в один запуск на слой
-   сразу на все чанки. 55 -> 40.
-3. **Слитое ядро на последовательную часть.** Цепочку чанков разорвать
-   нельзя, но всё внутри неё помещается в один варп: варп владеет 16 строками
-   состояния на всю глубину dk и делает пять матричных умножений подряд, не
-   выкладывая состояние в память. 40 -> 12.
-4. **Ещё две мелочи по замеру.** Q читается фрагментами прямо из глобальной
-   памяти, а не из shared: все варпы CTA берут одни и те же элементы, их
-   держит L1, а 17 КБ shared дороже (11.8 -> 11.2). Подстановка в
-   `wy_factor` переведена на панели по 16 строк: значение предыдущей строки
-   читается раз на шестнадцать FMA, внутри панели живёт в регистрах
+1. **Forward substitution in value space — 66 of 102 µs/token.**
+   It solved the system for all 128 value dimensions at once, re-reading coefficients
+   from global memory: 50 MB per layer chunk. Replaced with an explicit inverse of the
+   unit lower-triangular matrix (64x64, entirely in shared) plus an MMA with
+   it. 102 -> 55.
+2. **Launches.** State-independent phases were computed per chunk:
+   14 launches per chunk, i.e. 7680 per 1024-token step at a launch
+   latency of 1.3-3.1 µs (measured separately). Moved to one launch per layer
+   for all chunks at once. 55 -> 40.
+3. **A fused kernel for the sequential part.** The chain of chunks can't be broken,
+   but everything inside it fits in one warp: a warp owns 16 state rows
+   over the full dk depth and does five matrix multiplies in a row without
+   spilling the state to memory. 40 -> 12.
+4. **Two more small things by measurement.** Q is read as fragments directly from global
+   memory rather than shared: all warps of a CTA take the same elements, L1
+   holds them, and 17 KB of shared costs more (11.8 -> 11.2). Substitution in
+   `wy_factor` switched to 16-row panels: the previous row's value
+   is read once per sixteen FMAs, within a panel it lives in registers
    (11.2 -> 10.2).
 
-В слитом ядре решило дело не столько само слияние, сколько раскладка:
-аккумулятор m16n8k16 (строка dv, столбец dk) годится как операнд A для
-`S K^T` и как операнд B для `Q S^T` без единой перекладки — BF16-копия
-состояния упаковывается один раз на чанк и служит обеим ролям.
+In the fused kernel what decided it was not so much the fusion itself as the layout:
+the m16n8k16 accumulator (row dv, column dk) works as operand A for
+`S K^T` and as operand B for `Q S^T` without a single reshuffle — the BF16 copy of
+the state is packed once per chunk and serves both roles.
 
-Свипы на слитом ядре: 4 варпа на CTA (13.0 мкс/токен) против 2 (14.4) и 8
-(16.0); T и F читаются из глобальной памяти, а не из shared — это освободило
-18 КБ и дало 13.5 -> 13.0.
+Sweeps on the fused kernel: 4 warps per CTA (13.0 µs/token) vs 2 (14.4) and 8
+(16.0); T and F are read from global memory, not shared — this freed
+18 KB and gave 13.5 -> 13.0.
 
-Остаток по фазам (замер выключением фаз, 512 токенов, тогда ещё 11.9
-мкс/токен; после панельной подстановки `wy_factor` стоит примерно вдвое
-меньше):
+Remainder by phase (measured by disabling phases, 512 tokens, at that time still 11.9
+µs/token; after panel substitution `wy_factor` costs about half
+as much):
 
-| фаза | мкс/токен |
+| phase | µs/token |
 |---|---:|
-| слитое ядро + тайл значений | 5.7 |
-| обратная матрица + множители (`wy_factor`) | 3.0 -> ~1.5 |
-| граммы K K^T и Q K^T | 1.2 |
-| тайлы q и k | 0.4 |
-| затухание | 0.2 |
+| fused kernel + value tile | 5.7 |
+| inverse matrix + multipliers (`wy_factor`) | 3.0 -> ~1.5 |
+| grams K K^T and Q K^T | 1.2 |
+| q and k tiles | 0.4 |
+| decay | 0.2 |
 
-Дальше по этому пути осталось немного и оно дорогое. Скан теперь 9.7% шага,
-а внимание на той же позиции — 36.7%: следующая работа по префиллу там, а не
-здесь (тайл в 64 строки запроса, где варп владеет своими 16 строками и всеми
-ключами — см. `prefill-budget-2026-09-14.md`).
+There's little left down this path and it's expensive. The scan is now 9.7% of the step,
+while attention at the same position is 36.7%: the next prefill work is there, not
+here (a 64-query-row tile where a warp owns its 16 rows and all
+keys — see `prefill-budget-2026-09-14.md`).
 
-### Что померили и отвергли
+### What was measured and rejected
 
-Транспонирование значений внутри слитого ядра (вместо отдельного ядра и
-25 МБ буфера) — **медленнее**: 11.2 -> 11.8 мкс/токен. Отдельное ядро
-параллельнее, а слитому staging значений ложится в ту же цепочку, что и
-счёт, при двух-четырёх варпах на SM.
+Transposing values inside the fused kernel (instead of a separate kernel and a
+25 MB buffer) — **slower**: 11.2 -> 11.8 µs/token. The separate kernel is
+more parallel, while in the fused one value staging lands on the same chain as
+the compute, with two to four warps per SM.
 
-## Ошибка, которую поймал стенд, а не тест
+## A bug caught by the bench, not by a test
 
-Дифф-eval упал на случае `ru` (14 токенов промпта): argmax на GPU выдал
-0xFFFFFFFF, то есть NaN в логитах. Причина — затухание.
+Diff-eval failed on the `ru` case (14 prompt tokens): the GPU argmax returned
+0xFFFFFFFF, i.e. NaN in the logits. The cause was decay.
 
-gamma_t (произведение alpha по чанку) на 64 токенах уходит под нижнюю границу
-fp32 уже при alpha около 0.2, а вся чанковая форма построена на отношениях
-gamma_t / gamma_r. После обнуления обоих отношение становится 0/0. Реальные
-alpha в модели такие бывают, а в тестах — нет: там стояло 0.92..0.96, где
-gamma за чанк падает всего до 0.005.
+gamma_t (the product of alpha over a chunk) over 64 tokens underflows
+fp32 already at alpha around 0.2, and the whole chunked form is built on the ratios
+gamma_t / gamma_r. Once both are zeroed the ratio becomes 0/0. Such real
+alpha values do occur in the model, but not in the tests: they had 0.92..0.96, where
+gamma per chunk drops only to 0.005.
 
-Починено переводом затухания в логарифмы: копится сумма `log(alpha)`,
-отношение берётся как `exp` от разности (всегда не больше единицы), сам
-gamma_t — как `exp` от суммы (при переполнении вниз честно даёт ноль). То же
-сделано в CPU-эталоне. Тест теперь проходит по затуханиям 0.94, 0.5, 0.15 и
-0.05 на токен.
+Fixed by moving decay to logarithms: the sum of `log(alpha)` is accumulated,
+the ratio is taken as `exp` of the difference (always at most one), and
+gamma_t itself as `exp` of the sum (on underflow it honestly gives zero). The same
+was done in the CPU reference. The test now passes for decays of 0.94, 0.5, 0.15 and
+0.05 per token.
 
-## Цена
+## Cost
 
-Скретч WY-скана — около 84 МБ на движок (тайлы q/k, граммы, обратные
-матрицы, множители, тайл значений; рассчитаны на полную арену в 2048 строк).
-Заводится только в режиме `--delta-state wy`. На c=80 с контекстом 2048 это
-уже ощутимо: один из прогонов чат-точки не стартовал по памяти.
+The WY scan scratch is about 84 MB per engine (q/k tiles, grams, inverse
+matrices, multipliers, value tile; sized for the full 2048-row arena).
+It's allocated only in `--delta-state wy` mode. At c=80 with context 2048 this is
+already noticeable: one of the chat-point runs didn't start for lack of memory.
 
-Поэтапный (не слитый) путь удалён вместе с его кернелами: он был лесами для
-сверки и в 3.4 раза медленнее слитого.
+The staged (non-fused) path was removed along with its kernels: it was scaffolding for
+verification and 3.4x slower than the fused one.

@@ -1,15 +1,15 @@
-//! Спекулятивный decode на MTP-голове: черновики головой, проверка моделью.
+//! Speculative decode on the MTP head: drafts by the head, verification by the model.
 //!
 //! `cargo run --release -p qwc-engine --bin speculate -- --prompt-ids 9707 --max-new 64 --draft 2`
 //!
-//! Шаг устроен так: голова по цепочке предлагает k токенов (каждый стоит
-//! чтения её 849 МБ плюс словарной проекции), модель проверяет их одним
-//! проходом по весам, и принимается самый длинный совпавший префикс плюс один
-//! свой токен сверху. Состояние DeltaNet при этом живёт на черновом слоте:
-//! пока неизвестно, сколько принято, настоящее трогать нельзя.
+//! A step works like this: the head proposes k tokens in a chain (each costs
+//! reading its 849 MB plus the vocab projection), the model verifies them in one
+//! pass over the weights, and the longest matching prefix plus one
+//! of its own tokens on top is accepted. The DeltaNet state meanwhile lives in the draft slot:
+//! until it's known how many were accepted, the real one can't be touched.
 //!
-//! Флаг `--verify` прогоняет то же самое обычным greedy и сверяет токены: у
-//! спекуляции нет права менять выход, только скорость.
+//! The `--verify` flag runs the same thing with plain greedy and compares tokens:
+//! speculation has no right to change the output, only the speed.
 
 use qwc_core::arch::{HIDDEN_SIZE, VOCAB_SIZE};
 use qwc_cuda::paged_attention::KvCacheDtype;
@@ -21,20 +21,20 @@ use qwc_model::Checkpoint;
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// Проверка идёт префилльным путём, обычный decode — своим, и логиты у них
-/// сходятся не бит в бит.
+/// Verification goes through the prefill path, regular decode through its own, and their logits
+/// don't match bit for bit.
 ///
-/// Замер на двенадцати длинах промпта: max|dlogit| строки 0 лежит в
-/// 0.076..0.318 и зависит от контекста, а не от глубины черновика — на
-/// одном промпте значение одинаково при depth 1, 2 и 3. Для сравнения:
-/// сдвиг позиции на единицу давал 1.24..1.36, а W4A4 с квантованными
-/// активациями — 0.64. Допуск 0.5 отделяет округление от обоих с запасом.
+/// Measured on twelve prompt lengths: max|dlogit| of row 0 lies in
+/// 0.076..0.318 and depends on context, not draft depth — on
+/// one prompt the value is the same at depth 1, 2 and 3. For comparison:
+/// a position shift by one gave 1.24..1.36, and W4A4 with quantized
+/// activations 0.64. A tolerance of 0.5 separates rounding from both with margin.
 const ROW_ZERO_TOLERANCE: f32 = 0.50;
 
-/// Допуск на ничью в логитах. Наблюдавшиеся перевороты argmax шли с разрывом
-/// не больше 0.023 — на порядок ниже допуска. Это не доказательство
-/// отсутствия ошибки, а граница «дальше того, что давало округление»:
-/// сдвиг позиции переворачивал argmax при разрыве 0.66.
+/// Tolerance for a tie in logits. Observed argmax flips had a gap of
+/// at most 0.023 — an order of magnitude below the tolerance. This isn't proof of
+/// no error, but a bound "beyond what rounding gave":
+/// a position shift flipped the argmax with a gap of 0.66.
 const TIE_TOLERANCE: f32 = 0.25;
 
 struct Speculator {
@@ -60,8 +60,8 @@ impl Speculator {
         })
     }
 
-    /// Цепочка черновиков: первый идёт по скрытому состоянию модели, дальше
-    /// голова продолжает по собственному выходу и собственному предсказанию.
+    /// A draft chain: the first goes off the model's hidden state, then
+    /// the head continues off its own output and its own prediction.
     fn draft(
         &mut self,
         weights: &ModelWeights,
@@ -77,7 +77,7 @@ impl Speculator {
             } else {
                 &self.draft_hidden
             };
-            // SAFETY: буферы живут в self и не пересекаются с выходом.
+            // SAFETY: the buffers live in self and don't overlap with the output.
             let source = unsafe { &*source };
             mtp::draft(
                 &self.head,
@@ -127,10 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--verify" => verify = true,
             "--diagnose" => diagnose = true,
             "--profile" => profile = true,
-            other => return Err(format!("неизвестный аргумент: {other}").into()),
+            other => return Err(format!("unknown argument: {other}").into()),
         }
     }
-    assert!((1..=7).contains(&depth), "глубина черновика 1..7");
+    assert!((1..=7).contains(&depth), "draft depth 1..7");
 
     let checkpoint = Checkpoint::open(&model)?;
     let weights = ModelWeights::load(&checkpoint)?;
@@ -140,12 +140,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let mut speculator = Speculator::new(&checkpoint, context)?;
 
-    // Спекулятивный прогон.
+    // The speculative run.
     executor.prefill_sequence(&weights, &prompt, 0, 0)?;
     executor.copy_prefill_hidden_row(prompt.len() - 1, &mut speculator.hidden)?;
     let mut next = executor.argmax_to_host(1)?[0];
     let mut generated: Vec<u32> = Vec::with_capacity(max_new);
-    // Откуда взялся каждый выданный токен: строка модели или принятый черновик.
+    // Where each emitted token came from: a model row or an accepted draft.
     let mut origin: Vec<&'static str> = Vec::with_capacity(max_new);
     let pool_blocks: Vec<u32> = (0..executor.max_blocks() as u32).collect();
     let mut position = prompt.len();
@@ -165,14 +165,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         batch.push(next);
         batch.extend_from_slice(&drafts);
 
-        // Стенд ведёт одну последовательность и владеет пулом целиком,
-        // поэтому её страницы — это просто первые max_blocks пула.
+        // The bench drives one sequence and owns the whole pool,
+        // so its pages are simply the first max_blocks of the pool.
         let truth = executor.verify_speculation(&weights, &batch, position, 0, &pool_blocks)?;
         verify_seconds += phase.elapsed().as_secs_f64();
         let phase = Instant::now();
-        // Принимается самый длинный совпавший префикс; за ним идёт токен,
-        // который модель выдала на первой расходящейся строке — он верен по
-        // построению, поэтому шаг всегда даёт хотя бы один токен.
+        // The longest matching prefix is accepted; after it comes the token
+        // the model emitted on the first diverging row — it's correct by
+        // construction, so a step always gives at least one token.
         let mut accepted = 0usize;
         while accepted < drafts.len() && truth[accepted] == drafts[accepted] {
             accepted += 1;
@@ -182,10 +182,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         commit_seconds += phase.elapsed().as_secs_f64();
 
         generated.push(next);
-        origin.push("модель");
+        origin.push("model");
         for &draft in &drafts[..accepted] {
             generated.push(draft);
-            origin.push("черновик");
+            origin.push("draft");
         }
         next = truth[accepted];
         position += rows;
@@ -197,29 +197,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     generated.truncate(max_new);
     origin.truncate(max_new);
 
-    println!("промпт: {prompt:?}");
-    println!("выдано: {generated:?}");
+    println!("prompt: {prompt:?}");
+    println!("generated: {generated:?}");
     println!(
-        "\n{} токенов за {:.3} с = {:.1} tok/s, шагов {steps}, принято черновиков {accepted_total} ({:.2} на шаг)",
+        "\n{} tokens in {:.3} s = {:.1} tok/s, {steps} steps, {accepted_total} drafts accepted ({:.2} per step)",
         generated.len(),
         elapsed,
         generated.len() as f64 / elapsed,
         accepted_total as f64 / steps as f64
     );
     println!(
-        "токенов за шаг: {:.2} (глубина черновика {depth})",
+        "tokens per step: {:.2} (draft depth {depth})",
         (accepted_total + steps) as f64 / steps as f64
     );
     if profile {
         let phases = executor.profile_totals()?;
         let total: f32 = phases.iter().map(|(_, ms)| ms).sum();
-        println!("\nразметка шагов проверки (сумма по всем шагам, {total:.1} мс):");
+        println!("\nverification step breakdown (sum over all steps, {total:.1} ms):");
         for (name, ms) in phases.iter().take(10) {
-            println!("  {name:<24} {ms:8.2} мс  {:5.1}%", ms / total * 100.0);
+            println!("  {name:<24} {ms:8.2} ms  {:5.1}%", ms / total * 100.0);
         }
     }
     println!(
-        "на шаг: черновики {:.2} мс, проверка {:.2} мс, фиксация {:.2} мс, прочее {:.2} мс",
+        "per step: drafts {:.2} ms, verification {:.2} ms, commit {:.2} ms, other {:.2} ms",
         draft_seconds * 1e3 / steps as f64,
         verify_seconds * 1e3 / steps as f64,
         commit_seconds * 1e3 / steps as f64,
@@ -228,21 +228,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if diagnose {
         let worst = row_zero_logit_gap(&checkpoint, &weights, &prompt, context, depth)?;
-        println!("строка 0 проверки против обычного decode: max|dlogit| {worst:.5}");
+        println!("verification row 0 vs regular decode: max|dlogit| {worst:.5}");
     }
 
     if verify {
-        // Строка 0 проверки считает ровно то же, что обычный decode: тот же
-        // токен, та же позиция, то же состояние на входе. Сдвиг позиции виден
-        // здесь сразу, а по токенам — далеко не всегда: при сдвиге на единицу
-        // расхождение логитов доходило до 1.36, а argmax чаще всего выживал.
+        // Verification row 0 computes exactly the same as regular decode: the same
+        // token, the same position, the same input state. A position shift shows
+        // here immediately, but in tokens far from always: with a shift by one
+        // the logit divergence reached 1.36, while the argmax most often survived.
         let worst = row_zero_logit_gap(&checkpoint, &weights, &prompt, context, depth)?;
         assert!(
             worst <= ROW_ZERO_TOLERANCE,
-            "строка 0 проверки разошлась с decode на {worst:.4} при допуске \
-             {ROW_ZERO_TOLERANCE} — это не округление, а другой расчёт"
+            "verification row 0 diverged from decode by {worst:.4} with tolerance \
+             {ROW_ZERO_TOLERANCE} — that's not rounding, it's a different computation"
         );
-        println!("\nстрока 0 проверки против decode: max|dlogit| {worst:.5}");
+        println!("\nverification row 0 vs decode: max|dlogit| {worst:.5}");
 
         let mut plain = Executor::new(ExecutorConfig {
             max_batch: 1,
@@ -259,7 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let plain_seconds = started.elapsed().as_secs_f64();
         println!(
-            "обычный greedy: {:.1} tok/s, ускорение {:.2}x",
+            "plain greedy: {:.1} tok/s, speedup {:.2}x",
             max_new as f64 / plain_seconds,
             (max_new as f64 / elapsed) / (max_new as f64 / plain_seconds)
         );
@@ -269,13 +269,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .zip(reference.iter())
             .position(|(left, right)| left != right);
         let Some(index) = first else {
-            println!("выход совпал с обычным greedy токен в токен");
+            println!("output matched plain greedy token for token");
             return Ok(());
         };
 
-        // Проверка и decode идут разными путями и сходятся не бит в бит.
-        // Пока модели действительно всё равно, какой из двух токенов взять,
-        // расхождение — свойство, а не ошибка; отличает их разрыв логитов.
+        // Verification and decode take different paths and don't match bit for bit.
+        // As long as the model really doesn't care which of two tokens to take,
+        // the divergence is a property, not an error; the logit gap tells them apart.
         let mut probe = Executor::new(ExecutorConfig {
             max_batch: 1,
             max_context: context,
@@ -290,17 +290,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let gap = logits[reference[index] as usize] - logits[generated[index] as usize];
         assert!(
             gap <= TIE_TOLERANCE,
-            "спекуляция изменила выход не на ничье: токен {index}, greedy {} против \
-             {} у спекуляции, разрыв логитов {gap:.4} при допуске {TIE_TOLERANCE} — \
-             это ошибка, а не оптимизация",
+            "speculation changed the output not on a tie: token {index}, greedy {} vs \
+             {} for speculation, logit gap {gap:.4} with tolerance {TIE_TOLERANCE} — \
+             this is a bug, not an optimization",
             reference[index],
             generated[index]
         );
-        // Источник важен: строка модели указывает на сам проход проверки,
-        // принятый черновик — ещё и на сверку принятия.
+        // The source matters: a model row points at the verification pass itself,
+        // an accepted draft also at the acceptance check.
         println!(
-            "расхождение на ничье: токен {index} (позиция {}, источник {}), greedy {} \
-             против {} у спекуляции, разрыв логитов {gap:.5}",
+            "divergence on a tie: token {index} (position {}, source {}), greedy {} \
+             vs {} for speculation, logit gap {gap:.5}",
             prompt.len() + index,
             origin[index],
             reference[index],
@@ -310,11 +310,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Насколько строка 0 спекулятивной проверки расходится с обычным decode.
+/// How much row 0 of speculative verification diverges from regular decode.
 ///
-/// Вход у них один и тот же — тот же токен на той же позиции из того же
-/// состояния, — поэтому всё, что здесь вылезает сверх округления, означает,
-/// что проверка считает не то.
+/// Their input is the same — the same token at the same position from the same
+/// state — so anything showing up here beyond rounding means
+/// verification computes the wrong thing.
 fn row_zero_logit_gap(
     checkpoint: &Checkpoint,
     weights: &ModelWeights,
@@ -342,7 +342,7 @@ fn row_zero_logit_gap(
     let mut plain = Executor::new(config())?;
     plain.prefill_sequence(weights, prompt, 0, 0)?;
     let plain_first = plain.argmax_to_host(1)?[0];
-    assert_eq!(first, plain_first, "префилл разошёлся сам с собой");
+    assert_eq!(first, plain_first, "prefill diverged from itself");
     plain.decode(weights, &[plain_first], &[prompt.len() as u32])?;
     let plain_logits = plain.logits_to_host(0)?;
 

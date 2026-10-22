@@ -1,31 +1,31 @@
-//! Форматы хранения весов и кэша.
+//! Storage formats for weights and cache.
 //!
-//! NVFP4 — это не просто «4 бита»: на каждый блок из 16 элементов идёт
-//! отдельная шкала float8_e4m3, что даёт 4.5 бита на элемент.
-//! Игнорировать это при планировании памяти нельзя — на 24B параметров
-//! забытые шкалы дают промах в 1.5 GB.
+//! NVFP4 isn't just "4 bits": every block of 16 elements gets
+//! its own float8_e4m3 scale, which gives 4.5 bits per element.
+//! Memory planning can't ignore this — at 24B parameters
+//! forgotten scales cause a 1.5 GB miss.
 
 pub const NVFP4_BLOCK: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Dtype {
-    /// Веса и активации в bfloat16.
+    /// Weights and activations in bfloat16.
     Bf16,
-    /// float8_e4m3 — шкалы блоков, KV-кэш, при желании эмбеддинги.
+    /// float8_e4m3 — block scales, KV cache, optionally embeddings.
     Fp8E4m3,
-    /// NVFP4: 4 бита на элемент + fp8-шкала на блок из 16.
+    /// NVFP4: 4 bits per element + an fp8 scale per block of 16.
     Nvfp4,
-    /// int8 с масштабом f32 на строку состояния (128 элементов). Формат
-    /// хранения рекуррентного состояния DeltaNet: строки плоские, и на них
-    /// он вчетверо точнее fp8 при том же байте
+    /// int8 with an f32 scale per state row (128 elements). The storage
+    /// format of the DeltaNet recurrent state: rows are flat, and on them
+    /// it's four times more precise than fp8 for the same byte
     /// (`bench/results/delta-state-8bit.md`).
     Int8Row128,
     Fp32,
 }
 
 impl Dtype {
-    /// Байт на `n` элементов. Целочисленная арифметика: для NVFP4 это
-    /// n/2 байт данных плюс n/16 байт шкал.
+    /// Bytes for `n` elements. Integer arithmetic: for NVFP4 this is
+    /// n/2 data bytes plus n/16 scale bytes.
     pub const fn bytes(self, n: usize) -> u64 {
         match self {
             Dtype::Fp32 => (n * 4) as u64,
@@ -36,7 +36,7 @@ impl Dtype {
         }
     }
 
-    /// Эффективная разрядность, включая накладные расходы на шкалы.
+    /// Effective bit width, including scale overhead.
     pub const fn effective_bits(self) -> f32 {
         match self {
             Dtype::Fp32 => 32.0,
@@ -64,18 +64,18 @@ mod tests {
 
     #[test]
     fn nvfp4_includes_block_scales() {
-        // Ровно один блок: 8 байт данных + 1 байт шкалы.
+        // Exactly one block: 8 data bytes + 1 scale byte.
         assert_eq!(Dtype::Nvfp4.bytes(16), 9);
-        // 4.5 бита на элемент на большом тензоре.
+        // 4.5 bits per element on a large tensor.
         let n = 1_000_000;
         let bits = Dtype::Nvfp4.bytes(n) as f64 * 8.0 / n as f64;
-        assert!((bits - 4.5).abs() < 0.01, "{bits} бит/элемент");
+        assert!((bits - 4.5).abs() < 0.01, "{bits} bits/element");
     }
 
     #[test]
     fn quantized_body_size() {
         use crate::arch::QUANTIZED_PARAMS;
         let gb = Dtype::Nvfp4.bytes(QUANTIZED_PARAMS) as f64 / 1e9;
-        assert!((13.0..14.5).contains(&gb), "тело модели в NVFP4: {gb} GB");
+        assert!((13.0..14.5).contains(&gb), "model body in NVFP4: {gb} GB");
     }
 }

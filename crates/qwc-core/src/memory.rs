@@ -1,17 +1,17 @@
-//! Планирование VRAM под одну RTX 5090 (32 GB).
+//! VRAM planning for a single RTX 5090 (32 GB).
 //!
-//! Ключевое отличие от обычного трансформера: память под последовательность
-//! состоит из ДВУХ независимых частей.
+//! The key difference from an ordinary transformer: per-sequence memory
+//! consists of TWO independent parts.
 //!
-//!   1. Рекуррентное состояние DeltaNet (48 слоёв) — константа на слот,
-//!      не зависит от длины контекста: ~39 MB @ int8, ~81 MB @ bf16,
-//!      ~157 MB @ fp32. Сверх слотов лежит одна расквантованная копия на
-//!      движок, ~76 MB, по которой идёт префилл.
-//!   2. Paged KV-кэш (16 слоёв) — линейно растёт: 32 KB на токен @ fp8.
+//!   1. The DeltaNet recurrent state (48 layers) — a constant per slot,
+//!      independent of context length: ~39 MB @ int8, ~81 MB @ bf16,
+//!      ~157 MB @ fp32. Beyond the slots there's one dequantized copy per
+//!      engine, ~76 MB, on which prefill runs.
+//!   2. The paged KV cache (16 layers) — grows linearly: 32 KB per token @ fp8.
 //!
-//! Точка равенства — около 2.5K токенов. Ниже неё concurrency упирается
-//! в число слотов состояний, выше — в KV-кэш. Планировщик обязан учитывать
-//! обе части, иначе admission control ошибается в разы.
+//! The break-even point is around 2.5K tokens. Below it concurrency is limited
+//! by the number of state slots, above it by the KV cache. The scheduler must account for
+//! both parts, otherwise admission control is off by multiples.
 
 use crate::arch::*;
 use crate::dtype::Dtype;
@@ -20,22 +20,22 @@ pub const GB: u64 = 1_000_000_000;
 pub const MIB: u64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// Веса
+// Weights
 // ---------------------------------------------------------------------------
 
-/// Раскладка весов по форматам. Значения по умолчанию соответствуют
-/// нашей загрузке чекпоинта QUASAR в text-only режиме.
+/// Weight layout by format. The defaults correspond to
+/// our text-only load of the QUASAR checkpoint.
 #[derive(Debug, Clone, Copy)]
 pub struct WeightPlan {
-    /// Все linear-слои тела модели.
+    /// All linear layers of the model body.
     pub body: Dtype,
-    /// `lm_head` в чекпоинте не квантован (BF16); мы переводим его в FP8.
+    /// `lm_head` isn't quantized in the checkpoint (BF16); we convert it to FP8.
     pub lm_head: Dtype,
-    /// `embed_tokens` — это lookup, точность некритична.
+    /// `embed_tokens` is a lookup, precision is not critical.
     pub embed: Dtype,
-    /// MTP draft-голова для спекулятивного декодинга.
+    /// The MTP draft head for speculative decoding.
     pub mtp: Option<Dtype>,
-    /// Vision tower. В text-only движке всегда `false`.
+    /// Vision tower. Always `false` in a text-only engine.
     pub vision: bool,
 }
 
@@ -52,8 +52,8 @@ impl Default for WeightPlan {
 }
 
 impl WeightPlan {
-    /// Как чекпоинт лежит на диске: lm_head и эмбеддинги в BF16,
-    /// vision tower и MTP загружены. Это то, что грузит vLLM.
+    /// How the checkpoint lies on disk: lm_head and embeddings in BF16,
+    /// vision tower and MTP loaded. This is what vLLM loads.
     pub fn as_shipped() -> Self {
         Self {
             body: Dtype::Nvfp4,
@@ -64,9 +64,9 @@ impl WeightPlan {
         }
     }
 
-    /// Полный resident footprint весов. Эта величина нужна для VRAM-бюджета,
-    /// но не является трафиком одного decode-шага: обычный шаг не читает MTP,
-    /// vision tower и всю таблицу embedding.
+    /// The full resident weight footprint. This quantity is needed for the VRAM budget,
+    /// but is not the traffic of one decode step: a regular step doesn't read MTP,
+    /// the vision tower or the whole embedding table.
     pub fn bytes(&self) -> u64 {
         let mut total = self.body.bytes(QUANTIZED_PARAMS);
         total += self.lm_head.bytes(LM_HEAD_PARAMS);
@@ -80,10 +80,10 @@ impl WeightPlan {
         total
     }
 
-    /// Байты весов, которые обычный decode-шаг действительно читает из
-    /// памяти. Тело модели и `lm_head` сканируются целиком, а embedding делает
-    /// lookup одной строки на последовательность. MTP и vision в обычном
-    /// decode не исполняются.
+    /// Weight bytes a regular decode step actually reads from
+    /// memory. The model body and `lm_head` are scanned entirely, while the embedding does
+    /// a lookup of one row per sequence. MTP and vision don't run in regular
+    /// decode.
     pub fn decode_weight_bytes(&self, batch: usize) -> u64 {
         self.body.bytes(QUANTIZED_PARAMS)
             + self.lm_head.bytes(LM_HEAD_PARAMS)
@@ -92,18 +92,18 @@ impl WeightPlan {
 }
 
 // ---------------------------------------------------------------------------
-// Кэш
+// Cache
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheConfig {
-    /// Формат KV-кэша для 16 full-attention слоёв.
+    /// KV cache format for the 16 full-attention layers.
     pub kv_dtype: Dtype,
-    /// Формат рекуррентного состояния покоящихся слотов. Конфиг модели
-    /// требует fp32; движок хранит int8 с масштабом на строку, а префилл
-    /// идёт по отдельной bf16-копии (см. `state_work_bytes`).
+    /// Recurrent state format of resting slots. The model config
+    /// requires fp32; the engine stores int8 with a per-row scale, and prefill
+    /// runs on a separate bf16 copy (see `state_work_bytes`).
     pub state_dtype: Dtype,
-    /// Размер блока paged KV-кэша в токенах.
+    /// Paged KV cache block size in tokens.
     pub block_size: usize,
 }
 
@@ -118,7 +118,7 @@ impl Default for CacheConfig {
 }
 
 impl CacheConfig {
-    /// Байт KV-кэша на один токен по всем full-attention слоям.
+    /// KV cache bytes per token across all full-attention layers.
     pub fn kv_bytes_per_token(&self) -> u64 {
         self.kv_dtype.bytes(KV_ELEMS_PER_TOKEN)
     }
@@ -127,49 +127,49 @@ impl CacheConfig {
         self.kv_bytes_per_token() * self.block_size as u64
     }
 
-    /// Байт на слот состояния: рекуррентное состояние DeltaNet + conv-окно.
-    /// Conv-состояние всегда fp32 — оно копеечное, экономить смысла нет.
+    /// Bytes per state slot: DeltaNet recurrent state + conv window.
+    /// The conv state is always fp32 — it's tiny, no point saving on it.
     pub fn state_bytes_per_slot(&self) -> u64 {
         self.state_dtype.bytes(STATE_ELEMS_PER_SEQ) + Dtype::Fp32.bytes(CONV_ELEMS_PER_SEQ)
     }
 
-    /// Расквантованная копия состояния одной последовательности. Она одна на
-    /// движок, а не на слот, поэтому в стоимость слота не входит — но в
-    /// бюджет карты входит, и на двух слотах она съедает всю экономию.
+    /// Dequantized state copy of one sequence. There's one per
+    /// engine, not per slot, so it's not part of a slot's cost — but it is part
+    /// of the card's budget, and with two slots it eats all the savings.
     pub fn state_work_bytes(&self) -> u64 {
         Dtype::Bf16.bytes(STATE_ELEMS_PER_SEQ)
     }
 
-    /// Полная стоимость последовательности заданной длины.
+    /// Full cost of a sequence of the given length.
     pub fn bytes_per_seq(&self, context_len: usize) -> u64 {
         let blocks = context_len.div_ceil(self.block_size) as u64;
         self.state_bytes_per_slot() + blocks * self.kv_bytes_per_block()
     }
 
-    /// Длина контекста, при которой KV-кэш сравнивается по объёму
-    /// с рекуррентным состоянием. Ниже неё «дорогая» часть — состояния.
+    /// The context length at which the KV cache equals the recurrent state
+    /// in size. Below it the "expensive" part is the states.
     pub fn crossover_tokens(&self) -> usize {
         (self.state_bytes_per_slot() / self.kv_bytes_per_token()) as usize
     }
 }
 
 // ---------------------------------------------------------------------------
-// Бюджет
+// Budget
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {
     pub total_vram: u64,
-    /// Занято до старта движка: CUDA-контекст, драйвер, чужие процессы
-    /// (на десктопе gnome-shell легко съедает больше гигабайта).
+    /// Taken before the engine starts: CUDA context, driver, other processes
+    /// (on a desktop gnome-shell easily eats more than a gigabyte).
     pub reserved: u64,
     pub weights: u64,
-    /// Активации, workspace CUTLASS, буферы сэмплинга, CUDA-графы.
+    /// Activations, CUTLASS workspace, sampling buffers, CUDA graphs.
     pub workspace: u64,
 }
 
 impl Budget {
-    /// Память, доступная под KV-кэш и слоты состояний.
+    /// Memory available for the KV cache and state slots.
     pub fn cache_available(&self) -> u64 {
         self.total_vram
             .saturating_sub(self.reserved)
@@ -177,7 +177,7 @@ impl Budget {
             .saturating_sub(self.workspace)
     }
 
-    /// Сколько последовательностей заданной длины помещается.
+    /// How many sequences of the given length fit.
     pub fn max_concurrency(&self, cfg: &CacheConfig, context_len: usize) -> usize {
         let per_seq = cfg.bytes_per_seq(context_len);
         if per_seq == 0 {
@@ -186,7 +186,7 @@ impl Budget {
         (self.cache_available() / per_seq) as usize
     }
 
-    /// Максимальный контекст при заданном числе последовательностей.
+    /// Maximum context for a given number of sequences.
     pub fn max_context(&self, cfg: &CacheConfig, concurrency: usize) -> usize {
         if concurrency == 0 {
             return 0;
@@ -201,12 +201,12 @@ impl Budget {
     }
 }
 
-/// Бюджет RTX 5090 при работающем десктопе.
-/// nvidia-smi показывает 32607 MiB всего и ~1238 MiB занято gnome-shell.
+/// RTX 5090 budget with the desktop running.
+/// nvidia-smi shows 32607 MiB total and ~1238 MiB taken by gnome-shell.
 pub fn rtx5090(weights: u64, workspace: u64) -> Budget {
     Budget {
         total_vram: 32_607 * MIB,
-        reserved: 2_100 * MIB, // desktop + CUDA-контекст
+        reserved: 2_100 * MIB, // desktop + CUDA context
         weights,
         workspace,
     }
@@ -222,19 +222,19 @@ mod tests {
 
     #[test]
     fn weight_plan_matches_checkpoint_size() {
-        // На диске чекпоинт QUASAR занимает 20.6 GB.
+        // On disk the QUASAR checkpoint takes 20.6 GB.
         let shipped = WeightPlan::as_shipped().bytes() as f64 / 1e9;
         assert!((20.0..21.2).contains(&shipped), "as_shipped: {shipped} GB");
 
-        // После наших преобразований — заметно меньше.
+        // After our transformations — noticeably less.
         let ours = WeightPlan::default().bytes() as f64 / 1e9;
         assert!((16.5..17.5).contains(&ours), "default: {ours} GB");
 
         let saved = shipped - ours;
-        assert!(saved > 3.0, "экономия всего {saved} GB, ожидали >3");
+        assert!(saved > 3.0, "only {saved} GB saved, expected >3");
 
-        // Resident footprint включает MTP и полную embedding table, но
-        // обычный batch-1 decode их не стримит целиком.
+        // The resident footprint includes MTP and the full embedding table, but
+        // regular batch-1 decode doesn't stream them in full.
         let decode = WeightPlan::default().decode_weight_bytes(1) as f64 / 1e9;
         assert!(
             (14.5..15.5).contains(&decode),
@@ -250,10 +250,10 @@ mod tests {
     fn state_dominates_below_crossover() {
         let cfg = CacheConfig::default();
         let x = cfg.crossover_tokens();
-        // 8-битное состояние равно KV-кэшу примерно на 1.3K токенов: вдвое
-        // дешевле слот — вдвое ближе точка равенства, и диапазон, где
-        // concurrency упирается в слоты, а не в KV, соответственно сузился.
-        assert!((1000..1700).contains(&x), "точка пересечения: {x}");
+        // 8-bit state equals the KV cache at about 1.3K tokens: a slot half as
+        // expensive brings the break-even point twice as close, and the range where
+        // concurrency is limited by slots rather than KV narrowed accordingly.
+        assert!((1000..1700).contains(&x), "crossover point: {x}");
 
         let wide = CacheConfig {
             state_dtype: Dtype::Bf16,
@@ -261,11 +261,11 @@ mod tests {
         };
         assert!(
             wide.crossover_tokens() > x * 3 / 2,
-            "bf16 {} против int8 {x}",
+            "bf16 {} vs int8 {x}",
             wide.crossover_tokens()
         );
 
-        // Ниже неё состояние дороже KV.
+        // Below it the state is more expensive than KV.
         let short: usize = 512;
         let blocks = short.div_ceil(cfg.block_size) as u64;
         assert!(cfg.state_bytes_per_slot() > blocks * cfg.kv_bytes_per_block());
@@ -278,7 +278,7 @@ mod tests {
             ..CacheConfig::default()
         };
         let x = cfg.crossover_tokens();
-        assert!((4200..5600).contains(&x), "fp32 точка пересечения: {x}");
+        assert!((4200..5600).contains(&x), "fp32 crossover point: {x}");
     }
 
     #[test]
@@ -286,7 +286,7 @@ mod tests {
         let b = default_budget();
         let cfg = CacheConfig::default();
 
-        // Целевая матрица: всё до 32x2K должно помещаться.
+        // Target matrix: everything up to 32x2K must fit.
         assert!(b.fits(&cfg, 1, 512));
         assert!(b.fits(&cfg, 1, 16 * 1024));
         assert!(b.fits(&cfg, 4, 2048));
@@ -303,7 +303,7 @@ mod tests {
         let n_fp8 = b.max_concurrency(&fp8, 32 * 1024);
         assert!((8..=14).contains(&n_fp8), "fp8 KV @32K: {n_fp8} seq");
 
-        // NVFP4 KV-кэш почти удваивает concurrency на длинном контексте.
+        // An NVFP4 KV cache nearly doubles concurrency on long context.
         let fp4 = CacheConfig {
             kv_dtype: Dtype::Nvfp4,
             ..CacheConfig::default()
@@ -323,6 +323,6 @@ mod tests {
 
         let ctx = 32 * 1024;
         let gain = ours.max_concurrency(&cfg, ctx) - vllm_like.max_concurrency(&cfg, ctx);
-        assert!(gain >= 3, "выигрыш всего {gain} последовательностей");
+        assert!(gain >= 3, "gain of only {gain} sequences");
     }
 }

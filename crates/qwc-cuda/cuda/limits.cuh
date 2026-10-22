@@ -1,14 +1,14 @@
 #pragma once
 
-// Потолки строк, общие для всех кернелов шага.
+// Row caps shared by all step kernels.
 //
-// Один шаг движка несёт не больше kMaxStepRows строк: это ёмкость арены
-// префилла (`PREFILL_CHUNK_SIZE` в движке, `MAX_STEP_ROWS` в Rust). Проверки
-// в кернелах ловят мусор в аргументах, а не описывают их устройство — сетки
-// у них растут по строкам линейно.
+// One engine step carries at most kMaxStepRows rows: that's the prefill arena
+// capacity (`PREFILL_CHUNK_SIZE` in the engine, `MAX_STEP_ROWS` in Rust). Checks
+// in kernels catch garbage arguments rather than describe their structure — their grids
+// scale linearly in rows.
 //
-// Построчный путь decode — отдельный случай: его разметка партиций
-// рассчитана на число слотов последовательностей, а не на размер чанка.
+// The row-wise decode path is a separate case: its partition layout
+// is sized for the number of sequence slots, not the chunk size.
 namespace qwc {
 
 constexpr int kMaxStepRows = 2048;

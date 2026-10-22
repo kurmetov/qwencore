@@ -1,9 +1,9 @@
-//! Движок: подъём весов в VRAM и исполнение шага decode.
+//! The engine: loading weights into VRAM and executing the decode step.
 //!
-//! Крейт лежит выше `qwc-cuda` (кернелы), `qwc-model` (чекпоинт) и
-//! `qwc-runtime` (планирование), потому что только здесь эти три границы
-//! встречаются. Ниже они друг о друге не знают: runtime остаётся
-//! CPU-тестируемым, а qwc-model не тянет CUDA.
+//! The crate sits above `qwc-cuda` (kernels), `qwc-model` (checkpoint) and
+//! `qwc-runtime` (scheduling), because only here do these three boundaries
+//! meet. Below, they don't know about each other: runtime stays
+//! CPU-testable, and qwc-model doesn't pull in CUDA.
 
 pub mod executor;
 pub mod mtp;

@@ -1,15 +1,15 @@
-//! CUDA-слой движка: FFI, память, потоки, кернелы.
+//! The engine's CUDA layer: FFI, memory, streams, kernels.
 //!
-//! Целевая архитектура ровно одна — sm_120a (RTX 5090). Это не настройка
-//! сборки, а часть специализации: кернелы пишутся под 99 KB shared memory,
-//! 170 SM и block-scaled MMA для NVFP4, и на другом железе смысла не имеют.
+//! There is exactly one target architecture — sm_120a (RTX 5090). It's not a build
+//! setting but part of the specialization: kernels are written for 99 KB of shared memory,
+//! 170 SMs and block-scaled MMA for NVFP4, and make no sense on other hardware.
 
-/// Потолок строк одного шага движка: ёмкость арены префилла.
+/// Row cap of one engine step: the prefill arena capacity.
 ///
-/// Кернелы шага растут по строкам линейно, поэтому это не их предел, а
-/// договорённость о размере арены — та же, что `kMaxStepRows` в `limits.cuh`
-/// и `PREFILL_CHUNK_SIZE` в движке. Построчный decode считает свои строки
-/// отдельно: см. `paged_attention::MAX_DECODE_ROWS`.
+/// Step kernels scale linearly in rows, so this isn't their limit but
+/// an agreement on arena size — the same as `kMaxStepRows` in `limits.cuh`
+/// and `PREFILL_CHUNK_SIZE` in the engine. Row-wise decode counts its rows
+/// separately: see `paged_attention::MAX_DECODE_ROWS`.
 pub const MAX_STEP_ROWS: usize = 2048;
 
 pub mod attention_prepare;

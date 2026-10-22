@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Внимание FlashInfer на формах QwenCore: для сравнения с packedbench.
+"""FlashInfer attention on QwenCore shapes: for comparison with packedbench.
 
-Запуск только из baseline-venv и только с готовыми ядрами из кэша JIT:
+Run only from the baseline venv and only with prebuilt kernels from the JIT cache:
 
     FLASHINFER_DISABLE_JIT=1 ~/.venvs/baseline/bin/python bench/flashinfer_attention.py
 
-FLASHINFER_DISABLE_JIT обязателен: без него промах кэша запускает сборку, а
-JIT FlashInfer вешает десктоп. Отсутствия nvcc в PATH мало — FlashInfer берёт
-$CUDA_HOME/bin/nvcc напрямую. Сам по себе флаг запрещает и загрузку из кэша:
-без сборки FlashInfer доверяет только AOT-артефактам, а готовую .so из JIT-кэша
-пропускает через ninja. Поэтому стенд грузит её сам.
+FLASHINFER_DISABLE_JIT is mandatory: without it a cache miss triggers a build, and
+FlashInfer's JIT hangs the desktop. Lacking nvcc in PATH isn't enough — FlashInfer takes
+$CUDA_HOME/bin/nvcc directly. The flag by itself also forbids loading from cache:
+without building, FlashInfer trusts only AOT artifacts and sends a prebuilt .so from the JIT cache
+through ninja. So the bench loads it itself.
 
-Формы те же, что у `packedbench`: сегмент одной последовательности за
-историей `start`, KV fp8 e4m3 в раскладке HND ([страница][KV-голова][токен]
-[измерение], как у нас), страница 64, 16 слоёв с отдельными кэшами. Пути:
-- xqa, q_len 1 — decode одной строки;
-- xqa, q_len 4 — проверка трёх черновиков (так её гоняет vLLM с MTP);
-- batch prefill (FA2) — чанки и хвосты промпта.
-Перед замером каждое ядро сверяется с эталоном на torch.
+Shapes are the same as `packedbench`: a segment of one sequence after
+`start` of history, KV fp8 e4m3 in the HND layout ([page][KV head][token]
+[dimension], as ours), page 64, 16 layers with separate caches. Paths:
+- xqa, q_len 1 — decode of one row;
+- xqa, q_len 4 — verifying three drafts (how vLLM runs it with MTP);
+- batch prefill (FA2) — prompt chunks and tails.
+Before measuring, every kernel is checked against a torch reference.
 """
 
 import argparse
@@ -25,7 +25,7 @@ import os
 import sys
 
 if not os.environ.get("FLASHINFER_DISABLE_JIT"):
-    sys.exit("нужен FLASHINFER_DISABLE_JIT=1: иначе промах кэша запустит JIT-сборку")
+    sys.exit("FLASHINFER_DISABLE_JIT=1 is required: otherwise a cache miss triggers a JIT build")
 
 import torch
 import flashinfer
@@ -34,7 +34,7 @@ from flashinfer.jit.core import JitSpecNvcc
 
 
 def load_built(self, aot=JitSpecNvcc.try_load):
-    """AOT-артефакт, а если его нет — собранная vLLM .so из JIT-кэша."""
+    """The AOT artifact, or if absent — the vLLM-built .so from the JIT cache."""
     module = aot(self)
     if module is None and self.jit_library_path.exists():
         module = self.load()
@@ -45,14 +45,14 @@ JitSpecNvcc.try_load = load_built
 
 HEADS, KV_HEADS, DIM, PAGE, LAYERS = 24, 4, 256, 64, 16
 SCALE = DIM ** -0.5
-# Столько vLLM отдаёт под буфер FlashInfer по умолчанию; первые 8 МБ —
-# семафоры xqa. У xqa и FA2 буферы разные: частичные суммы FA2 ложатся поверх
-# семафоров, а xqa ждёт их нулевыми и после этого считает мимо.
+# This is how much vLLM gives the FlashInfer buffer by default; the first 8 MB are
+# xqa semaphores. xqa and FA2 need separate buffers: FA2 partial sums land on top of
+# the semaphores, while xqa expects them zeroed and then computes garbage.
 WORKSPACE_BYTES = 394 * 1024 * 1024
 
 
 def draft_mask(q_len: int, device) -> torch.Tensor:
-    """Причинная маска черновиков в упаковке xqa, как её строит vLLM."""
+    """Causal draft mask in xqa packing, as vLLM builds it."""
     packed = (q_len + 31) // 32
     q_idx = torch.arange(q_len, device=device).unsqueeze(1)
     kv_idx = torch.arange(packed * 32, device=device).unsqueeze(0)
@@ -62,14 +62,14 @@ def draft_mask(q_len: int, device) -> torch.Tensor:
 
 
 def reference(query, key, value, table, start, rows):
-    """Причинное внимание в fp32 по страницам таблицы; строка r видит start+r+1."""
+    """Causal attention in fp32 over table pages; row r sees start+r+1."""
     context = start + rows
     pages = table[: (context + PAGE - 1) // PAGE].long()
     k = key[pages].float().permute(1, 0, 2, 3).reshape(KV_HEADS, -1, DIM)[:, :context]
     v = value[pages].float().permute(1, 0, 2, 3).reshape(KV_HEADS, -1, DIM)[:, :context]
     k = k.repeat_interleave(HEADS // KV_HEADS, 0)
     v = v.repeat_interleave(HEADS // KV_HEADS, 0)
-    q = query.float().transpose(0, 1)  # [голова][строка][измерение]
+    q = query.float().transpose(0, 1)  # [head][row][dimension]
     scores = q @ k.transpose(1, 2) * SCALE
     limits = torch.arange(rows, device=q.device) + start + 1
     allowed = torch.arange(context, device=q.device).unsqueeze(0) < limits.unsqueeze(1)
@@ -97,8 +97,8 @@ def main() -> int:
     device = torch.device("cuda")
     torch.manual_seed(0)
     print(f"FlashInfer {flashinfer.__version__}, {torch.cuda.get_device_name()}, "
-          f"{LAYERS} слоёв, KV fp8 e4m3 HND; мкс на слой")
-    print(f"  {'путь':>18} | {'строк':>5} | {'старт':>6} | {'мкс':>8} | {'отн.ош.':>8}")
+          f"{LAYERS} layers, KV fp8 e4m3 HND; us per layer")
+    print(f"  {'path':>18} | {'rows':>5} | {'start':>6} | {'us':>8} | {'rel.err':>8}")
 
     xqa_workspace = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
     prefill_workspace = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
@@ -110,20 +110,20 @@ def main() -> int:
             k = (torch.randn(pages, KV_HEADS, PAGE, DIM, device=device) * 0.5).to(torch.float8_e4m3fn)
             v = (torch.randn(pages, KV_HEADS, PAGE, DIM, device=device) * 0.5).to(torch.float8_e4m3fn)
             caches.append((k, v))
-        # Страницы вразнобой: тест, игнорирующий таблицу, не пройдёт.
+        # Pages shuffled: a test that ignores the table won't pass.
         table = torch.randperm(pages, device=device, dtype=torch.int32)
 
         def check(name, rows, output, query):
             key, value = caches[0]
             expected = reference(query, key, value, table, start, rows)
-            # Выход — среднее по тысячам ключей, его масштаб ~0.01: ошибка
-            # относительно наибольшего элемента эталона.
+            # The output is an average over thousands of keys, its scale ~0.01: error
+            # relative to the reference's largest element.
             error = ((output.float() - expected).abs().max() / expected.abs().max()).item()
             if error > 0.02:
-                raise SystemExit(f"{name}: {rows} строк на {start} расходится с эталоном: {error}")
+                raise SystemExit(f"{name}: {rows} rows at {start} diverge from reference: {error}")
             return error
 
-        # xqa: decode и проверка черновиков.
+        # xqa: decode and draft verification.
         for q_len in (1, 4):
             query = (torch.randn(q_len, HEADS, DIM, device=device) * 0.5).to(torch.bfloat16)
             seq_lens = torch.tensor([start + q_len], dtype=torch.int32, device=device)
@@ -145,7 +145,7 @@ def main() -> int:
             name = "xqa decode" if q_len == 1 else f"xqa spec q_len={q_len}"
             print(f"  {name:>18} | {q_len:>5} | {start:>6} | {micros:>8.1f} | {error:>8.4f}")
 
-        # Batch prefill FA2: сегмент в `rows` строк на позиции start.
+        # FA2 batch prefill: a segment of `rows` rows at position start.
         for rows in (int(r) for r in args.prefill_rows.split(",")):
             context = start + rows
             used = (context + PAGE - 1) // PAGE

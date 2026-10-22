@@ -1,4 +1,4 @@
-//! End-to-end проверка настоящего NVFP4-тензора из QUASAR checkpoint.
+//! End-to-end check of a real NVFP4 tensor from the QUASAR checkpoint.
 //!
 //! `cargo run --release -p qwc-cuda --example nvfp4_real -- /path/to/model`
 
@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or("передайте путь к checkpoint первым аргументом")?;
+        .ok_or("pass the checkpoint path as the first argument")?;
     let checkpoint = Checkpoint::open(&model)?;
     let gate_prefix = "model.language_model.layers.0.mlp.gate_proj";
     let up_prefix = "model.language_model.layers.0.mlp.up_proj";
@@ -81,15 +81,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         worst_scaled = worst_scaled.max(absolute / want.abs().max(0.05));
     }
 
-    println!("тензор: {gate_prefix}");
-    println!("форма: {} x {}", INTERMEDIATE_SIZE, HIDDEN_SIZE);
+    println!("tensor: {gate_prefix}");
+    println!("shape: {} x {}", INTERMEDIATE_SIZE, HIDDEN_SIZE);
     println!(
-        "checkpoint weight_global_scale (делитель): {}",
+        "checkpoint weight_global_scale (divisor): {}",
         gate_weight.weight_global_scale
     );
     println!("max absolute error: {worst_absolute:.6}");
     println!("max scaled error:   {worst_scaled:.6}");
-    assert!(worst_scaled < 0.025, "GPU расходится с CPU-oracle");
+    assert!(worst_scaled < 0.025, "GPU diverges from the CPU oracle");
 
     let mut expected_swiglu = expected;
     for (gate_value, up_value) in expected_swiglu.iter_mut().zip(expected_up) {
@@ -107,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("fused gate+up+SwiGLU max scaled error: {fused_worst_scaled:.6}");
     assert!(
         fused_worst_scaled < 0.035,
-        "fused GPU расходится с CPU-oracle"
+        "fused GPU diverges from the CPU oracle"
     );
 
     const W4A4_BATCH: usize = 4;
@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert!(
         w4a4_worst_scaled < 0.035,
-        "W4A4 GPU расходится с CPU-oracle"
+        "W4A4 GPU diverges from the CPU oracle"
     );
     Ok(())
 }

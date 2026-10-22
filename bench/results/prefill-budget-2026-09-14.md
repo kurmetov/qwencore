@@ -1,23 +1,23 @@
-# Бюджет префилла: куда уходят 118 мкс на токен — 2026-09-14
+# Prefill budget: where 118 µs per token go — 2026-09-14
 
-> **Одиночные точки одной сессии, без доверительных интервалов.** Сравнение с
-> vLLM здесь снято до появления протокола
-> [`docs/11-experiments.md`](../../docs/11-experiments.md): один-два прогона на
-> точку, без ротации порядка вариантов и без bootstrap CI, на частично занятой
-> карте. Эти множители отменяются прогоном comparison suite и не должны
-> цитироваться как результат проекта. Условия каждой точки — ниже по тексту.
+> **Single points from one session, without confidence intervals.** The comparison with
+> vLLM here was taken before the protocol
+> [`docs/11-experiments.md`](../../docs/11-experiments.md) existed: one or two runs per
+> point, no variant order rotation and no bootstrap CI, on a partially busy
+> card. These multipliers are superseded by a comparison suite run and must not
+> be quoted as a project result. The conditions of each point are given below.
 
-После MMA-внимания сквозной префилл шёл 7488 tok/s против 14656 у vLLM 0.28 —
-отставание 1.96x. Дальше двигаться наугад нельзя: нужно знать, из чего
-складывается токен.
+After MMA attention, end-to-end prefill ran at 7488 tok/s vs 14656 for vLLM 0.28 —
+a 1.96x lag. Moving on blindly isn't possible: we need to know what
+a token consists of.
 
-## Разметка шага
+## Step breakdown
 
 `stepprofile --concurrency 2 --prefill-tokens 2046 --prefill-start 3584
---context 8192`, то есть полный чанк арены на поздней позиции промпта.
-Шаг 241.2 мс на 2046 токенов — **117.9 мкс/токен**.
+--context 8192`, i.e. a full arena chunk at a late prompt position.
+A step is 241.2 ms for 2046 tokens — **117.9 µs/token**.
 
-| фаза | мс | доля | мкс/токен |
+| phase | ms | share | µs/token |
 |---|---:|---:|---:|
 | attn.prefill | 78.27 | 32.4% | 38.3 |
 | delta.scan_prefill | 48.79 | 20.2% | 23.8 |
@@ -26,105 +26,105 @@
 | gemm.la_in | 13.12 | 5.4% | 6.4 |
 | swiglu | 8.70 | 3.6% | 4.3 |
 | norm | 7.91 | 3.3% | 3.9 |
-| остальные 14 фаз | 25.62 | 10.8% | 12.5 |
+| other 14 phases | 25.62 | 10.8% | 12.5 |
 
-Никакого «необъяснённого остатка» нет: проекции вместе — 41.2 мкс/токен,
-внимание 38.3, скан 23.8, всё прочее 14.6. Прежняя оценка остатка в 43 мкс
-была артефактом сравнения сквозной цифры (усреднённой по всем позициям
-промпта) с пофазными замерами на одной позиции — так считать нельзя.
+There is no "unexplained remainder": projections together are 41.2 µs/token,
+attention 38.3, scan 23.8, everything else 14.6. The earlier estimate of a 43 µs remainder
+was an artifact of comparing the end-to-end figure (averaged over all prompt
+positions) with per-phase measurements at one position — you can't count that way.
 
-Средний токен промпта 4096 при чанке 2048 обходится дешевле профиля выше,
-потому что первый чанк видит пустой контекст: внимание усредняется до
-17.2 мкс/токен, и бюджет становится **~97 мкс/токен** — проекции 41.2,
-скан 23.8, внимание 17.2, прочее 14.6. Измеренное сквозное — 9313 tok/s
-(107 мкс/токен), разница уходит в планировщик, хост и хвост decode.
+The average token of a 4096 prompt with chunk 2048 costs less than the profile above,
+because the first chunk sees an empty context: attention averages to
+17.2 µs/token, and the budget becomes **~97 µs/token** — projections 41.2,
+scan 23.8, attention 17.2, other 14.6. Measured end to end — 9313 tok/s
+(107 µs/token), the difference goes to the scheduler, host and decode tail.
 
-Две фазы идут на потолке и трогать их нечего: `swiglu` — 13.6 ГБ за 8.7 мс,
-то есть 1.57 ТБ/с, `lm_head` — 1378 ГБ/с.
+Two phases run at the ceiling and there's nothing to touch: `swiglu` — 13.6 GB in 8.7 ms,
+i.e. 1.57 TB/s, `lm_head` — 1378 GB/s.
 
-## Что меняет размер чанка
+## What chunk size changes
 
-Ни одна фаза, кроме скана, не безразлична к M. Проекции на M=511 идут на
-1097 TFLOP/s, на M=2048 — на 1350 (пик NVFP4 на 5090 — 1676). Внимание на
-большом тайле реже перечитывает KV.
+No phase except the scan is indifferent to M. Projections at M=511 run at
+1097 TFLOP/s, at M=2048 at 1350 (NVFP4 peak on the 5090 is 1676). Attention on
+a large tile re-reads KV less often.
 
-| чанк | проекции, мкс/токен | внимание, мкс/токен | сумма |
+| chunk | projections, µs/token | attention, µs/token | sum |
 |---:|---:|---:|---:|
 | 512 | 44.1 | 23.3 | 67.4 |
 | 1024 | 38.8 | 19.7 | 58.5 |
 | **2048** | **35.8** | **17.2** | **53.0** |
 
-Внимание пересчитано на весь промпт 4096: чанк 512 это восемь запусков на
-позициях 0..3584, чанк 2048 — два. Цена запуска линейна по позиции, так что
-сравнивать можно только полные промпты, а не одну позицию.
+Attention is recomputed over the whole 4096 prompt: chunk 512 is eight launches at
+positions 0..3584, chunk 2048 is two. Launch cost is linear in position, so
+only full prompts can be compared, not a single position.
 
-Замер на движке подтвердил микробенчмарки. Та же позиция 3584, промпт 4096,
-32 запроса, KV bf16:
+A measurement on the engine confirmed the microbenchmarks. Same position 3584, prompt 4096,
+32 requests, KV bf16:
 
-| | чанк 512 | чанк 1024 | чанк 2048 |
+| | chunk 512 | chunk 1024 | chunk 2048 |
 |---|---:|---:|---:|
-| префилл сквозной | 7603 tok/s | 8772 | **9188** |
-| шагов движка | 265 | 137 | 73 |
-| TTFT p50 | 8.59 с | 7.48 | 7.23 |
-| ITL p50 | 66.2 мс | 111.9 | **207.9** |
-| проекции (разметка) | 52.0 мкс/токен | | **41.2** |
-| скан (разметка) | 23.6 мкс/токен | | 23.8 |
+| end-to-end prefill | 7603 tok/s | 8772 | **9188** |
+| engine steps | 265 | 137 | 73 |
+| TTFT p50 | 8.59 s | 7.48 | 7.23 |
+| ITL p50 | 66.2 ms | 111.9 | **207.9** |
+| projections (breakdown) | 52.0 µs/token | | **41.2** |
+| scan (breakdown) | 23.6 µs/token | | 23.8 |
 
-**+21% префилла — и втрое худший ITL.** Плата честная: decode-строка ждёт весь
-чанк. Поэтому бюджет планировщика вынесен в `--prefill-chunk` (потолок —
-ёмкость арены, `PREFILL_CHUNK_SIZE`), а не прибит к ней гвоздями.
+**+21% prefill — and 3x worse ITL.** The price is fair: a decode row waits for the whole
+chunk. So the scheduler budget is exposed as `--prefill-chunk` (the cap is
+arena capacity, `PREFILL_CHUNK_SIZE`), rather than nailed to it.
 
-На чате бюджет не значит ничего: промпты по 256 токенов, c=32, 128 запросов —
-1123.8 tok/s при чанке 512 против 1113.8 при 2048, ITL одинаковый. Короткие
-префиллы и раньше паковались по несколько на шаг.
+On chat the budget means nothing: 256-token prompts, c=32, 128 requests —
+1123.8 tok/s with chunk 512 vs 1113.8 with 2048, same ITL. Short
+prefills were already packed several per step.
 
-Сделано: `PREFILL_CHUNK_SIZE = MAX_STEP_ROWS = 2048`, потолки строк сведены в
-один `limits.cuh` (`kMaxStepRows`) вместо семи литералов `1024` по кернелам,
-разметка partition_count оставлена на строках decode (`kMaxDecodeRows`).
-Формы за старым потолком закрыты тестами
-`quantizer_and_w4a4_match_oracle_past_the_old_row_cap` и
+Done: `PREFILL_CHUNK_SIZE = MAX_STEP_ROWS = 2048`, row caps consolidated into
+one `limits.cuh` (`kMaxStepRows`) instead of seven `1024` literals across kernels,
+partition_count sizing left on decode rows (`kMaxDecodeRows`).
+Shapes beyond the old cap are covered by the tests
+`quantizer_and_w4a4_match_oracle_past_the_old_row_cap` and
 `prefill_mma_matches_the_tiled_kernel_on_a_full_arena_chunk`.
 
-Склейка `gate`+`up` в одну матрицу на M=2048 не нужна: 482.3 мкс против
-244.3 + 243.7 = 488.0, то есть 1%. На M=511 она давала 12% (135.3 против
-154.1) — эффект был не в склейке, а в узком M.
+Merging `gate`+`up` into one matrix at M=2048 isn't needed: 482.3 µs vs
+244.3 + 243.7 = 488.0, i.e. 1%. At M=511 it gave 12% (135.3 vs
+154.1) — the effect was not the merge but the narrow M.
 
-## Что осталось крупного
+## What big items remain
 
-1. **Скан DeltaNet — 23.1 мкс/токен и не зависит от чанка.** Рекуррентная
-   форма делает 4.7 MFLOP на токен на слой и выдаёт около 10 TFLOP/s: она
-   последовательна по токенам и тензорные ядра не трогает. Чанковая форма
-   (WY-представление, как в FLA и в vLLM) считает чанк по 64 токена
-   матрицами: FLOP-ов примерно в 1.6 раза больше, но они идут на тензорных
-   ядрах. Даже на 100 TFLOP/s это 3-4 мкс/токен. Потенциал: **-19 мкс/токен**.
-2. **Внимание — 17.2 мкс/токен после чанка 2048.** Полезной работы в нём
-   3.3 TFLOP на промпт (причинная половина), то есть ядро идёт на ~47 TFLOP/s
-   при bf16-пике около 200. Причинность уже соблюдена по тайлам: цикл по KV
-   ограничен максимальным контекстом строк тайла.
+1. **DeltaNet scan — 23.1 µs/token and independent of chunk.** The recurrent
+   form does 4.7 MFLOP per token per layer and delivers about 10 TFLOP/s: it's
+   sequential over tokens and doesn't touch tensor cores. The chunked form
+   (WY representation, as in FLA and vLLM) computes a chunk of 64 tokens with
+   matrices: roughly 1.6x more FLOPs, but they run on tensor
+   cores. Even at 100 TFLOP/s that's 3-4 µs/token. Potential: **-19 µs/token**.
+2. **Attention — 17.2 µs/token after chunk 2048.** Its useful work is
+   3.3 TFLOP per prompt (the causal half), i.e. the kernel runs at ~47 TFLOP/s
+   against a bf16 peak of about 200. Causality is already respected per tile: the KV loop is
+   bounded by the max context of the tile's rows.
 
-   Гипотезу «упирается в перечитывание KV» проверил и отбросил: ядро умеет
-   обслуживать несколько голов группы одним KV-тайлом (`kMmaGroups`), и это
-   меняет трафик кратно. Замер на чанке 2048:
+   I checked and rejected the hypothesis "bound by KV re-reads": the kernel can
+   serve several heads of a group with one KV tile (`kMmaGroups`), and that
+   changes traffic by a multiple. Measured at chunk 2048:
 
-   | kMmaGroups | позиция 0 | 1024 | 3584 | 7680 |
+   | kMmaGroups | position 0 | 1024 | 3584 | 7680 |
    |---:|---:|---:|---:|---:|
-   | 1 | 18.83 мс | 34.82 | 77.46 | 142.32 |
+   | 1 | 18.83 ms | 34.82 | 77.46 | 142.32 |
    | 2 | 21.37 | 39.62 | 86.27 | 161.16 |
    | 3 | 18.59 | 34.25 | 73.31 | 138.98 |
 
-   Втрое меньше чтений KV дают 3-5% на длинном контексте и ноль на коротком:
-   регистровое давление съедает выигрыш. Значит, дело не в трафике, а в
-   обвязке: тайл — 16 строк и 32 ключа, на каждый такой тайл приходится два
-   `__syncthreads`, прогон S через shared, обратное чтение под softmax и запись
-   P снова в shared. Правильная форма — тайл в 64 строки, где варп владеет
-   своими 16 строками и всеми ключами: тогда softmax живёт в регистрах варпа,
-   P не ходит через shared и барьеры остаются только у стейджинга KV.
-   Потенциал: **-8 мкс/токен**, оценка грубая.
-3. **Остаток.** Пока не разобран; см. выше.
+   Three times fewer KV reads give 3-5% on long context and zero on short:
+   register pressure eats the gain. So it's not traffic but the
+   plumbing: a tile is 16 rows and 32 keys, each such tile has two
+   `__syncthreads`, a pass of S through shared, a read back for softmax and a write of
+   P to shared again. The right form is a 64-row tile where a warp owns
+   its 16 rows and all keys: then softmax lives in the warp's registers,
+   P doesn't go through shared, and barriers remain only for KV staging.
+   Potential: **-8 µs/token**, a rough estimate.
+3. **Remainder.** Not analyzed yet; see above.
 
-Проекции — 41.2 мкс/токен, самая большая строка, но и самая близкая к потолку:
-1350 TFLOP/s из 1676 пиковых. Там осталось процентов пятнадцать, и они дорогие.
+Projections are 41.2 µs/token, the biggest row, but also the closest to the ceiling:
+1350 TFLOP/s of the 1676 peak. About fifteen percent is left there, and it's expensive.
 
-Порядок работ определяется этим списком, а не удобством: скан первым.
-Математика чанковой формы уже сверена с рекуррентной на CPU —
-`reference::prefill_chunked_fp32`, тест `chunked_wy_form_matches_the_recurrent_scan`.
+The work order is determined by this list, not by convenience: the scan first.
+The chunked form's math has already been checked against the recurrent one on CPU —
+`reference::prefill_chunked_fp32`, test `chunked_wy_form_matches_the_recurrent_scan`.

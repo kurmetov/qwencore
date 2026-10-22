@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("FP8 lm_head [{measured_vocab}, {HIDDEN_SIZE}]");
     println!(
         "  {:>5} | {:>9} | {:>13} | {:>10}",
-        "batch", "на запуск", "полный vocab", "токен/с"
+        "batch", "per launch", "full vocab", "tokens/s"
     );
     println!("  {:->5}-+-{:->9}-+-{:->13}-+-{:->10}", "", "", "", "");
 

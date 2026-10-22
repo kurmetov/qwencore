@@ -1,10 +1,10 @@
-//! Замер chunk-скана Gated DeltaNet на prefill.
+//! Measures the Gated DeltaNet chunk scan on prefill.
 //! `cargo run --release -p qwc-cuda --bin deltaprefillbench`
 //!
-//! Скан на prefill — самая дорогая фаза шага (28.8% на разметке), и он
-//! последователен по токенам: варп держит строку состояния и идёт по чанку
-//! сам. Здесь он меряется изолированно, слой за слоем, как в настоящем шаге —
-//! один буфер в цикле осел бы в L2.
+//! The prefill scan is the most expensive phase of the step (28.8% in the breakdown), and it's
+//! sequential over tokens: a warp holds a state row and walks the chunk
+//! by itself. Here it's measured in isolation, layer by layer, as in a real step —
+//! a single buffer in a loop would settle in L2.
 
 use qwc_core::arch::NUM_LINEAR_LAYERS;
 use qwc_cuda::delta_net::{
@@ -19,12 +19,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wy = std::env::args().skip(1).any(|argument| argument == "--wy");
 
     println!(
-        "Gated DeltaNet, {} prefill (одна последовательность, слот 0)\n",
-        if wy { "WY-скан" } else { "рекуррентный скан" },
+        "Gated DeltaNet, {} prefill (one sequence, slot 0)\n",
+        if wy { "WY scan" } else { "recurrent scan" },
     );
     println!(
         "  {:>6} | {:>10} | {:>11} | {:>10} | {:>9}",
-        "токенов", "на слой", "48 слоёв", "на токен", "токен/с"
+        "tokens", "per layer", "48 layers", "per token", "tokens/s"
     );
     println!(
         "  {:->6}-+-{:->10}-+-{:->11}-+-{:->10}-+-{:->9}",

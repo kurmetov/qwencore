@@ -1,4 +1,4 @@
-//! Ошибки CUDA.
+//! CUDA errors.
 
 use std::ffi::CStr;
 use std::fmt;
@@ -10,11 +10,11 @@ pub type Result<T> = std::result::Result<T, CudaError>;
 
 impl CudaError {
     pub fn message(self) -> String {
-        // SAFETY: cudaGetErrorString возвращает статическую строку для любого
-        // кода, включая неизвестный.
+        // SAFETY: cudaGetErrorString returns a static string for any
+        // code, including an unknown one.
         let s = unsafe { crate::ffi::cudaGetErrorString(self.0) };
         if s.is_null() {
-            return format!("неизвестная ошибка CUDA {}", self.0);
+            return format!("unknown CUDA error {}", self.0);
         }
         unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned()
     }

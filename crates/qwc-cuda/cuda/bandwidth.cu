@@ -1,17 +1,17 @@
-// Замер реально достижимой пропускной способности памяти.
+// Measures actually achievable memory bandwidth.
 //
-// Главный вывод roofline-анализа: весь целевой диапазон concurrency (1..32)
-// находится в memory-bound режиме, поэтому правильная метрика прогресса —
-// доля достигнутой пропускной способности, а не загрузка тензорных ядер.
-// Чтобы эта доля что-то значила, нужен честный знаменатель: не паспортные
-// 1792 GB/s, а то, что выдаёт эта конкретная карта на чистом чтении.
+// The main conclusion of the roofline analysis: the whole target concurrency range (1..32)
+// is memory-bound, so the right progress metric is
+// the share of achieved bandwidth, not tensor core utilization.
+// For that share to mean anything it needs an honest denominator: not the spec
+// 1792 GB/s, but what this particular card delivers on pure reads.
 
 #include <cuda_runtime.h>
 
 namespace {
 
-// Чтение доминирует в decode: за шаг вычитываются все веса модели.
-// Редукция нужна только чтобы компилятор не выбросил загрузки.
+// Reads dominate decode: each step reads all model weights.
+// The reduction is only there so the compiler doesn't drop the loads.
 __global__ void bw_read_kernel(const float4* __restrict__ src, size_t n4, float* __restrict__ out) {
     float acc = 0.0f;
     size_t stride = size_t(gridDim.x) * blockDim.x;
@@ -19,7 +19,7 @@ __global__ void bw_read_kernel(const float4* __restrict__ src, size_t n4, float*
         float4 v = src[i];
         acc += v.x + v.y + v.z + v.w;
     }
-    // Внутриварповая редукция, затем один атомарный доступ на варп.
+    // Intra-warp reduction, then one atomic access per warp.
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
@@ -35,7 +35,7 @@ __global__ void bw_copy_kernel(const float4* __restrict__ src, float4* __restric
     }
 }
 
-// 170 SM; берём с запасом, чтобы планировщик всегда имел работу.
+// 170 SMs; take extra so the scheduler always has work.
 constexpr int kBlock = 256;
 constexpr int kBlocksPerSm = 8;
 
@@ -51,7 +51,7 @@ int grid_for(size_t n4) {
 
 extern "C" {
 
-// Трафик: bytes (только чтение).
+// Traffic: bytes (read only).
 cudaError_t qwc_bw_read(const void* src, size_t bytes, float* out, cudaStream_t stream) {
     size_t n4 = bytes / sizeof(float4);
     bw_read_kernel<<<grid_for(n4), kBlock, 0, stream>>>(
@@ -59,7 +59,7 @@ cudaError_t qwc_bw_read(const void* src, size_t bytes, float* out, cudaStream_t 
     return cudaGetLastError();
 }
 
-// Трафик: 2 * bytes (чтение и запись).
+// Traffic: 2 * bytes (read and write).
 cudaError_t qwc_bw_copy(const void* src, void* dst, size_t bytes, cudaStream_t stream) {
     size_t n4 = bytes / sizeof(float4);
     bw_copy_kernel<<<grid_for(n4), kBlock, 0, stream>>>(

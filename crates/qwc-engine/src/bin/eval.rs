@@ -413,9 +413,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     })
 }
 
-/// Путь чекпоинта для артефакта: канонический, но дом — через `$HOME`.
-/// Имя пользователя в run-header не нужно, а артефакты уходят в публичный
-/// репозиторий. Движок при этом открывает настоящий путь, не эту строку.
+/// Checkpoint path for the artifact: canonical, but home goes as `$HOME`.
+/// The username isn't needed in the run header, and artifacts go to a public
+/// repository. The engine still opens the real path, not this string.
 fn canonical_display(path: &Path) -> String {
     let full = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let home = home().canonicalize().unwrap_or_else(|_| home());
@@ -453,15 +453,15 @@ mod tests {
 
     #[test]
     fn checkpoint_path_hides_the_home_directory() {
-        // От канонического дома: у несуществующего пути canonicalize не
-        // сработает, и сравнивать пришлось бы с домом через симлинк.
+        // From the canonical home: canonicalize fails on a nonexistent path,
+        // and we'd have to compare against home through a symlink.
         let home_real = home().canonicalize().unwrap_or_else(|_| home());
         let inside = home_real.join("models/Qwen3.8-27B-QUASAR-NVFP4");
         assert_eq!(
             canonical_display(&inside),
             "$HOME/models/Qwen3.8-27B-QUASAR-NVFP4"
         );
-        // Вне дома путь остаётся как есть: скрывать там нечего.
+        // Outside home the path stays as is: there's nothing to hide there.
         let outside = Path::new("/opt/checkpoints/qwen");
         assert_eq!(canonical_display(outside), "/opt/checkpoints/qwen");
     }

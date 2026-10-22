@@ -1,25 +1,25 @@
-//! Словарные матрицы в FP8: таблица эмбеддингов и lm_head.
+//! Vocab matrices in FP8: the embedding table and lm_head.
 //!
-//! В чекпоинте обе матрицы `[vocab, hidden]` лежат в BF16 и стоят по 2.54 GB.
-//! Мы храним их в E4M3 с FP32-шкалой на строку: это ровно половина, а ошибка
-//! остаётся локальной — одна плохо отмасштабированная строка не портит весь
-//! словарь. Шкала выносится из скалярного произведения, поэтому lm_head
-//! применяет её один раз на строку, а не на каждый элемент.
+//! In the checkpoint both `[vocab, hidden]` matrices are BF16 and cost 2.54 GB each.
+//! We store them in E4M3 with an FP32 scale per row: exactly half, and the error
+//! stays local — one badly scaled row doesn't spoil the whole
+//! vocab. The scale factors out of the dot product, so lm_head
+//! applies it once per row, not per element.
 
 use crate::error::{Result, check};
 use crate::{DeviceBuffer, Stream, ffi};
 use std::ffi::c_void;
 
-/// Потолок batch узкого кернела logits: hidden-тайл лежит в статической
-/// shared-памяти. На batch 1 он идёт на потолке полосы, поэтому остаётся
-/// быстрым путём для одиночной последовательности.
+/// Batch cap of the narrow logits kernel: the hidden tile lives in static
+/// shared memory. At batch 1 it runs at the bandwidth ceiling, so it stays
+/// the fast path for a single sequence.
 pub const MAX_LOGITS_BATCH: usize = 8;
 
-/// Потолок batch батчевого кернела: таблица читается один раз на любой batch
-/// вплоть до этого значения. Выше — группы, как и раньше.
+/// Batch cap of the batched kernel: the table is read once for any batch
+/// up to this value. Above it — groups, as before.
 pub const MAX_BATCHED_LOGITS: usize = 96;
 
-/// Те же потолки, но прочитанные из кернела: константы не должны разъезжаться.
+/// The same caps, but read from the kernel: the constants must not drift apart.
 pub fn kernel_max_logits_batch() -> usize {
     unsafe { ffi::qwc_fp8_max_logits_batch() as usize }
 }
@@ -35,10 +35,10 @@ pub struct Fp8Vocab {
     cols: usize,
 }
 
-/// Исходная BF16 словарная матрица без дополнительной квантизации.
+/// The original BF16 vocab matrix without extra quantization.
 ///
-/// Диагностический путь общий для embedding и `lm_head`: каждая матрица
-/// стоит на 1.27 GB больше FP8-варианта.
+/// The diagnostic path is shared by the embedding and `lm_head`: each matrix
+/// costs 1.27 GB more than the FP8 variant.
 pub struct Bf16Vocab {
     data: DeviceBuffer<u8>,
     rows: usize,
@@ -55,7 +55,7 @@ impl Bf16Vocab {
         })
     }
 
-    /// Копирует целые BF16-строки из mmap без невыровненного `u16` cast.
+    /// Copies whole BF16 rows from mmap without an unaligned `u16` cast.
     pub fn copy_rows(&mut self, first_row: usize, bf16_le: &[u8]) -> Result<()> {
         let row_bytes = self.cols * 2;
         assert!(bf16_le.len().is_multiple_of(row_bytes));
@@ -108,7 +108,7 @@ impl Bf16Vocab {
         let mut done = 0;
         while done < batch {
             let group = (batch - done).min(MAX_LOGITS_BATCH);
-            // SAFETY: смещения внутри проверенных выше буферов.
+            // SAFETY: offsets within the buffers checked above.
             let hidden_ptr =
                 unsafe { (hidden.as_ptr() as *const u16).add(done * self.cols) as *const c_void };
             let logits_ptr =
@@ -139,7 +139,7 @@ impl Bf16Vocab {
     ) -> Result<()> {
         assert!((hidden_row + 1) * self.cols <= hidden.len());
         assert!((logits_row + 1) * self.rows <= logits.len());
-        // SAFETY: оба смещения покрыты assertion выше.
+        // SAFETY: both offsets are covered by the assertion above.
         let hidden_ptr =
             unsafe { (hidden.as_ptr() as *const u16).add(hidden_row * self.cols) as *const c_void };
         let logits_ptr =
@@ -161,7 +161,7 @@ impl Bf16Vocab {
         self.data.bytes()
     }
 
-    /// Копия для GPU-oracle теста.
+    /// A copy for the GPU oracle test.
     pub fn to_host(&self) -> Result<Vec<u8>> {
         self.data.to_vec()
     }
@@ -178,12 +178,12 @@ impl Fp8Vocab {
         })
     }
 
-    /// Квантизует строки `[first_row, first_row + rows)` из BF16. На вход идут
-    /// сырые little-endian байты чекпоинта: срез mmap не выровнен под `u16`, а
-    /// лишняя копия на хосте здесь стоила бы 2.54 GB.
+    /// Quantizes rows `[first_row, first_row + rows)` from BF16. The input is
+    /// the checkpoint's raw little-endian bytes: the mmap slice isn't aligned for `u16`, and
+    /// an extra host copy here would cost 2.54 GB.
     ///
-    /// `staging` переиспользуется между вызовами, поэтому запуск ждётся здесь
-    /// же: иначе следующая копия затёрла бы данные ещё работающего кернела.
+    /// `staging` is reused between calls, so the launch is waited on right
+    /// here: otherwise the next copy would overwrite data of a still-running kernel.
     pub fn quantize_rows(
         &mut self,
         first_row: usize,
@@ -211,7 +211,7 @@ impl Fp8Vocab {
         stream.synchronize()
     }
 
-    /// Строки таблицы по идентификаторам токенов, сразу в BF16.
+    /// Table rows by token ids, straight into BF16.
     pub fn gather(
         &self,
         token_ids: &DeviceBuffer<u32>,
@@ -259,11 +259,11 @@ impl Fp8Vocab {
         })
     }
 
-    /// Логиты `[batch, vocab]` в FP32.
+    /// Logits `[batch, vocab]` in FP32.
     ///
-    /// До `MAX_LOGITS_BATCH` работает узкий кернел — на batch 1 он уже на
-    /// потолке полосы. Дальше идёт батчевый: он читает таблицу один раз, тогда
-    /// как группы по восемь перечитывали её по 1.27 GB на группу.
+    /// Up to `MAX_LOGITS_BATCH` the narrow kernel runs — at batch 1 it's already at
+    /// the bandwidth ceiling. Beyond that the batched one: it reads the table once, whereas
+    /// groups of eight re-read it at 1.27 GB per group.
     pub fn logits(
         &self,
         hidden: &DeviceBuffer<u16>,
@@ -280,7 +280,7 @@ impl Fp8Vocab {
         let mut done = 0;
         while done < batch {
             let group = (batch - done).min(MAX_LOGITS_BATCH);
-            // SAFETY: смещения внутри уже проверенных по длине буферов.
+            // SAFETY: offsets within buffers already checked by length.
             let hidden_ptr =
                 unsafe { (hidden.as_ptr() as *const u16).add(done * self.cols) as *const c_void };
             let logits_ptr =
@@ -302,12 +302,12 @@ impl Fp8Vocab {
         Ok(())
     }
 
-    /// Логиты одной строки скрытого состояния, но только по строкам словаря
-    /// из `row_ids`. Выход плотный: `logits[i]` соответствует `row_ids[i]`,
-    /// поэтому argmax по нему даёт индекс в списке, а не токен.
+    /// Logits of one hidden-state row, but only for the vocab rows
+    /// in `row_ids`. The output is dense: `logits[i]` corresponds to `row_ids[i]`,
+    /// so the argmax over it gives an index into the list, not a token.
     ///
-    /// Нужно черновой голове: её предложение проверяет основная модель, и
-    /// промах списка стоит отвергнутого черновика, а не неверного выхода.
+    /// Needed by the draft head: its proposal is verified by the main model, and
+    /// a list miss costs a rejected draft, not a wrong output.
     pub fn logits_subset(
         &self,
         hidden: &DeviceBuffer<u16>,
@@ -334,9 +334,9 @@ impl Fp8Vocab {
         })
     }
 
-    /// Один проход по таблице на весь batch. Батчи больше
-    /// `MAX_BATCHED_LOGITS` всё ещё режутся, но это далеко за пределами
-    /// `MAX_BATCH` исполнителя.
+    /// One pass over the table for the whole batch. Batches larger than
+    /// `MAX_BATCHED_LOGITS` are still split, but that's far beyond the executor's
+    /// `MAX_BATCH`.
     fn logits_batched(
         &self,
         hidden: &DeviceBuffer<u16>,
@@ -347,7 +347,7 @@ impl Fp8Vocab {
         let mut done = 0;
         while done < batch {
             let group = (batch - done).min(MAX_BATCHED_LOGITS);
-            // SAFETY: смещения внутри уже проверенных по длине буферов.
+            // SAFETY: offsets within buffers already checked by length.
             let hidden_ptr =
                 unsafe { (hidden.as_ptr() as *const u16).add(done * self.cols) as *const c_void };
             let logits_ptr =
@@ -422,14 +422,14 @@ impl Fp8Vocab {
         self.data.bytes() + self.row_scales.bytes()
     }
 
-    /// Копии на хост для сверки с эталоном.
+    /// Copies to host for checking against the reference.
     pub fn to_host(&self) -> Result<(Vec<u8>, Vec<f32>)> {
         Ok((self.data.to_vec()?, self.row_scales.to_vec()?))
     }
 }
 
-/// Эталон на CPU поверх уже квантованных данных: он проверяет арифметику
-/// кернелов, а не выбор шкалы.
+/// A CPU reference on top of already quantized data: it checks the kernels'
+/// arithmetic, not the choice of scale.
 pub mod reference {
     use crate::bf16;
     use crate::nvfp4::reference::e4m3;
@@ -476,8 +476,8 @@ pub mod reference {
 
 #[cfg(test)]
 mod tests {
-    /// Константа Rust и константа кернела не должны разъезжаться: на этом
-    /// потолке держится размер shared-тайла.
+    /// The Rust constant and the kernel constant must not drift apart: the size
+    /// of the shared tile depends on this cap.
     #[test]
     fn max_logits_batch_matches_kernel() {
         assert_eq!(super::MAX_LOGITS_BATCH, super::kernel_max_logits_batch());

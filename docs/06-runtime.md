@@ -1,32 +1,32 @@
-# Runtime: двухресурсный кэш и continuous batching
+# Runtime: two-resource cache and continuous batching
 
-## Зачем отдельный runtime
+## Why a separate runtime
 
-У Qwen3.8 одна последовательность одновременно занимает два разных ресурса:
+In Qwen3.8 one sequence occupies two different resources at once:
 
-* фиксированный state-слот для 48 Gated DeltaNet слоёв;
-* переменное число paged KV-блоков для 16 full-attention слоёв.
+* a fixed state slot for the 48 Gated DeltaNet layers;
+* a variable number of paged KV blocks for the 16 full-attention layers.
 
-Поэтому одного счётчика KV недостаточно. Запрос принимается только тогда, когда
-есть и state-слот, и все KV-блоки prompt. `CacheManager` выполняет эту проверку
-транзакционно: при отказе ни один ресурс не расходуется. Scheduler дополнительно
-коммитит KV-ёмкость на `prompt + max_new_tokens`, пока нет preemption: иначе
-несколько запросов могли бы вместе заполнить пул на границе страниц и навсегда
-застрять перед следующим decode-токеном.
+So a single KV counter is not enough. A request is admitted only when
+there is both a state slot and all the prompt's KV blocks. `CacheManager` performs this check
+transactionally: on refusal no resource is consumed. The scheduler additionally
+commits KV capacity for `prompt + max_new_tokens` while there is no preemption: otherwise
+several requests could together fill the pool at a page boundary and get stuck forever
+before the next decode token.
 
-`CacheManager::from_budget` статически делит доступную VRAM под заданный
-`target_context`. Число state-слотов равно `Budget::max_concurrency`, остаток
-отдаётся KV-пулу. Если реальные запросы заметно короче target, раньше
-заканчиваются state-слоты; если длиннее — KV-блоки.
+`CacheManager::from_budget` statically splits the available VRAM for a given
+`target_context`. The number of state slots equals `Budget::max_concurrency`, the rest
+goes to the KV pool. If real requests are noticeably shorter than the target, state slots
+run out first; if longer, KV blocks do.
 
-GPU executor использует тот же общий пул физических страниц, что и
-`CacheManager`. `max_context` определяет ширину логической block table одной
-последовательности, но не размер физической аллокации. Размер аллокации задаётся
-независимо как `kv_pool_blocks`; каждый page ID из scheduler layout проверяется
-против этой ёмкости перед загрузкой metadata. Это позволяет, например, держать
-`max_context=32768` и 80 state-слотов, не резервируя `80 × 32768` токенов KV.
+The GPU executor uses the same shared pool of physical pages as
+`CacheManager`. `max_context` sets the width of one sequence's logical block table,
+but not the size of the physical allocation. The allocation size is set
+independently as `kv_pool_blocks`; every page ID from the scheduler layout is checked
+against this capacity before metadata is uploaded. This allows, for example, keeping
+`max_context=32768` and 80 state slots without reserving `80 × 32768` KV tokens.
 
-## Состояния запроса
+## Request states
 
 ```text
 waiting
@@ -35,73 +35,73 @@ waiting
   -> completed / cancelled -> release(state + KV)
 ```
 
-Одновременно существует не больше одного in-flight batch. Это не ограничение
-GPU: внутри batch может быть до `max_num_seqs` последовательностей. Ограничение
-нужно на границе CPU/GPU, чтобы подтверждение и откат всегда относились к
-единственному известному плану.
+At most one in-flight batch exists at a time. This is not a GPU
+limitation: a batch can hold up to `max_num_seqs` sequences. The limitation
+is needed at the CPU/GPU boundary so that commit and rollback always refer to
+the single known plan.
 
-Жизненный цикл executor:
+Executor lifecycle:
 
-1. `submit` кладёт запрос в FIFO, ещё не занимая VRAM.
-2. `next_batch` принимает помещающиеся запросы и возвращает смешанный `Batch`.
-3. Executor выполняет `decode` и `prefill` части batch.
-4. При успехе вызывает `complete_batch(stopped)`, при ошибке до исполнения —
+1. `submit` puts the request in a FIFO without taking VRAM yet.
+2. `next_batch` admits requests that fit and returns a mixed `Batch`.
+3. The executor runs the `decode` and `prefill` parts of the batch.
+4. On success it calls `complete_batch(stopped)`, on an error before execution —
    `abort_batch()`.
 
-## Политика планирования
+## Scheduling policy
 
-1. Готовый decode имеет приоритет: это защищает inter-token latency уже
-   запущенных запросов.
-2. Оставшиеся sequence slots и token budget заполняются chunked prefill.
-3. Decode обслуживается round-robin.
-4. Admission идёт в порядке FIFO, но длинный prompt, временно не помещающийся
-   в свободный KV, не блокирует меньший запрос за ним. Отсутствие state-слота
-   останавливает admission целиком, потому что следующий запрос тоже не
-   сможет пройти.
+1. Ready decode has priority: this protects the inter-token latency of already
+   running requests.
+2. The remaining sequence slots and token budget are filled with chunked prefill.
+3. Decode is served round-robin.
+4. Admission is FIFO, but a long prompt that temporarily doesn't fit
+   in free KV doesn't block a smaller request behind it. Lack of a state slot
+   stops admission entirely, because the next request wouldn't be able to
+   get through either.
 
-`max_num_batched_tokens` общий: один decode стоит один токен, prefill — размер
-чанка. Поэтому scheduler может в одном шаге поддержать decode активных
-последовательностей и использовать остаток GPU-работы для нового prompt.
+`max_num_batched_tokens` is shared: one decode costs one token, prefill costs the chunk
+size. So in one step the scheduler can keep decode of active
+sequences going and use the rest of the GPU work for a new prompt.
 
-## Резервация до GPU
+## Reservation before the GPU
 
-Перед добавлением последовательности в decode batch scheduler вызывает
-`CacheManager::append_token`. Если следующий токен пересекает границу страницы,
-новый KV-блок выделяется **до** запуска кернела. OOM между планированием и
-исполнением невозможен.
+Before adding a sequence to the decode batch, the scheduler calls
+`CacheManager::append_token`. If the next token crosses a page boundary,
+a new KV block is allocated **before** the kernel launches. OOM between planning and
+execution is impossible.
 
-Коммит lifetime-ёмкости логический: реальные страницы по-прежнему выделяются
-лениво. Поэтому block tables содержат только уже используемые страницы, но
-admission не обещает свободный остаток другим запросам. Консервативность можно
-будет снять одновременно с появлением preemption, а не ценой дедлока.
+The lifetime capacity commit is logical: real pages are still allocated
+lazily. So block tables contain only pages already in use, but
+admission doesn't promise the free remainder to other requests. The conservatism can
+be lifted together with the arrival of preemption, rather than at the cost of a deadlock.
 
-Если batch не был исполнен, `abort_batch` вызывает `rollback_token`: счётчик
-длины возвращается назад, а лишняя KV-страница освобождается. Prefill откатить
-проще — весь prompt-кэш резервируется при admission, а подтверждённое смещение
-меняется только в `complete_batch`.
+If a batch was not executed, `abort_batch` calls `rollback_token`: the length counter
+goes back, and the extra KV page is freed. Prefill is easier to roll back
+— the whole prompt cache is reserved at admission, and the committed offset
+changes only in `complete_batch`.
 
-Завершение по лимиту токенов, EOS/stop condition и явная отмена освобождают оба
-ресурса. Отмена in-flight последовательности запрещена: сначала необходимо
-подтвердить или откатить batch, чтобы GPU не получил dangling block table.
+Finishing on the token limit, EOS/stop condition and explicit cancellation free both
+resources. Cancelling an in-flight sequence is forbidden: the batch must first be
+committed or rolled back so the GPU doesn't get a dangling block table.
 
-## Batch metadata для GPU
+## Batch metadata for the GPU
 
-`BatchLayout` переводит scheduler batch и текущее состояние кэша в плоскую
-structure-of-arrays раскладку на `u32`. Decode-записи идут первыми, затем
-prefill-чанки. Для каждой последовательности передаются:
+`BatchLayout` turns the scheduler batch and current cache state into a flat
+structure-of-arrays layout of `u32`. Decode entries come first, then
+prefill chunks. For each sequence it passes:
 
-* `SeqId` и номер state-слота;
-* начальная позиция и длина видимого контекста;
-* CSR offset входных токенов;
-* CSR offset и физические ID KV-блоков.
+* the `SeqId` and state slot number;
+* the start position and visible context length;
+* the CSR offset of the input tokens;
+* the CSR offset and physical IDs of KV blocks.
 
-Для decode длина уже включает зарезервированный следующий токен. Для prefill
-она заканчивается на границе текущего чанка, даже если admission заранее
-выделил страницы под весь prompt. Такая раскладка не содержит Rust padding и
-копируется в преаллоцированные device buffers фиксированного адреса. CUDA graph
-читает новые значения из тех же адресов на каждом запуске.
+For decode the length already includes the reserved next token. For prefill
+it ends at the current chunk boundary, even if admission has already
+allocated pages for the whole prompt. This layout has no Rust padding and
+is copied into preallocated fixed-address device buffers. The CUDA graph
+reads new values from the same addresses on every launch.
 
-## Проверка
+## Verification
 
 ```bash
 cargo test -p qwc-runtime
@@ -109,12 +109,12 @@ cargo clippy -p qwc-runtime --all-targets -- -D warnings \
   -A clippy::manual-is-multiple-of
 ```
 
-CPU-тесты покрывают оба вида дефицита, ленивое расширение KV, rollback на
-границе страницы, chunked prefill, mixed batch, first-fit admission, лимит
-генерации, stop condition, безопасную отмену и CSR-раскладку GPU metadata.
+CPU tests cover both kinds of shortage, lazy KV growth, rollback at
+a page boundary, chunked prefill, mixed batch, first-fit admission, the generation
+limit, stop condition, safe cancellation and the CSR layout of GPU metadata.
 
-`qwc-engine::Executor::execute_layout` принимает эту раскладку напрямую:
-decode использует scheduler-selected state slots и физические KV pages, а
-prefill-чанки обновляют те же пулы. Пример полного цикла находится в binary
-`qwc-engine/src/bin/scheduled.rs`. Preemption, swap и prefix snapshots в
-текущий runtime намеренно не входят.
+`qwc-engine::Executor::execute_layout` takes this layout directly:
+decode uses the scheduler-selected state slots and physical KV pages, and
+prefill chunks update the same pools. An example of the full loop is in the binary
+`qwc-engine/src/bin/scheduled.rs`. Preemption, swap and prefix snapshots are
+intentionally not part of the current runtime.

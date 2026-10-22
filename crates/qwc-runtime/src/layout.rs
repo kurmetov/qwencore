@@ -1,8 +1,8 @@
-//! Плоская CPU-раскладка batch metadata для загрузки в GPU executor.
+//! Flat CPU layout of batch metadata for upload to the GPU executor.
 //!
-//! Вектора имеют структуру-of-arrays и используют `u32`: CUDA-кернелам не
-//! нужны Rust-структуры с padding, а один и тот же device buffer позднее можно
-//! преаллоцировать под максимальный batch и обновлять только активный префикс.
+//! Vectors are struct-of-arrays and use `u32`: CUDA kernels don't
+//! need Rust structs with padding, and the same device buffer can later be
+//! preallocated for the max batch with only the active prefix updated.
 
 use crate::cache::{CacheManager, SeqId};
 use crate::scheduler::{Batch, PrefillChunk};
@@ -20,33 +20,33 @@ pub enum LayoutError {
 impl std::fmt::Display for LayoutError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingSequence(id) => write!(f, "SeqId {id} отсутствует в кэше"),
-            Self::DuplicateSequence(id) => write!(f, "SeqId {id} дважды присутствует в batch"),
-            Self::InvalidPrefillRange(id) => write!(f, "prefill-диапазон SeqId {id} некорректен"),
-            Self::MissingKvBlocks(id) => write!(f, "не хватает выделенных KV-блоков SeqId {id}"),
-            Self::IntegerOverflow(field) => write!(f, "{field} не помещается в GPU metadata"),
+            Self::MissingSequence(id) => write!(f, "SeqId {id} is missing from the cache"),
+            Self::DuplicateSequence(id) => write!(f, "SeqId {id} appears twice in the batch"),
+            Self::InvalidPrefillRange(id) => write!(f, "invalid prefill range for SeqId {id}"),
+            Self::MissingKvBlocks(id) => write!(f, "not enough allocated KV blocks for SeqId {id}"),
+            Self::IntegerOverflow(field) => write!(f, "{field} doesn't fit GPU metadata"),
         }
     }
 }
 
 impl std::error::Error for LayoutError {}
 
-/// Компактные metadata одного смешанного batch. Decode-последовательности
-/// всегда идут первыми (`0..num_decode`), затем prefill-чанки.
+/// Compact metadata of one mixed batch. Decode sequences
+/// always come first (`0..num_decode`), then prefill chunks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchLayout {
     pub num_decode: u32,
     pub seq_ids: Vec<SeqId>,
     pub state_slots: Vec<u32>,
-    /// Начальная абсолютная позиция входных токенов каждой последовательности.
+    /// Starting absolute position of each sequence's input tokens.
     pub position_starts: Vec<u32>,
-    /// Длина видимого контекста после исполнения элемента batch.
+    /// Visible context length after executing the batch element.
     pub context_lens: Vec<u32>,
-    /// CSR offsets токенов; последний элемент равен общему числу токенов.
+    /// CSR offsets of tokens; the last element equals the total token count.
     pub token_offsets: Vec<u32>,
-    /// CSR offsets таблиц KV-блоков каждой последовательности.
+    /// CSR offsets of each sequence's KV block tables.
     pub block_table_offsets: Vec<u32>,
-    /// Плоские физические ID страниц KV-кэша.
+    /// Flat physical KV cache page IDs.
     pub block_ids: Vec<u32>,
 }
 
@@ -141,7 +141,7 @@ impl BatchLayout {
         let total_tokens = self
             .num_tokens()
             .checked_add(tokens)
-            .ok_or(LayoutError::IntegerOverflow("суммарное число токенов"))?;
+            .ok_or(LayoutError::IntegerOverflow("total token count"))?;
         self.token_offsets
             .push(as_u32(total_tokens, "token offset")?);
 

@@ -1,9 +1,9 @@
-//! Вытеснение страниц чекпоинта: RSS падает, отображение остаётся живым.
+//! Checkpoint page eviction: RSS drops, the mapping stays alive.
 
 use qwc_model::Checkpoint;
 use std::path::{Path, PathBuf};
 
-/// Полезная нагрузка заметно больше страницы, иначе падение RSS утонет в шуме.
+/// The payload is well above a page, otherwise the RSS drop drowns in noise.
 const PAYLOAD: usize = 8 << 20;
 
 struct TempDir(PathBuf);
@@ -12,7 +12,7 @@ impl TempDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("qwc-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("временный каталог");
+        std::fs::create_dir_all(&dir).expect("temp dir");
         Self(dir)
     }
 
@@ -27,18 +27,18 @@ impl Drop for TempDir {
     }
 }
 
-/// Резидентные байты процесса по /proc/self/statm (второе поле — страницы).
+/// Resident bytes of the process from /proc/self/statm (the second field is pages).
 fn resident_bytes() -> usize {
     let statm = std::fs::read_to_string("/proc/self/statm").expect("/proc/self/statm");
     let pages: usize = statm
         .split_whitespace()
         .nth(1)
         .and_then(|p| p.parse().ok())
-        .expect("поле resident");
+        .expect("resident field");
     pages * 4096
 }
 
-/// Однотензорный шард: [8 байт длины заголовка][JSON][данные].
+/// A single-tensor shard: [8-byte header length][JSON][data].
 fn write_checkpoint(dir: &Path, payload: &[u8]) {
     let header = format!(
         r#"{{"weights":{{"dtype":"U8","shape":[{}],"data_offsets":[0,{}]}}}}"#,
@@ -49,12 +49,12 @@ fn write_checkpoint(dir: &Path, payload: &[u8]) {
     shard.extend_from_slice(&(header.len() as u64).to_le_bytes());
     shard.extend_from_slice(header.as_bytes());
     shard.extend_from_slice(payload);
-    std::fs::write(dir.join("model-00001.safetensors"), &shard).expect("шард");
+    std::fs::write(dir.join("model-00001.safetensors"), &shard).expect("shard");
     std::fs::write(
         dir.join("model.safetensors.index.json"),
         r#"{"weight_map":{"weights":"model-00001.safetensors"}}"#,
     )
-    .expect("индекс");
+    .expect("index");
 }
 
 #[test]
@@ -63,24 +63,24 @@ fn eviction_drops_resident_pages_and_keeps_tensors_readable() {
     let dir = TempDir::new("mmap-eviction");
     write_checkpoint(dir.path(), &payload);
 
-    let checkpoint = Checkpoint::open(dir.path()).expect("чекпоинт открывается");
+    let checkpoint = Checkpoint::open(dir.path()).expect("checkpoint opens");
     let before_touch = resident_bytes();
 
-    // Аналог фазы загрузки: страницы прочитаны и попали в working set.
-    assert_eq!(checkpoint.bytes("weights").expect("тензор"), &payload[..]);
+    // Like the load phase: pages are read and enter the working set.
+    assert_eq!(checkpoint.bytes("weights").expect("tensor"), &payload[..]);
     let touched = resident_bytes();
     assert!(
         touched >= before_touch + PAYLOAD / 2,
-        "чтение тензора не подняло RSS: {before_touch} -> {touched}"
+        "reading the tensor didn't raise RSS: {before_touch} -> {touched}"
     );
 
-    checkpoint.evict_file_pages().expect("вытеснение страниц");
+    checkpoint.evict_file_pages().expect("page eviction");
     let evicted = resident_bytes();
     assert!(
         evicted <= touched - PAYLOAD / 2,
-        "RSS не упал после вытеснения: {touched} -> {evicted}"
+        "RSS didn't drop after eviction: {touched} -> {evicted}"
     );
 
-    // Отображение остаётся валидным: страницы подгружаются из файла заново.
-    assert_eq!(checkpoint.bytes("weights").expect("тензор"), &payload[..]);
+    // The mapping stays valid: pages are reloaded from the file.
+    assert_eq!(checkpoint.bytes("weights").expect("tensor"), &payload[..]);
 }

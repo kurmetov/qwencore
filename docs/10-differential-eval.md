@@ -1,29 +1,29 @@
 # Differential eval
 
-Осмысленное продолжение smoke-теста — сравнение не строк, а следующего
-распределения токенов на одном checkpoint. Контур находится в
-`bench/diff_eval.py`, замороженный корпус — в `bench/corpus/core.jsonl`.
+The meaningful continuation of the smoke test is comparing not strings but the next-token
+distribution on the same checkpoint. The harness is in
+`bench/diff_eval.py`, the frozen corpus in `bench/corpus/core.jsonl`.
 
-## Что сравнивается
+## What is compared
 
-Каждый backend получает **те же token IDs**, без chat template, BOS и скрытой
-ретокенизации. Для каждого шага сохраняются greedy token ID и top-20 raw
-log-probabilities. Отчёт считает:
+Each backend gets **the same token IDs**, without chat template, BOS or hidden
+retokenization. For each step the greedy token ID and top-20 raw
+log-probabilities are saved. The report computes:
 
-* длину общего greedy-префикса;
+* the length of the common greedy prefix;
 * top-1 agreement;
-* Jaccard overlap множеств top-k;
-* mean/max absolute delta общих log-probabilities.
+* Jaccard overlap of the top-k sets;
+* mean/max absolute delta of the shared log-probabilities.
 
-После первой greedy-развилки распределения больше не сравниваются: у моделей
-уже разные контексты. Сама длина общего префикса продолжает отражать расхождение
-генерации.
+After the first greedy divergence distributions are no longer compared: the models
+already have different contexts. The common prefix length itself keeps reflecting the generation
+divergence.
 
-Корпус включает английский текст, Python, русский, китайский, арабский,
-математику и whitespace, а также синтетические длины 63/64/65 (граница
-64-токенной KV-страницы), 127/128/129 (граница prefill-чанка) и 601 токен.
+The corpus includes English text, Python, Russian, Chinese, Arabic,
+math and whitespace, plus synthetic lengths 63/64/65 (the
+64-token KV page boundary), 127/128/129 (the prefill chunk boundary) and 601 tokens.
 
-## Быстрый запуск
+## Quick start
 
 ```bash
 PY=$HOME/.venvs/baseline/bin/python
@@ -57,20 +57,20 @@ $PY bench/diff_eval.py compare \
   --fail-on-threshold
 ```
 
-Пороги по умолчанию: top-1 не ниже 0.95, top-k Jaccard не ниже 0.70,
-log-prob MAE не выше 0.25. Их можно менять аргументами `compare`, но baseline
-следует хранить со строгими значениями, а не подгонять после результата.
+Default thresholds: top-1 at least 0.95, top-k Jaccard at least 0.70,
+log-prob MAE at most 0.25. They can be changed with `compare` arguments, but the baseline
+should be kept with strict values, not tuned after seeing the result.
 
-`--lm-head bf16` оставляет финальную матрицу в исходном типе checkpoint
-и добавляет 1.27 GB VRAM. Это A/B-диагностика: если MAE почти не изменится,
-ошибка приходит в `lm_head` уже из hidden state; если упадёт ниже gate,
-FP8-квантизацию головы нельзя оставлять в quality-конфигурации.
-`--embedding bf16` проводит тот же A/B-замер для входной таблицы.
-`--vllm-kv-cache-dtype fp8` квантует только full-attention KV у reference;
-Gated DeltaNet state остаётся в dtype модели. Это изолирует вклад FP8 KV
-без смены checkpoint или весов.
+`--lm-head bf16` keeps the final matrix in the checkpoint's original type
+and adds 1.27 GB of VRAM. This is an A/B diagnostic: if MAE barely changes,
+the error reaches `lm_head` already from the hidden state; if it drops below the gate,
+FP8 quantization of the head can't stay in the quality configuration.
+`--embedding bf16` does the same A/B for the input table.
+`--vllm-kv-cache-dtype fp8` quantizes only the reference's full-attention KV;
+the Gated DeltaNet state stays in the model dtype. This isolates the FP8 KV contribution
+without changing the checkpoint or weights.
 
-## Backend-адаптеры
+## Backend adapters
 
 ### Transformers
 
@@ -79,21 +79,21 @@ $PY bench/diff_eval.py run --engine transformers \
   --model "$MODEL" --output bench/results/transformers.jsonl
 ```
 
-Адаптер читает полные logits непосредственно из `forward`, поэтому это самый
-сильный эталон. Для `device_map` требуется `accelerate`. Важно: backend обязан
-уметь исполнять именно `compressed-tensors` NVFP4 checkpoint; деквантизация
-27B в BF16 не помещается на 32-GB GPU и не считается эквивалентным запуском.
+The adapter reads full logits directly from `forward`, so it's the strongest
+reference. `device_map` requires `accelerate`. Important: the backend must
+be able to run exactly the `compressed-tensors` NVFP4 checkpoint; dequantizing
+27B to BF16 doesn't fit on a 32 GB GPU and doesn't count as an equivalent run.
 
 ### vLLM
 
-Offline API получает `prompt_token_ids`, `temperature=0`, отключённые penalties
-и top-k raw log-probabilities. EOS игнорируется, чтобы все backend вернули одно
-число шагов.
+The offline API gets `prompt_token_ids`, `temperature=0`, disabled penalties
+and top-k raw log-probabilities. EOS is ignored so all backends return the same
+number of steps.
 
 ### SGLang
 
-Запускается внешний server, после чего используется нативный `/generate`: он,
-в отличие от OpenAI chat API, принимает `input_ids` и возвращает numeric token
+An external server is started, then the native `/generate` is used: unlike
+the OpenAI chat API, it accepts `input_ids` and returns numeric token
 IDs.
 
 ```bash
@@ -104,9 +104,9 @@ $PY bench/diff_eval.py run --engine sglang --url http://127.0.0.1:30000 \
 
 ### llama.cpp
 
-Нужен GGUF, полученный из **этого же** checkpoint без смены квантования или
-токенизатора. Нативный `/completion` принимает массив token IDs и с
-`n_probs=20` возвращает IDs и log-probabilities.
+You need a GGUF produced from **this same** checkpoint without changing quantization or
+tokenizer. The native `/completion` accepts an array of token IDs and with
+`n_probs=20` returns IDs and log-probabilities.
 
 ```bash
 llama-server -m /models/qwen3.8-27b-nvfp4.gguf -c 1024 -ngl 999 --port 8080
@@ -114,14 +114,14 @@ $PY bench/diff_eval.py run --engine llamacpp --url http://127.0.0.1:8080 \
   --model "$MODEL" --output bench/results/llamacpp.jsonl
 ```
 
-Если конвертер не поддерживает `Qwen3_5ForConditionalGeneration` и
-`nvfp4-pack-quantized`, такой backend помечается несовместимым. Сравнивать с
-другим GGUF-квантом можно как quality experiment, но не как проверку qwc.
+If the converter doesn't support `Qwen3_5ForConditionalGeneration` and
+`nvfp4-pack-quantized`, the backend is marked incompatible. Comparing against
+another GGUF quant is possible as a quality experiment, but not as a qwc check.
 
-### TensorRT-LLM, LMDeploy, MLC LLM, Ollama и другие OpenAI server
+### TensorRT-LLM, LMDeploy, MLC LLM, Ollama and other OpenAI servers
 
-Для них есть fallback `--engine openai`. Следует указать имя отдельно, чтобы
-оно не потерялось в отчёте:
+For these there is the `--engine openai` fallback. Give the name separately so
+it doesn't get lost in the report:
 
 ```bash
 $PY bench/diff_eval.py run --engine openai \
@@ -130,61 +130,61 @@ $PY bench/diff_eval.py run --engine openai \
   --output bench/results/tensorrt-llm.jsonl
 ```
 
-OpenAI schema не возвращает numeric token IDs. Адаптер принимает позицию лишь
-когда строка токена однозначно round-trip'ится официальным tokenizer; иначе
-ставит `unsupported_exact_token_output`. Это слабее нативных адаптеров, но не
-подменяет идентичность токенов догадкой.
+The OpenAI schema doesn't return numeric token IDs. The adapter accepts a position only
+when the token string round-trips unambiguously through the official tokenizer; otherwise
+it sets `unsupported_exact_token_output`. This is weaker than the native adapters, but it doesn't
+replace token identity with a guess.
 
 ### TGI
 
-TGI custom API возвращает numeric IDs и top tokens, но принимает только текст.
-Поэтому адаптер запускает лишь семантические cases, для которых официальный
-tokenizer подтверждает точное совпадение с замороженными IDs. Синтетические
-границы честно получают `unsupported_exact_token_input`.
+The TGI custom API returns numeric IDs and top tokens, but accepts only text.
+So the adapter runs only the semantic cases for which the official
+tokenizer confirms an exact match with the frozen IDs. Synthetic
+boundaries honestly get `unsupported_exact_token_input`.
 
-ExLlamaV2 не имеет пути для этого NVFP4 checkpoint. Ollama и MLC требуют
-конвертированную модель, поэтому их результаты являются отдельным сравнением
-формата, а не строгим differential test исходных весов.
+ExLlamaV2 has no path for this NVFP4 checkpoint. Ollama and MLC need
+a converted model, so their results are a separate format comparison,
+not a strict differential test of the original weights.
 
-## Артефакт и CI
+## Artifact and CI
 
-JSONL начинается с run-header, затем содержит по записи на case. Артефакты
-самодостаточны: model path, version backend, SHA-256 корпуса, режим logits и
-top-k. Их удобно сохранять между коммитами и сравнивать тем же `compare`.
+The JSONL starts with a run header, then has one record per case. Artifacts are
+self-contained: model path, backend version, corpus SHA-256, logits mode and
+top-k. They are convenient to keep between commits and compare with the same `compare`.
 
-CPU-тесты harness:
+Harness CPU tests:
 
 ```bash
 python3 -m unittest discover -s bench/tests -v
 cargo test -p qwc-engine --bin eval
 ```
 
-`--fail-on-threshold` возвращает ненулевой exit status и предназначен для CI.
+`--fail-on-threshold` returns a nonzero exit status and is meant for CI.
 
-## Зафиксированный прогон 2026-09-11
+## Recorded run 2026-09-11
 
-Полный отчёт лежит в `bench/results/report.md`, исходные JSONL — рядом. На
-RTX 5090 32 GB практическим reference стал vLLM 0.28.0: Transformers 5.16.1
-не смог исполнить packed checkpoint в заданной памяти.
+The full report is in `bench/results/report.md`, the source JSONL next to it. On the
+RTX 5090 32 GB the practical reference became vLLM 0.28.0: Transformers 5.16.1
+couldn't run the packed checkpoint within the given memory.
 
-| Кандидат | Покрытие | Greedy prefix | Top-1 | Top-20 Jaccard | Log-prob MAE | Результат |
+| Candidate | Coverage | Greedy prefix | Top-1 | Top-20 Jaccard | Log-prob MAE | Result |
 |---|---:|---:|---:|---:|---:|---|
-| qwc batch 1 | 14/14 | 1.000 | 1.000 | 0.782 | 0.364 | все 120 token IDs совпали; строгий calibration gate не пройден |
-| qwc batch 8 | 14/14 | 0.967 | 0.991 | 0.772 | 0.436 | одна развилка в `math`, шаг 8; строгий gate не пройден |
+| qwc batch 1 | 14/14 | 1.000 | 1.000 | 0.782 | 0.364 | all 120 token IDs matched; strict calibration gate not passed |
+| qwc batch 8 | 14/14 | 0.967 | 0.991 | 0.772 | 0.436 | one divergence in `math`, step 8; strict gate not passed |
 
-У batch 1 генерация совпала с vLLM на каждом шаге, включая длины 63/64/65,
-127/128/129 и 601. Это сильная проверка вычислительного тракта, но не
-доказательство численной эквивалентности: MAE общих top-20 log-probabilities
-выше порога 0.25, а максимальная дельта 3.868 пришлась на `long-601`.
+At batch 1 generation matched vLLM at every step, including lengths 63/64/65,
+127/128/129 and 601. That's a strong check of the compute path, but not
+proof of numerical equivalence: the MAE of shared top-20 log-probabilities
+is above the 0.25 threshold, and the max delta of 3.868 fell on `long-601`.
 
-Batch 8 отличается только в `math`: первые восемь токенов совпадают, затем
-vLLM выбирает token 6558, а qwc — 271. Остальные 13 cases совпадают целиком.
-Вероятные места накопления ошибки — FP8 embedding/lm_head, FP8 KV и точность
-DeltaNet state; этот прогон их не локализует, поэтому причина пока не
-приписывается одному кернелу.
+Batch 8 differs only in `math`: the first eight tokens match, then
+vLLM picks token 6558 and qwc picks 271. The other 13 cases match entirely.
+Likely places of error accumulation are FP8 embedding/lm_head, FP8 KV and DeltaNet state
+precision; this run doesn't localize them, so the cause is not yet
+attributed to a single kernel.
 
-Статус остальных runtime и причины отсутствия строгого результата записаны в
-`bench/results/README.md`. В частности, SGLang 0.5.19 загрузил исходный NVFP4
-checkpoint, но его первый FP4 warmup потребовал FlashInfer JIT и полный CUDA
-SDK. На этой рабочей станции прогон был остановлен после потери отзывчивости
-хоста; corpus result не публикуется.
+The status of the other runtimes and the reasons for no strict result are recorded in
+`bench/results/README.md`. In particular, SGLang 0.5.19 loaded the original NVFP4
+checkpoint, but its first FP4 warmup required FlashInfer JIT and the full CUDA
+SDK. On this workstation the run was stopped after the host became
+unresponsive; no corpus result is published.

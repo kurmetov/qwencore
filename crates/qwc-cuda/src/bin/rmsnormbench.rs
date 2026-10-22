@@ -1,4 +1,4 @@
-//! Decode-бенчмарк RMSNorm + dynamic NVFP4 quantization.
+//! Decode benchmark of RMSNorm + dynamic NVFP4 quantization.
 //! `cargo run --release -p qwc-cuda --bin rmsnormbench`
 
 use qwc_core::arch::HIDDEN_SIZE;
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "RMSNorm -> NVFP4 decode producer, RTX 5090 ({} SM)",
         device.sm_count
     );
-    println!("hidden={HIDDEN_SIZE}; median из {SAMPLES} серий по {ITERATIONS} итераций\n");
+    println!("hidden={HIDDEN_SIZE}; median of {SAMPLES} series of {ITERATIONS} iterations\n");
     println!(
         "  {:>5} | {:>8} | {:>11} | {:>8} | {:>13} | {:>8}",
         "batch", "separate", "fused", "speedup", "+res separate", "+res fused"

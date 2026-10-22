@@ -1,27 +1,27 @@
-// Gated DeltaNet: рекуррентный шаг decode и чанковый скан prefill.
+// Gated DeltaNet: recurrent decode step and chunked prefill scan.
 //
-// 48 из 64 слоёв Qwen3.8 — линейное внимание с рекуррентным состоянием
-// S размера [48 голов, 128, 128]. На каждый токен состояние читается и
-// переписывается целиком: при batch=32 это 21% всего трафика decode-шага,
-// вдвое больше KV-кэша.
+// 48 of Qwen3.8's 64 layers are linear attention with a recurrent state
+// S of size [48 heads, 128, 128]. For every token the state is read and
+// rewritten in full: at batch=32 that's 21% of all decode-step traffic,
+// twice the KV cache.
 //
-// Рекуррентность:
+// Recurrence:
 //     S_t = a * S (I - b k k^T) + b v k^T = a*S + b(v - a*(S k)) k^T
 //     o_t = S_t q = a*(S q) + b(v - a*(S k)) * (k . q)
 //
-// Отсюда главное свойство реализации: S k и S q считаются за ОДИН проход,
-// после чего строка состояния остаётся в регистрах и переписывается на месте.
-// Одно чтение и одна запись вместо трёх проходов по памяти.
+// Hence the key property of the implementation: S k and S q are computed in ONE pass,
+// after which the state row stays in registers and is rewritten in place.
+// One read and one write instead of three passes over memory.
 //
-// Раскладка блока: варп владеет строкой состояния. 32 потока x 4 элемента =
-// ровно 128, доступ вектором по 8 байт даёт полностью слитые 256-байтные
-// транзакции на варп.
+// Block layout: a warp owns a state row. 32 threads x 4 elements =
+// exactly 128, 8-byte vector access gives fully coalesced 256-byte
+// transactions per warp.
 //
-// Строки состояния дополнительно разбиваются между блоками по gridDim.z.
-// Без этого при batch=1 запускается всего 48 блоков (по одному на v-голову)
-// на 170 SM, и три четверти чипа простаивает: замер давал 24% пропускной
-// способности вместо 95%. Разбиение независимо, потому что строки состояния
-// обновляются независимо друг от друга — связывает их только скаляр k.q.
+// State rows are additionally split across blocks via gridDim.z.
+// Without this, batch=1 launches only 48 blocks (one per v head)
+// on 170 SMs, and three quarters of the chip sit idle: measured 24% of
+// bandwidth instead of 95%. The split is independent because state rows
+// are updated independently of each other — only the scalar k.q links them.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -35,9 +35,9 @@ constexpr int kDk = 128;        // linear_key_head_dim
 constexpr int kDv = 128;        // linear_value_head_dim
 constexpr int kHv = 48;         // linear_num_value_heads
 constexpr int kHk = 16;         // linear_num_key_heads
-constexpr int kRatio = kHv / kHk;  // k/q броадкастятся на v-головы 1:3
+constexpr int kRatio = kHv / kHk;  // k/q are broadcast onto v heads 1:3
 constexpr int kPerThread = kDk / 32;
-constexpr int kBlock = 256;     // 8 варпов -> 8 строк состояния за итерацию
+constexpr int kBlock = 256;     // 8 warps -> 8 state rows per iteration
 
 __device__ __forceinline__ float warp_sum(float v) {
     #pragma unroll
@@ -47,12 +47,12 @@ __device__ __forceinline__ float warp_sum(float v) {
     return v;
 }
 
-// Две редукции за один проход по бабочке: шагов столько же, сколько у одной,
-// а результат остаётся во всех дорожках — броадкаст с нулевой дорожки не нужен.
+// Two reductions in one butterfly pass: as many steps as for one,
+// and the result stays in all lanes — no broadcast from lane zero needed.
 //
-// Третьей здесь была k.q. Она одна на голову и не зависит от строки
-// состояния, поэтому её считает prepare, а не 128 строк каждой из трёх
-// v-голов по разу на токен.
+// The third one here used to be k.q. There's one per head and it doesn't depend on the state
+// row, so prepare computes it, rather than the 128 rows of each of three
+// v heads once per token.
 __device__ __forceinline__ void warp_sum2(float& a, float& b) {
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
@@ -61,8 +61,8 @@ __device__ __forceinline__ void warp_sum2(float& a, float& b) {
     }
 }
 
-// Та же бабочка на N независимых сумм: шагов столько же, сколько у одной, а
-// цепочек — N, и латентность shfl перекрывается ими, а не простоем.
+// The same butterfly over N independent sums: as many steps as for one, but
+// N chains, and shfl latency is hidden by them rather than by idling.
 template <int N>
 __device__ __forceinline__ void warp_sum_n(float (&vals)[N]) {
     #pragma unroll
@@ -74,28 +74,28 @@ __device__ __forceinline__ void warp_sum_n(float (&vals)[N]) {
     }
 }
 
-// Строк состояния на варп в prefill. Одна строка означала, что все восемь
-// варпов блока грузят одну и ту же строку k и q (адрес зависит только от
-// дорожки), и так же делают все 16 блоков по z: k и q читались по 128 раз.
-// Здесь же лежит и вторая беда — бабочка на двух значениях упиралась в
-// латентность shfl. Обе лечатся одним: варп ведёт kRows строк сразу.
+// State rows per warp in prefill. One row meant that all eight
+// warps of a block load the same k and q row (the address depends only on the
+// lane), and so do all 16 blocks along z: k and q were read 128 times.
+// The second problem lies here too — a butterfly over two values was bound by
+// shfl latency. Both are cured by one thing: a warp handles kRows rows at once.
 constexpr int kPrefillRows = 4;
-// Prefill берёт свой размер блока: строк на голову 128, и при kPrefillRows их
-// хватает либо на много мелких блоков, либо на мало крупных. Мелкие ровнее
-// ложатся на 170 SM.
+// Prefill takes its own block size: 128 rows per head, and with kPrefillRows they
+// suffice either for many small blocks or for few large ones. Small ones spread
+// more evenly over 170 SMs.
 constexpr int kPrefillBlock = 64;
 
-// Чанк матричной (WY) формы: она меняет проход по токенам на пять матричных
-// умножений на тайл. 64 — компромисс: меньше, и подготовка (её стоимость на
-// токен не зависит от длины чанка) перестаёт окупаться; больше, и матрица
-// 64x64 на голову с её обратной перестаёт помещаться в shared блока.
+// Chunk of the matrix (WY) form: it replaces the pass over tokens with five matrix
+// multiplies per tile. 64 is a compromise: smaller, and preparation (whose per-token
+// cost doesn't depend on chunk length) stops paying off; larger, and the
+// 64x64 per-head matrix with its inverse stops fitting in a block's shared memory.
 constexpr int kWyChunk = 64;
 
-// Шаг рекуррентности для одной строки состояния. Вынесен из кернелов, потому
-// что строку decode читает из двух разных хранений (bf16 и int8), а
-// расходиться этой математике между ними нельзя.
+// Recurrence step for one state row. Pulled out of the kernels because
+// decode reads the row from two different storages (bf16 and int8), and
+// this math must not diverge between them.
 //
-// Возвращает вклад строки в выход; состояние `s` обновляется на месте.
+// Returns the row's contribution to the output; the state `s` is updated in place.
 __device__ __forceinline__ float delta_row_step(
     float (&s)[kPerThread], const float* sk, const float* sq,
     int base, float a, float bt, float v_row, float kq_token) {
@@ -119,20 +119,20 @@ __device__ __forceinline__ float delta_row_step(
 }
 
 // ---------------------------------------------------------------------------
-// Восьмибитное хранение состояния
+// Eight-bit state storage
 // ---------------------------------------------------------------------------
 //
-// Строка состояния (128 элементов по dk) хранится как int8 плюс один
-// масштаб f32 на строку. Масштаб именно построчный: вдоль строки идут оба
-// скалярных произведения S k и S q, так что вся сумма делит один масштаб.
+// A state row (128 elements along dk) is stored as int8 plus one
+// f32 scale per row. The scale is per row specifically: both dot products
+// S k and S q run along a row, so the whole sum shares one scale.
 //
-// int8, а не e4m3: строки плоские (пик близок к RMS), и четыре бита
-// экспоненты им не нужны — int8 отдаёт их мантиссе и вчетверо точнее при том
-// же байте (`bench/results/delta-state-8bit.md`).
+// int8, not e4m3: rows are flat (the peak is close to RMS), and they don't need four
+// exponent bits — int8 gives them to the mantissa and is four times more accurate at the same
+// byte (`bench/results/delta-state-8bit.md`).
 //
-// Варп владеет строкой, поэтому на поток приходится ровно kPerThread = 4
-// байта: 32 дорожки дают слитую 128-байтовую транзакцию, как и bf16-путь со
-// своими 256 байтами.
+// A warp owns a row, so each thread gets exactly kPerThread = 4
+// bytes: 32 lanes give a coalesced 128-byte transaction, like the bf16 path with
+// its 256 bytes.
 
 __device__ __forceinline__ void state_load_int8(
     const int8_t* __restrict__ row, float scale, int lane, float (&s)[kPerThread]) {
@@ -143,9 +143,9 @@ __device__ __forceinline__ void state_load_int8(
     s[3] = (float)packed.w * scale;
 }
 
-// Пишет строку и возвращает её масштаб. Масштаб считается по максимуму строки,
-// поэтому перед записью нужна редукция по варпу — она же единственная цена
-// 8-битного хранения сверх самой упаковки.
+// Writes a row and returns its scale. The scale is computed from the row max,
+// so a warp reduction is needed before the write — it's also the only cost of
+// 8-bit storage beyond the packing itself.
 __device__ __forceinline__ float state_store_int8(
     int8_t* __restrict__ row, int lane, const float (&s)[kPerThread]) {
     float peak = 0.0f;
@@ -197,11 +197,11 @@ __global__ __launch_bounds__(kBlock) void delta_decode_int8_kernel(
 
     __shared__ float sk[kDk];
     __shared__ float sq[kDk];
-    // Масштабы блока проходят через shared, а не через глобальную память
-    // построчно. Запись четырёх байт одной дорожкой — это частичная
-    // транзакция на строку состояния, и она стоила 2.97 мс из 3.3 мс
-    // накладных 8-битного хранения при c=32: дороже всей квантизации и всего
-    // трафика самого состояния вместе взятых.
+    // Block scales go through shared rather than global memory
+    // row by row. A four-byte write from one lane is a partial
+    // transaction per state row, and it cost 2.97 ms of the 3.3 ms
+    // 8-bit storage overhead at c=32: more than all the quantization and all
+    // the traffic of the state itself combined.
     __shared__ float srow_scale[kDv];
 
     const float* kp = k + (size_t)(b * kHk + hk) * kDk;
@@ -224,8 +224,8 @@ __global__ __launch_bounds__(kBlock) void delta_decode_int8_kernel(
     const float* vp = v + (size_t)(b * kHv + h) * kDv;
     float* op = out + (size_t)(b * kHv + h) * kDv;
 
-    // Чтение масштабов — одним слитным обращением на блок, в той же
-    // загрузке, что k и q.
+    // Scales are read with one coalesced access per block, in the same
+    // load as k and q.
     const int rows_here = row_end - row_begin;
     for (int i = threadIdx.x; i < rows_here; i += kBlock) {
         srow_scale[i] = scales[row_begin + i];
@@ -255,10 +255,10 @@ __global__ __launch_bounds__(kBlock) void delta_decode_int8_kernel(
     }
 }
 
-// Перекладка слота между хранениями. Префилл последовательности идёт по
-// расквантованной bf16-копии и квантуется один раз в конце промпта: если
-// его сегменты перезапускать с 8-битного состояния, весь остаток промпта
-// считается с испорченного S_0, и MAE подскакивает в 11 раз на границе
+// Moving a slot between storages. A sequence's prefill runs on a
+// dequantized bf16 copy and is quantized once at the end of the prompt: if
+// its segments were restarted from the 8-bit state, the whole rest of the prompt
+// would be computed from a spoiled S_0, and MAE jumps 11x at the boundary
 // `PREFILL_CHUNK_SIZE` (`bench/results/delta-state-8bit.md`).
 __global__ __launch_bounds__(kBlock) void delta_state_pack_kernel(
     const __nv_bfloat16* __restrict__ source,
@@ -325,12 +325,12 @@ __global__ __launch_bounds__(kBlock) void delta_state_unpack_kernel(
 __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
     __nv_bfloat16* __restrict__ state,   // [B, kHv, kDv, kDk]
     const uint32_t* __restrict__ state_slots,
-    const float* __restrict__ q,         // [B, kHk, kDk], L2-нормирован
-    const float* __restrict__ k,         // [B, kHk, kDk], L2-нормирован
+    const float* __restrict__ q,         // [B, kHk, kDk], L2-normalized
+    const float* __restrict__ k,         // [B, kHk, kDk], L2-normalized
     const float* __restrict__ v,         // [B, kHv, kDv]
     const float* __restrict__ alpha,     // [B, kHv]
     const float* __restrict__ beta,      // [B, kHv]
-    const float* __restrict__ kq,        // [B, kHk], скаляр k.q из prepare
+    const float* __restrict__ kq,        // [B, kHk], scalar k.q from prepare
     float* __restrict__ out)             // [B, kHv, kDv]
 {
     const int h = blockIdx.x;
@@ -338,7 +338,7 @@ __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
     const int state_slot = state_slots == nullptr ? b : state_slots[b];
     const int hk = h / kRatio;
 
-    // Диапазон строк, за который отвечает этот блок.
+    // The range of rows this block is responsible for.
     const int rows_per_block = kDv / gridDim.z;
     const int row_begin = blockIdx.z * rows_per_block;
     const int row_end = row_begin + rows_per_block;
@@ -356,8 +356,8 @@ __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
 
     const float a = alpha[b * kHv + h];
     const float bt = beta[b * kHv + h];
-    // Скаляр k . q общий для всех строк и обеих веток: его считает prepare,
-    // поэтому decode и повторный prefill читают ровно одно и то же число.
+    // The scalar k . q is shared by all rows and both branches: prepare computes it,
+    // so decode and a repeated prefill read exactly the same number.
     const float kq_token = kq[b * kHk + hk];
 
     const int warp = threadIdx.x >> 5;
@@ -371,7 +371,7 @@ __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
     for (int row = row_begin + warp; row < row_end; row += kWarps) {
         float2* srow = reinterpret_cast<float2*>(S + (size_t)row * kDk);
 
-        // Одно 8-байтовое чтение на поток: 4 bf16, слитые 256 байт на варп.
+        // One 8-byte read per thread: 4 bf16, coalesced 256 bytes per warp.
         float2 packed = srow[lane];
         __nv_bfloat162 p0 = *reinterpret_cast<__nv_bfloat162*>(&packed.x);
         __nv_bfloat162 p1 = *reinterpret_cast<__nv_bfloat162*>(&packed.y);
@@ -382,8 +382,8 @@ __global__ __launch_bounds__(kBlock) void delta_decode_kernel(
         s[2] = __bfloat162float(p1.x);
         s[3] = __bfloat162float(p1.y);
 
-        // Оба матвека за один проход, пока строка в регистрах, и обновление
-        // на месте: повторное чтение не нужно.
+        // Both matvecs in one pass while the row is in registers, and the update
+        // in place: no re-read needed.
         const float contribution = delta_row_step(
             s, sk, sq, lane * kPerThread, a, bt, vp[row], kq_token);
 
@@ -420,15 +420,15 @@ __global__ __launch_bounds__(kPrefillBlock) void delta_prefill_kernel(
     float* __restrict__ out,
     int state_slot,
     int tokens) {
-    // Варп владеет строкой состояния и идёт по токенам сам. Прежняя раскладка
-    // ставила на токен три __syncthreads() и считала k.q одним варпом из
-    // восьми, пока остальные стояли на барьере: рекуррентность и так
-    // последовательна, а барьеры добавляли к ней блочную синхронизацию.
-    // Строки состояния независимы — связывает их только скаляр k.q, который
-    // варп теперь считает себе сам, в той же бабочке, что u и w.
+    // A warp owns a state row and walks the tokens by itself. The old layout
+    // put three __syncthreads() per token and computed k.q with one warp out of
+    // eight while the others waited at the barrier: the recurrence is sequential
+    // anyway, and the barriers added block synchronization on top of it.
+    // State rows are independent — only the scalar k.q links them, which
+    // the warp now computes for itself, in the same butterfly as u and w.
     constexpr int kWarps = kPrefillBlock / 32;
     constexpr int kRows = kPrefillRows;
-    static_assert(kDv % (kWarps * kRows) == 0, "строки состояния делятся между варпами");
+    static_assert(kDv % (kWarps * kRows) == 0, "state rows are split among warps");
 
     const int h = blockIdx.x;
     const int hk = h / kRatio;
@@ -451,9 +451,9 @@ __global__ __launch_bounds__(kPrefillBlock) void delta_prefill_kernel(
         s[r][3] = __bfloat162float(p1.y);
     }
 
-    // Вход токена не зависит от состояния, поэтому загрузка следующего токена
-    // выдаётся до того, как посчитан текущий: рекуррентность последовательна,
-    // а её ожидание памяти — нет.
+    // A token's input doesn't depend on the state, so the next token's load
+    // is issued before the current one is computed: the recurrence is sequential,
+    // but its waiting on memory isn't.
     const float* krow = k + (size_t)hk * kDk + base;
     const float* qrow = q + (size_t)hk * kDk + base;
     float4 kv = *reinterpret_cast<const float4*>(krow);
@@ -467,8 +467,8 @@ __global__ __launch_bounds__(kPrefillBlock) void delta_prefill_kernel(
             qv = *reinterpret_cast<const float4*>(qrow + (size_t)(token + 1) * kHk * kDk);
         }
 
-        // Первые kRows сумм — u каждой строки, вторые — её w. Одна бабочка на
-        // все: k и q при этом прочитаны один раз на kRows строк, а не на одну.
+        // The first kRows sums are each row's u, the second its w. One butterfly for
+        // all: k and q are read once per kRows rows, not per one.
         float red[2 * kRows];
         #pragma unroll
         for (int r = 0; r < kRows; ++r) {
@@ -606,12 +606,12 @@ __global__ __launch_bounds__(32) void wy_gemm_kernel(
     }
 }
 
-// Тайлы q и k лежат как [чанк][голова][токен][измерение]: индекс батча в
-// `wy_gemm_kernel` — это chunk * головы + голова, поэтому раздача одной
-// k-головы на три v-головы (`b_group`) остаётся делением индекса.
+// The q and k tiles are laid out as [chunk][head][token][dim]: the batch index in
+// `wy_gemm_kernel` is chunk * heads + head, so handing one
+// k head to three v heads (`b_group`) remains an index division.
 //
-// Ни одна фаза до слитого ядра не зависит от состояния, поэтому все они
-// считаются сразу по всем чанкам сегмента — по одному запуску на слой.
+// No phase before the fused kernel depends on the state, so all of them
+// are computed for all chunks of the segment at once — one launch per layer.
 __global__ void wy_prepare_qk_kernel(
     const float* __restrict__ q,
     const float* __restrict__ k,
@@ -640,13 +640,13 @@ __global__ void wy_prepare_qk_kernel(
     key_tile[index] = kv;
 }
 
-// Затухание копится в логарифмах, а не произведением.
+// Decay is accumulated in logarithms, not as a product.
 //
-// Произведение alpha по чанку — это то самое gamma_t, на которое домножается
-// вклад входного состояния. На 64 токенах оно легко уходит под 1e-38: при
-// alpha = 0.2 уже к концу чанка. Дальше отношения gamma_t / gamma_r
-// превращаются в 0/0, и скан выдаёт NaN. Разность логарифмов всегда конечна,
-// а exp от неё либо честный ноль, либо число.
+// The product of alpha over a chunk is exactly the gamma_t that multiplies
+// the input state's contribution. Over 64 tokens it easily drops below 1e-38: at
+// alpha = 0.2 already by the end of the chunk. Then the ratios gamma_t / gamma_r
+// turn into 0/0, and the scan outputs NaN. A difference of logarithms is always finite,
+// and exp of it is either an honest zero or a number.
 __global__ void wy_decay_kernel(
     const float* __restrict__ alpha,
     float* __restrict__ log_decay,
@@ -661,8 +661,8 @@ __global__ void wy_decay_kernel(
     float sum = 0.0f;
     for (int token = 0; token < kWyChunk; ++token) {
         if (start + token < tokens) {
-            // Нижняя граница держит логарифм конечным: alpha = 0 дало бы
-            // -inf в обеих частях разности и NaN вместо нуля.
+            // The lower bound keeps the logarithm finite: alpha = 0 would give
+            // -inf on both sides of the difference and NaN instead of zero.
             sum += __logf(fmaxf(alpha[(size_t)(start + token) * kHv + head],
                                 1.0e-38f));
             destination[token] = sum;
@@ -672,15 +672,15 @@ __global__ void wy_decay_kernel(
     }
 }
 
-// Множители причинной части и обратная к единично-нижнетреугольной A = I + M.
+// Causal-part multipliers and the inverse of the unit lower-triangular A = I + M.
 //
-// Обе строятся из одних и тех же граммов и gamma, поэтому считаются одним
-// блоком: M не выходит за пределы shared и в глобальную память не попадает.
-// Прямая подстановка идёт по столбцам, а столбцы независимы — поток владеет
-// столбцом и читает только его, так что барьер нужен один, после сборки M.
-// Раньше подстановка шла в пространстве значений (128 измерений на токен) и
-// перечитывала коэффициенты из глобальной памяти: 50 МБ на чанк слоя и две
-// трети времени всего скана.
+// Both are built from the same grams and gamma, so they're computed in one
+// block: M doesn't leave shared and never reaches global memory.
+// Forward substitution goes by columns, and columns are independent — a thread owns
+// a column and reads only it, so one barrier is needed, after M is assembled.
+// Substitution used to run in value space (128 dims per token) and
+// re-read coefficients from global memory: 50 MB per layer chunk and two
+// thirds of the whole scan's time.
 __global__ __launch_bounds__(kWyChunk) void wy_factor_kernel(
     const float* __restrict__ beta,
     const float* __restrict__ log_decay,
@@ -721,14 +721,14 @@ __global__ __launch_bounds__(kWyChunk) void wy_factor_kernel(
     }
     __syncthreads();
 
-    // Строки за длиной чанка остаются единичными: правая часть там занулена,
-    // так что нули доходят до конца сами, без масок в следующих фазах.
+    // Rows beyond the chunk length stay unit: the right-hand side is zeroed there,
+    // so zeros propagate to the end on their own, without masks in later phases.
     //
-    // Подстановка идёт панелями по 16 строк. Наивная форма читала из shared
-    // дважды на каждую FMA — и множитель, и уже посчитанное значение, — и
-    // упиралась в это, а не в арифметику. В панельной форме значение
-    // предыдущей строки читается один раз на шестнадцать FMA, а внутри
-    // панели вообще живёт в регистрах: обращений к shared вдвое меньше.
+    // Substitution goes in 16-row panels. The naive form read shared
+    // twice per FMA — both the multiplier and the already computed value — and
+    // was bound by that, not by arithmetic. In the panel form the value of
+    // the previous row is read once per sixteen FMAs, and within the
+    // panel it lives in registers entirely: half the shared accesses.
     constexpr int kPanel = 16;
     for (int panel = 0; panel < kWyChunk / kPanel; ++panel) {
         const int base = panel * kPanel;
@@ -760,38 +760,38 @@ __global__ __launch_bounds__(kWyChunk) void wy_factor_kernel(
     }
 }
 
-// Правая часть системы, сразу транспонированная: [голова][измерение][токен].
-// P на входе — это S_0 K^T в той же раскладке, поэтому транспонирования между
-// фазами не нужно ни одного.
+// The system's right-hand side, already transposed: [head][dim][token].
+// P on input is S_0 K^T in the same layout, so not a single transposition
+// is needed between phases.
 // ------------------------------------------------------------------ //
-// Слитый последовательный скан: один запуск на слой вместо восьми на чанк.
+// Fused sequential scan: one launch per layer instead of eight per chunk.
 //
-// Последовательность чанков разорвать нельзя — состояние конца чанка нужно
-// следующему. Но всё, что между ними, помещается в один варп: варп владеет
-// 16 строками состояния (dv) на всю глубину dk и делает над ними пять
-// матричных умножений подряд, ни разу не выкладывая состояние в память.
-// Раньше те же пять умножений были пятью запусками, и состояние ходило в
-// глобальную память и обратно на каждом чанке.
+// The sequence of chunks can't be broken — a chunk's final state is needed by
+// the next one. But everything between them fits in one warp: a warp owns
+// 16 state rows (dv) over the full dk depth and does five
+// matrix multiplies over them in a row, never spilling the state to memory.
+// Before, the same five multiplies were five launches, and the state went to
+// global memory and back on every chunk.
 //
-// Раскладка фрагментов m16n8k16 одна и та же для трёх ролей состояния:
-// аккумулятор (строка dv, столбец dk), операнд A в P = S K^T и операнд B в
-// Q S^T. Во всех трёх дорожка держит строки grp и grp+8 и пару столбцов с
-// pos*2 — поэтому упакованная BF16-копия аккумулятора годится как есть и
-// перекладка не нужна.
+// The m16n8k16 fragment layout is the same for three roles of the state:
+// accumulator (row dv, column dk), operand A in P = S K^T and operand B in
+// Q S^T. In all three a lane holds rows grp and grp+8 and a pair of columns at
+// pos*2 — so the packed BF16 copy of the accumulator works as is and
+// no reshuffle is needed.
 constexpr int kFusedWarps = 4;
 constexpr int kFusedThreads = kFusedWarps * 32;
-constexpr int kFusedRows = 16;                       // dv-строк на варп
+constexpr int kFusedRows = 16;                       // dv rows per warp
 constexpr int kFusedSlice = kFusedWarps * kFusedRows;
 constexpr int kFusedSlices = kDv / kFusedSlice;
-constexpr int kDkTiles = kDk / 8;                    // n-тайлов состояния
-constexpr int kChunkTiles = kWyChunk / 8;            // n-тайлов по токенам
+constexpr int kDkTiles = kDk / 8;                    // state n-tiles
+constexpr int kChunkTiles = kWyChunk / 8;            // n-tiles along tokens
 constexpr int kKeyPad = kDk + 8;
 
 struct WyFusedShared {
     __nv_bfloat16 key[kWyChunk * kKeyPad];
     float gamma[kWyChunk];
-    float weight[kWyChunk];   // gamma_C / gamma_t — вес чанковой границы
-    float decay[kWyChunk];    // beta_t * gamma_t — вклад входного состояния
+    float weight[kWyChunk];   // gamma_C / gamma_t — chunk boundary weight
+    float decay[kWyChunk];    // beta_t * gamma_t — input state contribution
 };
 
 constexpr size_t wy_fused_shared_bytes() { return sizeof(WyFusedShared); }
@@ -814,8 +814,8 @@ __device__ __forceinline__ uint32_t wy_pack_strided(
         | (static_cast<uint32_t>(*reinterpret_cast<const uint16_t*>(high)) << 16);
 }
 
-// Копия строк в shared по 8 элементов (16 байт) за раз. Набивка выбрана так,
-// что шаг ряда кратен 16 байтам, иначе векторная запись развалится.
+// Copies rows into shared 8 elements (16 bytes) at a time. Padding is chosen so
+// that the row stride is a multiple of 16 bytes, otherwise the vector store falls apart.
 template <int kRow, int kPad>
 __device__ __forceinline__ void wy_stage_rows(
     const __nv_bfloat16* __restrict__ source, __nv_bfloat16* destination,
@@ -852,7 +852,7 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
     const int pos = lane & 3;
     const int row0 = blockIdx.y * kFusedSlice + warp * kFusedRows;
 
-    // Состояние: строки row0+grp и row0+grp+8, столбцы tile*8+pos*2 и +1.
+    // State: rows row0+grp and row0+grp+8, columns tile*8+pos*2 and +1.
     float state_acc[kDkTiles][4];
     {
         const __nv_bfloat16* source = state + (size_t)head * kDv * kDk;
@@ -890,8 +890,8 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
             const float value = __expf(cumulative);
             shared.gamma[token] = value;
             if (token < length) {
-                // Вес границы чанка — отношение затуханий, то есть exp от
-                // разности логарифмов: оно не больше единицы при любом alpha.
+                // The chunk boundary weight is a ratio of decays, i.e. exp of
+                // a difference of logarithms: it's at most one for any alpha.
                 shared.weight[token] =
                     __expf(chunk_decay[length - 1] - cumulative);
                 shared.decay[token] =
@@ -903,8 +903,8 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
         }
         __syncthreads();
 
-        // BF16-копия состояния: пара (строка, строка+8) на каждый столбцовый
-        // тайл. Она же операнд A для S K^T и операнд B для Q S^T.
+        // BF16 copy of the state: a (row, row+8) pair for each column
+        // tile. It's also operand A for S K^T and operand B for Q S^T.
         uint32_t state_pack[kDkTiles][2];
         #pragma unroll
         for (int tile = 0; tile < kDkTiles; ++tile) {
@@ -912,7 +912,7 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
             state_pack[tile][1] = wy_pack(state_acc[tile][2], state_acc[tile][3]);
         }
 
-        // P = S_0 K^T: [16 строк dv] x [64 токена].
+        // P = S_0 K^T: [16 dv rows] x [64 tokens].
         float product[kChunkTiles][4] = {};
         #pragma unroll
         for (int group = 0; group < kDk / 16; ++group) {
@@ -930,8 +930,8 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
             }
         }
 
-        // Правая часть: b_t v_t - b_t gamma_t S_0 k_t, сразу в BF16-фрагменты
-        // операнда A для умножения на T^T.
+        // Right-hand side: b_t v_t - b_t gamma_t S_0 k_t, straight into BF16 fragments
+        // of operand A for multiplying by T^T.
         uint32_t right[kChunkTiles][2];
         {
             const __nv_bfloat16* values =
@@ -974,17 +974,17 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
             }
         }
 
-        // O = diag(gamma) Q S_0^T + F C. Строки здесь — токены, столбцы —
-        // 16 dv-строк варпа, поэтому m-тайлов четыре, а n-тайлов два.
+        // O = diag(gamma) Q S_0^T + F C. Rows here are tokens, columns are
+        // the warp's 16 dv rows, so there are four m-tiles and two n-tiles.
         constexpr int kOutRowTiles = kWyChunk / 16;
         float output[kOutRowTiles][2][4] = {};
         #pragma unroll
         for (int group = 0; group < kDk / 16; ++group) {
             #pragma unroll
             for (int mt = 0; mt < kOutRowTiles; ++mt) {
-                // Q читается фрагментами прямо из глобальной памяти: все
-                // варпы CTA берут одни и те же элементы, их держит L1, а
-                // освободившиеся 17 КБ shared дороже этих обращений.
+                // Q is read as fragments straight from global memory: all
+                // warps of a CTA take the same elements, L1 holds them, and
+                // the 17 KB of shared freed up is worth more than these accesses.
                 const __nv_bfloat16* row = query_tile + qk_base
                     + (size_t)(mt * 16 + grp) * kDk + group * 16;
                 const __nv_bfloat16* row8 = query_tile + qk_base
@@ -1014,7 +1014,7 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
                 output[mt][nt][3] *= g8;
             }
         }
-        // C в роли операнда B: n — это dv-строка, k — токен.
+        // C as operand B: n is a dv row, k is a token.
         uint32_t coefficient_pack[kChunkTiles][2];
         #pragma unroll
         for (int tile = 0; tile < kChunkTiles; ++tile) {
@@ -1104,8 +1104,8 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
         }
     }
 
-    // Состояние последовательности переживает шаг, поэтому пишется обратно
-    // один раз, в конце.
+    // The sequence state outlives the step, so it's written back
+    // once, at the end.
     {
         __nv_bfloat16* destination = state + (size_t)head * kDv * kDk;
         #pragma unroll
@@ -1121,9 +1121,9 @@ __global__ __launch_bounds__(kFusedThreads, 1) void wy_fused_scan_kernel(
     }
 }
 
-// Тайл значений в BF16 и транспонированный: [чанк][голова][измерение][токен].
-// Слитое ядро читает его в раскладке аккумулятора, где строка — измерение, а
-// столбец — токен; транспонировать там было бы негде.
+// Value tile in BF16, transposed: [chunk][head][dim][token].
+// The fused kernel reads it in accumulator layout, where a row is a dim and
+// a column is a token; there would be nowhere to transpose there.
 __global__ __launch_bounds__(256) void wy_prepare_value_kernel(
     const float* __restrict__ v,
     const float* __restrict__ beta,
@@ -1178,9 +1178,9 @@ static void launch_wy_gemm(
 
 } // namespace
 
-// Число блоков на голову подбирается так, чтобы занять все SM.
-// Ограничения: делитель kDv, и на блок должно приходиться не меньше строк,
-// чем в нём варпов, иначе часть варпов простаивает.
+// The number of blocks per head is chosen to occupy all SMs.
+// Constraints: a divisor of kDv, and each block must get at least as many rows
+// as it has warps, otherwise some warps sit idle.
 static int splits_for(int batch) {
     constexpr int kWarps = kBlock / 32;
     constexpr int kMaxSplit = kDv / kWarps;   // 128 / 8 = 16
@@ -1189,12 +1189,12 @@ static int splits_for(int batch) {
     cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
     const int base = kHv * batch;
     if (base >= sms * 2) {
-        return 1;   // блоков и так достаточно
+        return 1;   // already enough blocks
     }
     int want = (sms * 2 + base - 1) / base;
     int split = 1;
     while (split * 2 <= kMaxSplit && split < want) {
-        split *= 2;   // держим делителем kDv
+        split *= 2;   // keep it a divisor of kDv
     }
     return split;
 }
@@ -1236,9 +1236,9 @@ extern "C" cudaError_t qwc_delta_decode_int8(
     return cudaGetLastError();
 }
 
-// Один слот bf16 -> один слот int8 и обратно. Оба конца адресуются слотами,
-// потому что bf16-копия у движка одна, а 8-битных слотов столько же, сколько
-// последовательностей.
+// One bf16 slot -> one int8 slot and back. Both ends are addressed by slots,
+// because the engine has one bf16 copy, and as many 8-bit slots as there are
+// sequences.
 extern "C" cudaError_t qwc_delta_state_pack(
     const void* source, void* packed, float* scales,
     int source_capacity, int source_slot,
@@ -1304,9 +1304,9 @@ extern "C" cudaError_t qwc_delta_prefill(
     beta += (size_t)row_offset * kHv;
     kq += (size_t)row_offset * kHk;
     out += (size_t)row_offset * kHv * kDv;
-    // kPrefillRows строк на варп, kPrefillBlock/32 варпа на блок: 48 голов x
-    // 16 блоков = 768 блоков на 170 SM. splits_for здесь не нужен — prefill
-    // всегда идёт одной последовательностью, и делить нечего, кроме строк.
+    // kPrefillRows rows per warp, kPrefillBlock/32 warps per block: 48 heads x
+    // 16 blocks = 768 blocks on 170 SMs. splits_for isn't needed here — prefill
+    // always runs one sequence, and there's nothing to split except rows.
     dim3 grid(kHv, 1, kDv / ((kPrefillBlock / 32) * kPrefillRows));
     if (round_state_per_token) {
         delta_prefill_kernel<true><<<grid, kPrefillBlock, 0, stream>>>(
@@ -1363,7 +1363,7 @@ extern "C" cudaError_t qwc_delta_prefill_wy(
     auto* value_tile = static_cast<__nv_bfloat16*>(value_tile_pointer);
     auto* log_decay = static_cast<float*>(log_decay_pointer);
 
-    // Дальше все координаты строк — внутри выбранного сегмента арены.
+    // From here on all row coordinates are within the chosen arena segment.
     q += (size_t)row_offset * kHk * kDk;
     k += (size_t)row_offset * kHk * kDk;
     v += (size_t)row_offset * kHv * kDv;
@@ -1380,14 +1380,14 @@ extern "C" cudaError_t qwc_delta_prefill_wy(
     __nv_bfloat16* selected_state =
         state_pool + (size_t)state_slot * kStateElements;
 
-    // Подготовка не зависит от состояния и считается сразу по всем чанкам —
-    // по одному запуску на слой. Когда каждая из этих фаз запускалась на
-    // каждый чанк, пусковая задержка стоила больше самой работы.
+    // Preparation doesn't depend on the state and is computed for all chunks at once —
+    // one launch per layer. When each of these phases was launched per
+    // chunk, the launch latency cost more than the work itself.
     wy_prepare_qk_kernel<<<qk_blocks, kThreads, 0, stream>>>(
         q, k, query_tile, key_tile, tokens, chunks);
     wy_decay_kernel<<<decay_blocks, kThreads, 0, stream>>>(
         alpha, log_decay, tokens, chunks);
-    // K K^T и Q K^T общие для трёх v-голов одной k-головы.
+    // K K^T and Q K^T are shared by the three v heads of one k head.
     launch_wy_gemm(
         key_tile, key_tile, gram_kk, nullptr, nullptr, nullptr,
         kWyChunk, kWyChunk, kDk, kHk * chunks,
@@ -1407,9 +1407,9 @@ extern "C" cudaError_t qwc_delta_prefill_wy(
     wy_prepare_value_kernel<<<dim3(kHv, chunks), 256, 0, stream>>>(
         v, beta, value_tile, tokens);
 
-    // Цепочка чанков разорвана быть не может: состояние конца чанка нужно
-    // следующему. Слитое ядро проходит её целиком, держа состояние в
-    // регистрах варпа.
+    // The chain of chunks can't be broken: a chunk's final state is needed by
+    // the next one. The fused kernel walks it whole, keeping the state in
+    // warp registers.
     static const cudaError_t opted = cudaFuncSetAttribute(
         wy_fused_scan_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -1425,29 +1425,29 @@ extern "C" cudaError_t qwc_delta_prefill_wy(
 }
 
 // ---------------------------------------------------------------------------
-// Перекладка состояния на 8-битную сетку
+// Snapping the state onto an 8-bit grid
 // ---------------------------------------------------------------------------
 //
-// Состояние остаётся в bf16: кернел только сажает значения на ту сетку, на
-// которой они оказались бы при 8-битном хранении, и возвращает обратно.
-// Биты теряются ровно те же, поэтому diff-eval даёт настоящий ответ по
-// точности, пока раскладка, пулы и бюджет ещё не тронуты.
+// The state stays in bf16: the kernel only snaps values onto the grid
+// they would land on with 8-bit storage, and writes them back.
+// Exactly the same bits are lost, so diff-eval gives the real accuracy answer
+// while the layout, pools and budget are still untouched.
 //
-// Масштаб — на строку состояния (128 элементов по dk): именно вдоль строки
-// идут оба скалярных произведения S k и S q, так что вся сумма делит один
-// масштаб. Строки плоские (пик близок к RMS), поэтому int8 с масштабом по
-// максимуму на строке бьёт e4m3 вчетверо при том же байте: e4m3 тратит
-// четыре бита на экспоненту, которая строке не нужна.
+// The scale is per state row (128 elements along dk): it's along a row that
+// both dot products S k and S q run, so the whole sum shares one
+// scale. Rows are flat (the peak is close to RMS), so int8 with a per-row max
+// scale beats e4m3 fourfold at the same byte: e4m3 spends
+// four bits on an exponent the row doesn't need.
 //
-// Обратный ход пишет bf16, то есть добавляет собственное округление bf16
-// поверх 8-битного. Настоящее хранение деквантует в fp32-регистры и этой
-// добавки не имеет, так что замер через этот кернел — оценка сверху.
+// The reverse pass writes bf16, i.e. adds its own bf16 rounding
+// on top of the 8-bit one. Real storage dequantizes into fp32 registers and doesn't
+// have this extra, so a measurement through this kernel is an upper bound.
 
 namespace {
 
 constexpr int kRequantBlock = 256;
 
-// 1 — int8 с построчным масштабом, 2 — e4m3 с построчным масштабом.
+// 1 — int8 with per-row scale, 2 — e4m3 with per-row scale.
 template <int kMode>
 __global__ __launch_bounds__(kRequantBlock) void delta_state_requantize_kernel(
     __nv_bfloat16* __restrict__ state,
@@ -1522,8 +1522,8 @@ __global__ __launch_bounds__(kRequantBlock) void delta_state_requantize_kernel(
 
 }  // namespace
 
-// `state_slots` задаёт слоты поимённо (decode); при nullptr берётся
-// `count` слотов подряд с `first_slot` (один сегмент prefill).
+// `state_slots` gives slots by name (decode); with nullptr,
+// `count` consecutive slots starting at `first_slot` are taken (one prefill segment).
 extern "C" cudaError_t qwc_delta_state_requantize(
     void* state, const uint32_t* state_slots,
     int first_slot, int state_capacity, int count, int mode,

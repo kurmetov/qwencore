@@ -1,34 +1,34 @@
-# Узкие формы W4A4 — 2026-09-12
+# Narrow W4A4 shapes — 2026-09-12
 
-## Что было не так
+## What was wrong
 
-Микрозамер по batch до 512 показал: `down_proj` [5120, 17408] стоит намертво
-на ~780 ГБ/с при любом batch от 3 до 256, тогда как `gate_proj` той же массы
-весов берёт 1335 ГБ/с. Разница только в форме.
+A microbenchmark over batch up to 512 showed: `down_proj` [5120, 17408] is stuck
+at ~780 GB/s at any batch from 3 to 256, while `gate_proj` with the same weight
+mass gets 1335 GB/s. The only difference is the shape.
 
-Тайл GEMM'а 128x128 нарезает выход на `ceil(M/128) * ceil(N/128)` блоков. Для
-`gate/up` при M<=128 это 136 блоков на 170 SM, а для `down` — 40: три четверти
-чипа простаивает, и полоса режется ровно в этой пропорции.
+The 128x128 GEMM tile cuts the output into `ceil(M/128) * ceil(N/128)` blocks. For
+`gate/up` at M<=128 that's 136 blocks on 170 SMs, and for `down` 40: three quarters
+of the chip sit idle, and bandwidth is cut in exactly that proportion.
 
-## Что сделано
+## What was done
 
-Вторая инстанция кернела: cooperative + stream-K-планировщик, который режет
-задачу по K и добирает занятость. Ping-pong stream-K не поддерживает
-(статический assert в CUTLASS), поэтому именно вторая, а не смена планировщика
-у существующей. Выбор по форме: узкой задача считается, когда тайлов вдвое
-меньше, чем SM. Порог с запасом — ровно на границе stream-K уже проигрывает
-(down при M=512: 78.3 против 76.4 мкс), потому что редукция стоит дороже
-добавленной занятости.
+A second kernel instance: cooperative + a stream-K scheduler, which splits
+the problem along K and makes up occupancy. Ping-pong doesn't support stream-K
+(a static assert in CUTLASS), hence a second instance rather than changing the scheduler
+of the existing one. Choice by shape: a problem counts as narrow when there are half as many
+tiles as SMs. The threshold has margin — right at the boundary stream-K already loses
+(down at M=512: 78.3 vs 76.4 µs), because the reduction costs more than
+the added occupancy.
 
-Побочно всплыл баг сайзинга: требование к workspace не монотонно по M —
-чем меньше M, тем больше блоков участвует в редукции. Арена мерила себя одним
-значением на максимуме строк и падала на смешанном шаге с M<512.
+As a side effect a sizing bug surfaced: the workspace requirement is not monotonic in M —
+the smaller M, the more blocks take part in the reduction. The arena sized itself with one
+value at the max row count and crashed on a mixed step with M<512.
 
-## Замер
+## Measurement
 
-`down`, вес 44.6 МБ на матрицу:
+`down`, weight 44.6 MB per matrix:
 
-| batch | было, ГБ/с | стало, ГБ/с |
+| batch | before, GB/s | after, GB/s |
 |---|---:|---:|
 | 3 | 784 | 1017 |
 | 16 | 782 | 1016 |
@@ -37,26 +37,26 @@
 | 256 | 774 | 1017 |
 | 512 | 656 | 668 |
 
-`gate/up` и `q+gate` не изменились — они на ping-pong.
+`gate/up` and `q+gate` didn't change — they're on ping-pong.
 
-Фаза `gemm.mlp_down` шага чистого decode на c=64: 4.77 -> 3.72 мс (среднее
-двух прогонов на конфигурацию), шаг 33.38 -> 32.87 мс.
+The `gemm.mlp_down` phase of a pure decode step at c=64: 4.77 -> 3.72 ms (mean
+of two runs per configuration), step 33.38 -> 32.87 ms.
 
-## Сквозной эффект и оговорка о дрейфе
+## End-to-end effect and a caveat about drift
 
-Сквозная пропускная способность на c=64, три замера подряд в одну сессию:
+End-to-end throughput at c=64, three measurements back to back in one session:
 
-| сборка | tok/s |
+| build | tok/s |
 |---|---:|
-| HEAD (после deltanet) | 1206.25 |
-| + ping-pong (та же база) | 1211.24 |
+| HEAD (after deltanet) | 1206.25 |
+| + ping-pong (same base) | 1211.24 |
 | + stream-K | 1223.64 |
 
-То есть +1.4%. Меньше, чем на шаге decode, потому что смешанный шаг идёт с
-M=511, где `down` даёт 160 тайлов и остаётся на ping-pong: выигрывают только
-чистые decode-шаги.
+I.e. +1.4%. Less than on the decode step, because the mixed step runs at
+M=511, where `down` gives 160 tiles and stays on ping-pong: only pure
+decode steps win.
 
-Оговорка: тот же HEAD утром давал 1274.74 tok/s, а сейчас 1206.25. Машина за
-день просела примерно на 5% — сравнивать можно только замеры одной сессии.
-Числа в `deltanet-prefill.md` и `lm-head-batched.md` сняты утром и между собой
-сопоставимы, но с этой таблицей их сравнивать нельзя.
+Caveat: the same HEAD gave 1274.74 tok/s in the morning, and 1206.25 now. The machine
+sagged about 5% during the day — only measurements from one session can be compared.
+The numbers in `deltanet-prefill.md` and `lm-head-batched.md` were taken in the morning and are
+comparable with each other, but can't be compared with this table.

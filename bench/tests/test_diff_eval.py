@@ -90,7 +90,7 @@ class RunHeaderPathTest(unittest.TestCase):
         )
 
     def test_checkpoint_outside_home_is_left_alone(self):
-        # Скрывать там нечего, и путь должен остаться проверяемым.
+        # There's nothing to hide there, and the path must stay checkable.
         self.assertEqual(diff_eval.display_path(Path("/opt/ckpt/qwen")), "/opt/ckpt/qwen")
 
 

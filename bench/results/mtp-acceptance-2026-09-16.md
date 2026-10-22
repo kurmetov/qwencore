@@ -1,84 +1,84 @@
-# Acceptance MTP-головы — 2026-09-16
+# MTP head acceptance — 2026-09-16
 
-> **Одиночные точки одной сессии, без доверительных интервалов.** Сравнение с
-> vLLM здесь снято до появления протокола
-> [`docs/11-experiments.md`](../../docs/11-experiments.md): один-два прогона на
-> точку, без ротации порядка вариантов и без bootstrap CI, на частично занятой
-> карте. Эти множители отменяются прогоном comparison suite и не должны
-> цитироваться как результат проекта. Условия каждой точки — ниже по тексту.
+> **Single points from one session, without confidence intervals.** The comparison with
+> vLLM here was taken before the protocol
+> [`docs/11-experiments.md`](../../docs/11-experiments.md) existed: one or two runs per
+> point, no variant order rotation and no bootstrap CI, on a partially busy
+> card. These multipliers are superseded by a comparison suite run and must not
+> be quoted as a project result. The conditions of each point are given below.
 
-Проверка перед тем, как строить спекулятивный decode: годится ли draft-голова,
-которая лежит в чекпоинте и до сих пор не грузилась. Замер оффлайн, без
-верификации, отката и планировщика.
+A check before building speculative decode: is the draft head usable,
+which sits in the checkpoint and hasn't been loaded so far. Measured offline, without
+verification, rollback or scheduler.
 
-## Как мерилось
+## How it was measured
 
-`qwc-engine --bin mtpdump` снимает с движка финальные скрытые состояния всех
-позиций (тот самый тензор, который уходит в `lm_head`) и сами токены:
-14 случаев корпуса `bench/corpus/core.jsonl`, по 128 сгенерированных токенов
-на случай, 3042 позиции.
+`qwc-engine --bin mtpdump` captures from the engine the final hidden states of all
+positions (the very tensor that goes into `lm_head`) and the tokens themselves:
+14 cases of the `bench/corpus/core.jsonl` corpus, 128 generated tokens
+per case, 3042 positions.
 
-`bench/mtp_acceptance.py` считает голову (torch, веса как есть) и сверяет её
-argmax с тем, что выдала настоящая модель. Позиция t получает h_t и эмбеддинг
-токена t+1 и обязана предсказать t+2 — ровно та связка, что в спекуляции.
+`bench/mtp_acceptance.py` runs the head (torch, weights as is) and checks its
+argmax against what the real model produced. Position t gets h_t and the embedding of
+token t+1 and must predict t+2 — exactly the pairing used in speculation.
 
-Самопроверка дампа: `lm_head(h_t)` воспроизводит токен t+1 на 130 позициях из
-132, то есть снятые состояния — действительно те.
+Dump self-check: `lm_head(h_t)` reproduces token t+1 at 130 of
+132 positions, i.e. the captured states really are the right ones.
 
-## Результат
+## Result
 
 | | acceptance |
 |---|---:|
-| по сгенерированным позициям, весь корпус | **0.929** |
-| то же, без синтетических повторов | **0.897** |
-| по позициям промпта | 0.891 |
+| over generated positions, whole corpus | **0.929** |
+| same, without synthetic repeats | **0.897** |
+| over prompt positions | 0.891 |
 
-Цепочка черновиков: второй и дальше идут по собственному выходу головы, и
-вероятность условная — принять k-й при принятых предыдущих.
+Draft chain: the second and further drafts go off the head's own output, and the
+probability is conditional — accepting the k-th given the previous ones were accepted.
 
-| k | p (весь корпус) | E[токенов за шаг] | p (осмысленные) | E |
+| k | p (whole corpus) | E[tokens per step] | p (meaningful) | E |
 |---:|---:|---:|---:|---:|
 | 1 | 0.929 | 1.93 | 0.898 | 1.90 |
 | 2 | 0.881 | 2.75 | 0.799 | 2.62 |
 | 3 | 0.858 | 3.45 | 0.718 | 3.13 |
 
-Архитектурная справка (`docs/01-model-architecture.md`) даёт 0.77-0.90 при трёх токенах —
-замер это подтверждает и на осмысленных текстах даёт 0.72-0.90.
+The architecture reference (`docs/01-model-architecture.md`) gives 0.77-0.90 at three tokens —
+the measurement confirms it and gives 0.72-0.90 on meaningful texts.
 
-## Что это даёт
+## What this gives
 
-Черновой шаг — чтение 849 МБ BF16 = 475 мкс при 1.79 ТБ/с, снимок состояния
-DeltaNet под откат — 91 мкс. База batch-1 сегодня: 12.66 мс, 79 tok/s.
+A draft step is reading 849 MB BF16 = 475 µs at 1.79 TB/s, a DeltaNet state
+snapshot for rollback is 91 µs. The batch-1 baseline today: 12.66 ms, 79 tok/s.
 
-| k | tok/s (осмысленные) | к нам | к vLLM 0.28 (50.4) |
+| k | tok/s (meaningful) | vs us | vs vLLM 0.28 (50.4) |
 |---:|---:|---:|---:|
 | 1 | 144 | 1.82x | 2.85x |
 | 2 | **191** | **2.42x** | **3.79x** |
 | 3 | 221 | 2.80x | 4.38x |
 
-Голова в FP8 (425 МБ) экономит ещё 237 мкс на черновик: k=3 даёт 232 tok/s.
-Это уже вторая итерация, на первую не нужно.
+The head in FP8 (425 MB) saves another 237 µs per draft: k=3 gives 232 tok/s.
+That's already a second iteration, not needed for the first.
 
-## Оговорки
+## Caveats
 
-- Замер — верхняя граница по двум причинам: голова видит только принятые
-  токены (в спекуляции так и есть), но её собственные черновые позиции не
-  попадают в KV соседних черновиков, то есть цепочка чуть занижена, а
-  остальное — завышено в меру синтетичности корпуса.
-- Половина корпуса — повторяющийся текст (`page-*`, `chunk-*`, `long-601`),
-  на нём acceptance закономерно выше. Ориентироваться стоит на колонку
-  «осмысленные»: 0.898 / 0.799 / 0.718.
-- Корпус короткий (128 токенов на случай) и не агентный. Для настоящей
-  оценки нужен прогон на диалогах с инструментами — там доля повторов из
-  контекста выше, и acceptance должен вырасти.
+- The measurement is an upper bound for two reasons: the head sees only accepted
+  tokens (that's how it is in speculation), but its own draft positions don't
+  get into the KV of neighboring drafts, i.e. the chain is slightly understated, and
+  the rest is overstated to the extent the corpus is synthetic.
+- Half the corpus is repetitive text (`page-*`, `chunk-*`, `long-601`),
+  where acceptance is naturally higher. Rely on the
+  "meaningful" column: 0.898 / 0.799 / 0.718.
+- The corpus is short (128 tokens per case) and not agentic. A real
+  estimate needs a run on dialogs with tools — there the share of repeats from
+  context is higher, and acceptance should grow.
 
-## Грабли, стоившие часа
+## A pitfall that cost an hour
 
-Все нормы в этой модели — **Gemma-вариант**: масштаб `(1 + weight)`, а не
-`weight`. В `rmsnorm.cu` это так с самого начала, а в питоновском эталоне я
-написал обычную форму — и получил **ровно ноль совпадений** на всех 3042
-позициях, включая синтетические повторы, где голова обязана попадать почти
-всегда. Диагностика, которая вывела на причину: если выбросить из головы
-слой внимания, её выход через `lm_head` начинал предсказывать *входной*
-токен (63 из 132) — значит, тракт жив, а ломается что-то внутри слоя.
-Ровный ноль на всём корпусе — это не «слабая голова», это структурная ошибка.
+All norms in this model are the **Gemma variant**: scale `(1 + weight)`, not
+`weight`. In `rmsnorm.cu` it's like that from the very start, but in the Python reference I
+wrote the usual form — and got **exactly zero matches** on all 3042
+positions, including synthetic repeats where the head must hit almost
+always. The diagnostic that led to the cause: if you drop the attention layer
+from the head, its output through `lm_head` started predicting the *input*
+token (63 of 132) — so the path is alive, and something breaks inside the layer.
+A flat zero over the whole corpus isn't "a weak head", it's a structural bug.

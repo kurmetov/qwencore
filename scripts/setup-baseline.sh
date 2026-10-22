@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Окружение для baseline-движков. Отдельный venv через uv: системный Python 3.14
-# новее, чем поддерживает vLLM, и трогать его не надо.
+# Environment for the baseline engines. A separate venv via uv: the system Python 3.14
+# is newer than vLLM supports, and it shouldn't be touched.
 set -euo pipefail
 
 ENV_DIR="${ENV_DIR:-$HOME/.venvs/baseline}"
 export PATH="$HOME/.local/bin:$PATH"
 
 uv venv --python 3.12 "$ENV_DIR"
-# sm_120 (потребительский Blackwell) требует сборок torch с CUDA >= 12.8.
+# sm_120 (consumer Blackwell) requires torch builds with CUDA >= 12.8.
 VIRTUAL_ENV="$ENV_DIR" uv pip install --python "$ENV_DIR/bin/python" vllm
 
 "$ENV_DIR/bin/python" - <<'PY'

@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""Подгонка выбора партиций упакованного ядра по плотному свипу packedbench.
+"""Fits the packed kernel's partition choice to the packedbench dense sweep.
 
     cargo run --release -p qwc-cuda --bin packedbench -- --sweep --dense \
         --rows 32,48,64,96,128,192,256,384,512 > sweep.txt
     bench/fit_packed_partitions.py sweep.txt
 
-Сравнивает прежнее правило «3.5-6 волн» и волновую модель
-«волны x (отрезок + k0 ключей)» с сеткой k0 и цены редукции. Промах —
-насколько время при выбранном P хуже лучшего замеренного. Модель в
-`packed_partition_count` — k0 = 64, без цены редукции. Данные 2026-09-24 —
-`bench/results/packed-dense-sweep-2026-09-24.txt` (частичные суммы в fp32,
-потолок 2048 пар) и `packed-dense-sweep-f16-2026-09-24.txt` (f16, 4096 пар);
-потолок задаёт `--max-pairs`.
+Compares the old "3.5-6 waves" rule and the wave model
+"waves x (segment + k0 keys)" over a grid of k0 and reduction cost. The miss is
+how much worse the time at the chosen P is than the best measured. The model in
+`packed_partition_count` is k0 = 64, no reduction cost. 2026-09-24 data —
+`bench/results/packed-dense-sweep-2026-09-24.txt` (fp32 partial sums,
+2048-pair cap) and `packed-dense-sweep-f16-2026-09-24.txt` (f16, 4096 pairs);
+the cap is set by `--max-pairs`.
 """
 import math
 import re
 import sys
 
 SMS, KV, GROUP, PAGE = 170, 4, 6, 64
-# Потолок пар (строка, партиция), PACKED_MAX_PARTIAL_ROWS.
+# Cap on (row, partition) pairs, PACKED_MAX_PARTIAL_ROWS.
 MAX_PAIRS = 4096
 
 
@@ -27,7 +27,7 @@ def parse(path):
     header = None
     for line in open(path):
         cells = [c.strip() for c in line.split("|")]
-        if len(cells) > 5 and cells[0] == "строк":
+        if len(cells) > 5 and cells[0] == "rows":
             header = [int(c[2:]) for c in cells[4:]]
             continue
         if header and len(cells) == len(header) + 4 and cells[0].isdigit():
@@ -63,7 +63,7 @@ def wave_rule(rows, context, k0, reduce_cost, max_partitions=48):
 
 
 def previous_rule(rows, context):
-    """Правило до d181413: 3.5-6 волн с самой полной последней."""
+    """The rule before d181413: 3.5-6 waves with the fullest last one."""
     ctas = KV * tiles(rows)
     if SMS // ctas >= 16:
         wanted = SMS // ctas
@@ -99,9 +99,9 @@ if __name__ == "__main__":
         MAX_PAIRS = int(sys.argv.pop(at + 1))
         sys.argv.pop(at)
     table = parse(sys.argv[1])
-    print(f"форм: {len(table)}")
+    print(f"shapes: {len(table)}")
     mean, worst, details = regret(table, previous_rule)
-    print(f"прежнее правило: среднее {mean:.3f}, худшее {worst:.3f}")
+    print(f"old rule: mean {mean:.3f}, worst {worst:.3f}")
     results = []
     for k0 in (0, 32, 64, 128, 192, 256, 384, 512, 768):
         for reduce_cost in (0, 0.5, 1, 2, 4, 8):
@@ -109,12 +109,12 @@ if __name__ == "__main__":
             results.append((mean, worst, k0, reduce_cost))
     results.sort()
     for mean, worst, k0, reduce_cost in results[:8]:
-        print(f"волны: k0={k0:4d} reduce={reduce_cost:4.1f}: среднее {mean:.3f}, худшее {worst:.3f}")
+        print(f"waves: k0={k0:4d} reduce={reduce_cost:4.1f}: mean {mean:.3f}, worst {worst:.3f}")
     mean, worst, k0, reduce_cost = results[0]
-    print(f"\nлучшее: k0={k0}, reduce={reduce_cost}")
+    print(f"\nbest: k0={k0}, reduce={reduce_cost}")
     for rows, start, p, t, best_p, best_t, loss in regret(
             table, lambda r, c: wave_rule(r, c, k0, reduce_cost))[2]:
         mark = "  <--" if loss > 0.05 else ""
         cur = previous_rule(rows, start + rows)
-        print(f"  {rows:4d} x {start:6d}: P={p:2d} {t:8.1f}  лучшее P={best_p:2d} {best_t:8.1f}"
-              f"  +{loss * 100:4.1f}%  (прежнее P={cur}: {table[(rows, start)].get(cur, float('nan')):.1f}){mark}")
+        print(f"  {rows:4d} x {start:6d}: P={p:2d} {t:8.1f}  best P={best_p:2d} {best_t:8.1f}"
+              f"  +{loss * 100:4.1f}%  (old P={cur}: {table[(rows, start)].get(cur, float('nan')):.1f}){mark}")

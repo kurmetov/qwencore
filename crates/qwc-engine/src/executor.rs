@@ -1,10 +1,10 @@
-//! Шаг decode целиком: от идентификатора токена до логитов.
+//! A whole decode step: from token id to logits.
 //!
-//! Все буферы шага резидентны и выделяются один раз: адреса не меняются от
-//! шага к шагу, иначе позже нечего будет захватывать в CUDA graph. Планировщик
-//! из `qwc-runtime` сюда пока не подключён — блоки KV и слоты состояния
-//! раздаются по последовательностям статически, чтобы сначала проверить
-//! численный тракт, а не политику вытеснения.
+//! All step buffers are resident and allocated once: addresses don't change from
+//! step to step, otherwise there would be nothing to capture in a CUDA graph later. The scheduler
+//! from `qwc-runtime` isn't wired in here yet — KV blocks and state slots
+//! are handed out to sequences statically, to check the numeric path first
+//! rather than the eviction policy.
 
 use crate::weights::{
     DecodeLinearMode, FullAttention, LinearAttention, MIXER_A_OFFSET, MIXER_B_OFFSET,
@@ -31,32 +31,32 @@ use qwc_runtime::BatchLayout;
 /// of the 16.25 GB of weights. The decode kernels themselves accept 128.
 pub const MAX_BATCH: usize = 96;
 
-/// Максимум строк в одном шаге проверки черновиков: принятый токен плюс до
-/// семи спекулятивных. Потолок задан bf16-линейкой MTP-головы.
+/// Max rows in one draft verification step: the accepted token plus up to
+/// seven speculative ones. The cap is set by the MTP head's bf16 linear layer.
 pub const MAX_SPECULATION_ROWS: usize = 8;
 
-/// С какой длины отрезка prefill-скан идёт чанковой (WY) формой.
-/// Ниже этого рекуррентный проход быстрее: см. `deltanet-wy-2026-09-16.md`,
-/// на 128 токенах формы сравниваются, на 256 WY уже вдвое лучше.
+/// From what segment length the prefill scan uses the chunked (WY) form.
+/// Below this the recurrent pass is faster: see `deltanet-wy-2026-09-16.md`,
+/// at 128 tokens the forms are even, at 256 WY is already twice as good.
 const MIN_WY_TOKENS: usize = 192;
-/// Fixed tensor-core M dimension used by chunked prefill. Это ёмкость арены:
-/// планировщику можно выдать бюджет меньше, но не больше.
+/// Fixed tensor-core M dimension used by chunked prefill. This is the arena capacity:
+/// the scheduler may be given a smaller budget, but not a larger one.
 ///
 /// Every engine step reads all 16.25 GB of weights regardless of how many
 /// tokens it carries, so a small chunk makes prefill pay that read over and
-/// over. Но упирается всё не в вес чтения, а в форму: W4A4 на M=511 идёт на
-/// 1097 TFLOP/s, на M=2048 — на 1350, а внимание на большом тайле реже
-/// перечитывает KV. Замер на формах модели (`prefillgemmbench`,
-/// `prefillattnbench`, промпт 4096):
+/// over. But what matters is not read weight but shape: W4A4 at M=511 runs at
+/// 1097 TFLOP/s, at M=2048 at 1350, and attention on a large tile re-reads
+/// KV less often. Measured on the model's shapes (`prefillgemmbench`,
+/// `prefillattnbench`, prompt 4096):
 ///
-/// | чанк | проекции | внимание |
+/// | chunk | projections | attention |
 /// |---|---:|---:|
-/// | 512 | 44.1 мкс/токен | 23.3 мкс/токен |
+/// | 512 | 44.1 µs/token | 23.3 µs/token |
 /// | 1024 | 38.8 | 19.7 |
 /// | 2048 | 35.8 | 17.2 |
 ///
-/// Плата — гранулярность шага: decode-строка ждёт весь чанк, поэтому 2048 это
-/// потолок, а не обязательный бюджет.
+/// The price is step granularity: a decode row waits for the whole chunk, so 2048 is
+/// a cap, not a mandatory budget.
 pub const PREFILL_CHUNK_SIZE: usize = qwc_cuda::MAX_STEP_ROWS;
 
 /// One sequence's slice of a fused step.
@@ -87,7 +87,7 @@ impl Default for ExecutorConfig {
     }
 }
 
-/// Резидентные буферы одного шага decode.
+/// Resident buffers of one decode step.
 pub struct Executor {
     stream: Stream,
     max_batch: usize,
@@ -102,7 +102,7 @@ pub struct Executor {
     decode_linear_mode: DecodeLinearMode,
     delta_state_mode: DeltaStateMode,
 
-    // Магистраль слоя.
+    // The layer's residual stream.
     residual: DeviceBuffer<u16>,
     normed: DeviceBuffer<u16>,
     mixer_out: DeviceBuffer<u16>,
@@ -116,50 +116,50 @@ pub struct Executor {
     projection_workspace: W4A4Workspace,
 
     // Gated DeltaNet.
-    /// Слитый вход миксера: qkv, z, a и b одной строкой.
+    /// Fused mixer input: qkv, z, a and b in one row.
     mixer_in: DeviceBuffer<u16>,
     prepared: PreparedDelta,
     delta_out: DeviceBuffer<f32>,
     delta_normed: DeviceBuffer<u16>,
     state_slots: DeviceBuffer<u32>,
-    /// Состояние покоящихся слотов: int8 плюс построчный масштаб. Decode
-    /// читает и пишет прямо сюда — в этом половина экономии трафика шага.
+    /// State of resting slots: int8 plus a per-row scale. Decode
+    /// reads and writes right here — that's half of the step's traffic saving.
     state_pools: Vec<PackedStatePool>,
-    /// Расквантованная копия состояния одной последовательности, по слоям.
-    /// Префилл идёт по ней, а не по 8-битному слоту: сегмент, стартующий с
-    /// квантованного состояния, портит весь остаток промпта — MAE
-    /// подскакивает в 11 раз на границе `PREFILL_CHUNK_SIZE`
+    /// Dequantized state copy of one sequence, per layer.
+    /// Prefill runs on it, not on the 8-bit slot: a segment starting from
+    /// a quantized state spoils the whole rest of the prompt — MAE
+    /// jumps 11x at the `PREFILL_CHUNK_SIZE` boundary
     /// (`bench/results/delta-state-8bit.md`).
     ///
-    /// Копия одна на движок, потому что недопрефилленной в каждый момент
-    /// может быть ровно одна последовательность: чанк выходит частичным
-    /// только когда исчерпал token budget шага, а это обрывает набор
+    /// One copy per engine, because at any moment exactly one
+    /// sequence can be partially prefilled: a chunk comes out partial
+    /// only when it has exhausted the step's token budget, and that breaks the
     /// (`qwc-runtime/src/scheduler.rs`).
     state_work: Vec<DeviceBuffer<u16>>,
-    /// Чей слот лежит в копии — по слою, потому что сегменты проходят все
-    /// слои по очереди и распаковка каждого слоя своя.
+    /// Whose slot is in the copy — per layer, because segments go through all
+    /// layers in turn and each layer is unpacked separately.
     work_owner: Vec<Option<usize>>,
     conv_pools: Vec<DeviceBuffer<f32>>,
-    /// Снимки кэша префиксов: bf16-состояние и conv-история по слоям.
-    /// Держатся в bf16, а не в 8 битах покоящихся слотов: продолжение
-    /// префикса — это префилл тысяч токенов с этого состояния, и с
-    /// квантованного он ошибается в разы (`bench/results/delta-state-8bit.md`).
+    /// Prefix cache snapshots: bf16 state and conv history per layer.
+    /// Kept in bf16, not in the 8 bits of resting slots: continuing
+    /// a prefix means prefilling thousands of tokens from this state, and from
+    /// a quantized one it errs many times more (`bench/results/delta-state-8bit.md`).
     prefix_state: Vec<DeviceBuffer<u16>>,
     prefix_conv: Vec<DeviceBuffer<f32>>,
-    /// Операции следующего прохода: `(слот, снимок)`. Подъём — вместо
-    /// распаковки слота, снятие — сразу после скана сегмента.
+    /// Operations for the next pass: `(slot, snapshot)`. Restore replaces
+    /// unpacking the slot, capture happens right after the segment's scan.
     prefix_restores: Vec<(usize, usize)>,
     prefix_saves: Vec<(usize, usize)>,
-    /// Скретч WY-скана. Общий на все слои и все последовательности: скан
-    /// вызывается до 48 раз за шаг, и аллокация внутри вызова сериализовала
-    /// бы этот путь. Заводится только в режиме `Wy` — он стоит десятки
-    /// мегабайт, которые остальным режимам не нужны.
+    /// WY scan scratch. Shared by all layers and all sequences: the scan
+    /// is called up to 48 times per step, and allocating inside the call would serialize
+    /// this path. Allocated only in `Wy` mode — it costs tens of
+    /// megabytes that the other modes don't need.
     delta_prefill: Option<DeltaPrefillWorkspace>,
-    /// Входы миксера всех линейных слоёв за шаг проверки черновиков.
+    /// Mixer inputs of all linear layers for a draft verification step.
     ///
-    /// Проверка идёт по черновому слоту состояния, а принятые токены потом
-    /// доигрываются на настоящем — для этого и нужны сохранённые входы: они
-    /// позволяют повторить conv и скан, не перечитывая веса второй раз.
+    /// Verification runs on the draft state slot, and accepted tokens are then
+    /// replayed on the real one — that's what the saved inputs are for: they
+    /// allow repeating conv and the scan without re-reading the weights.
     speculation_mixer: Vec<DeviceBuffer<u16>>,
     speculation_rows: usize,
 
@@ -180,19 +180,19 @@ pub struct Executor {
     workspace: PagedAttentionWorkspace,
     packed_workspace: PackedAttentionWorkspace,
 
-    // Вход и выход шага.
+    // Step input and output.
     tokens: DeviceBuffer<u32>,
     logits: DeviceBuffer<f32>,
     sampler: Argmax,
     decode_graphs: Vec<Option<CudaGraph>>,
     captured_weights: Option<usize>,
 
-    // Пофазный таймлайн. Пока он включён, шаг decode идёт мимо CUDA graph:
-    // внутри захвата события не измеряют время. Разница между шагом с
-    // таймлайном и шагом с графом — это и есть цена запусков.
+    // Per-phase timeline. While it's on, the decode step bypasses the CUDA graph:
+    // events don't measure time inside a capture. The difference between a step with
+    // the timeline and a step with the graph is exactly the cost of launches.
     profile: Option<Timeline>,
 
-    // Хостовые заготовки, чтобы не аллоцировать на каждом шаге.
+    // Host-side scratch, so as not to allocate on every step.
     host_cosine: Vec<u16>,
     host_sine: Vec<u16>,
     host_physical: Vec<u32>,
@@ -215,7 +215,7 @@ struct PrefillBuffers {
     mlp_hidden: DeviceBuffer<u16>,
     mlp_out: DeviceBuffer<u16>,
 
-    /// Слитый вход миксера: qkv, z, a и b одной строкой.
+    /// Fused mixer input: qkv, z, a and b in one row.
     mixer_in: DeviceBuffer<u16>,
     prepared: PreparedDelta,
     delta_out: DeviceBuffer<f32>,
@@ -233,8 +233,8 @@ struct PrefillBuffers {
     block_tables: DeviceBuffer<u32>,
     context_lengths: DeviceBuffer<u32>,
     attention_workspace: PagedAttentionWorkspace,
-    /// Частичные суммы упакованного внимания: и decode-строки шага, и
-    /// сегменты идут через него при fp8-кэше.
+    /// Partial sums of packed attention: both the step's decode rows and
+    /// segments go through it with an fp8 cache.
     packed_workspace: PackedAttentionWorkspace,
 
     tokens: DeviceBuffer<u32>,
@@ -303,9 +303,9 @@ impl PrefillBuffers {
             block_offsets: DeviceBuffer::zeroed(rows)?,
             block_tables: DeviceBuffer::from_slice(&tables)?,
             context_lengths: DeviceBuffer::zeroed(rows)?,
-            // Workspace обслуживает только строки decode, а их в шаге не
-            // больше, чем последовательностей: разметка партиций рассчитана
-            // на MAX_DECODE_ROWS.
+            // The workspace serves only decode rows, and a step has no more of them
+            // than sequences: partition sizing is computed
+            // for MAX_DECODE_ROWS.
             attention_workspace: PagedAttentionWorkspace::new(
                 rows.min(paged_attention::MAX_DECODE_ROWS),
                 max_context,
@@ -390,8 +390,8 @@ impl Executor {
         )
     }
 
-    /// Полный набор переключателей: KV, путь проекций decode и форма
-    /// prefill-скана. Стенды берут именно его, потому что свипают все три.
+    /// The full set of switches: KV, the decode projection path and the
+    /// prefill scan form. Benches take exactly this because they sweep all three.
     pub fn new_with_pool_options(
         config: ExecutorConfig,
         kv_cache_dtype: KvCacheDtype,
@@ -402,7 +402,7 @@ impl Executor {
         let batch = config.max_batch;
         assert!(
             (1..=MAX_BATCH).contains(&batch),
-            "decode держит batch до {MAX_BATCH}"
+            "decode holds batch up to {MAX_BATCH}"
         );
         assert!(config.max_context > 0);
         // CUTLASS W4A4 requires M >= 3. Diagnostic batch-1/2 runs keep
@@ -424,8 +424,8 @@ impl Executor {
         let cache_elements = kv_pool_blocks * NUM_KV_HEADS * PAGE_SIZE * ATTN_HEAD_DIM;
         let cache_bytes = cache_elements * kv_cache_dtype.bytes_per_element();
 
-        // Каждая последовательность владеет своим непрерывным диапазоном
-        // страниц: block table фиксирована, меняется только длина контекста.
+        // Each sequence owns its own contiguous range of
+        // pages: the block table is fixed, only the context length changes.
         let mut tables = vec![0u32; batch * max_blocks];
         for sequence in 0..batch {
             for block in 0..max_blocks {
@@ -444,10 +444,10 @@ impl Executor {
         let mut state_work = Vec::with_capacity(NUM_LINEAR_LAYERS);
         let mut conv_pools = Vec::with_capacity(NUM_LINEAR_LAYERS);
         for _ in 0..NUM_LINEAR_LAYERS {
-            // Слотов на один больше, чем последовательностей: последний —
-            // черновой. Проверка спекуляции гоняет состояние по нему, а
-            // настоящее остаётся нетронутым, пока не станет ясно, сколько
-            // токенов принято.
+            // One more slot than sequences: the last one is
+            // the draft slot. Speculation verification runs the state through it, while
+            // the real one stays untouched until it's clear how many
+            // tokens were accepted.
             state_pools.push(PackedStatePool::zeroed(batch + 1)?);
             state_work.push(DeviceBuffer::zeroed(STATE_ELEMS)?);
             conv_pools.push(DeviceBuffer::zeroed((batch + 1) * CONV_STATE_ELEMS)?);
@@ -527,8 +527,8 @@ impl Executor {
                 config.max_context,
             )?,
             tokens: DeviceBuffer::zeroed(batch)?,
-            // Проверка черновиков просит логиты сразу на k+1 строк, даже
-            // когда последовательность одна.
+            // Draft verification asks for logits on k+1 rows at once, even
+            // when there's a single sequence.
             logits: DeviceBuffer::zeroed(batch.max(MAX_SPECULATION_ROWS) * VOCAB_SIZE)?,
             sampler: Argmax::new(batch.max(MAX_SPECULATION_ROWS), VOCAB_SIZE)?,
             decode_graphs: (0..batch).map(|_| None).collect(),
@@ -549,8 +549,8 @@ impl Executor {
         &self.stream
     }
 
-    /// Включает пофазный замер. Шаг чистого decode перестаёт идти через CUDA
-    /// graph — события внутри захвата времени не дают.
+    /// Enables per-phase measurement. A pure decode step stops going through the CUDA
+    /// graph — events inside a capture don't give time.
     pub fn profile_enable(&mut self) {
         self.profile = Some(Timeline::new());
     }
@@ -559,14 +559,14 @@ impl Executor {
         self.profile = None;
     }
 
-    /// Сбрасывает метки перед шагом. Итоги читаются после него.
+    /// Resets marks before a step. Totals are read after it.
     pub fn profile_reset(&mut self) {
         if let Some(timeline) = self.profile.as_mut() {
             timeline.reset();
         }
     }
 
-    /// Суммы по фазам последнего шага в порядке первого появления.
+    /// Per-phase sums of the last step in order of first appearance.
     pub fn profile_totals(&self) -> Result<Vec<(&'static str, f32)>> {
         match self.profile.as_ref() {
             Some(timeline) => timeline.totals(),
@@ -574,7 +574,7 @@ impl Executor {
         }
     }
 
-    /// Время от первой метки шага до последней и число меток.
+    /// Time from the step's first mark to its last, and the number of marks.
     pub fn profile_span(&self) -> Result<(f32, usize)> {
         match self.profile.as_ref() {
             Some(timeline) => Ok((timeline.total_ms()?, timeline.marks())),
@@ -582,7 +582,7 @@ impl Executor {
         }
     }
 
-    /// Открывает фазу: интервал до следующей метки уйдёт в `label`.
+    /// Opens a phase: the interval until the next mark goes to `label`.
     fn mark(&mut self, label: &'static str) -> Result<()> {
         if let Some(timeline) = self.profile.as_mut() {
             timeline.mark(label, &self.stream)?;
@@ -594,15 +594,15 @@ impl Executor {
         &self.logits
     }
 
-    /// VRAM, занятая кэшем и состоянием: она соревнуется с весами за карту.
+    /// VRAM taken by cache and state: it competes with the weights for the card.
     pub fn cache_bytes(&self) -> usize {
         let state: usize = self.state_pools.iter().map(PackedStatePool::bytes).sum();
         let work: usize = self.state_work.iter().map(DeviceBuffer::bytes).sum();
         let conv: usize = self.conv_pools.iter().map(DeviceBuffer::bytes).sum();
         let keys: usize = self.key_caches.iter().map(DeviceBuffer::bytes).sum();
         let values: usize = self.value_caches.iter().map(DeviceBuffer::bytes).sum();
-        // Скретч WY-скана живёт столько же, сколько состояние, и в бюджете
-        // карты весит так же — молчать о нём значит занижать отчёт.
+        // The WY scan scratch lives as long as the state, and weighs the same in the card's
+        // budget — keeping quiet about it would understate the report.
         let scan: usize = self
             .delta_prefill
             .as_ref()
@@ -610,16 +610,16 @@ impl Executor {
         state + work + conv + keys + values + scan
     }
 
-    /// Прогон k+1 токенов по черновому слоту состояния: возвращает argmax
-    /// модели для каждой строки.
+    /// Runs k+1 tokens through the draft state slot: returns the model's argmax
+    /// for each row.
     ///
-    /// Настоящее состояние последовательности не трогается — пока неизвестно,
-    /// сколько токенов принято, трогать его нельзя. KV-страницы пишутся сразу
-    /// всем строкам: отвергнутые позиции перезапишет следующий шаг.
+    /// The sequence's real state isn't touched — until it's known how many
+    /// tokens were accepted, it can't be touched. KV pages are written for all
+    /// rows at once: rejected positions will be overwritten by the next step.
     ///
-    /// `block_ids` — страницы KV той же последовательности. Раздаёт их
-    /// `CacheManager`, и номера у него произвольные, поэтому выводить таблицу
-    /// из индекса слота нельзя: в сервере это чужие страницы.
+    /// `block_ids` are the KV pages of the same sequence. They're handed out by
+    /// `CacheManager`, and its numbers are arbitrary, so the table can't be derived
+    /// from the slot index: in the server those are someone else's pages.
     pub fn verify_speculation(
         &mut self,
         weights: &ModelWeights,
@@ -655,7 +655,7 @@ impl Executor {
         self.speculation_rows = rows;
         assert!(
             block_ids.len() >= (start_position + rows).div_ceil(PAGE_SIZE),
-            "таблица блоков короче проверяемых позиций"
+            "block table is shorter than the verified positions"
         );
         let segment = Segment {
             state_slot: scratch,
@@ -678,11 +678,11 @@ impl Executor {
         self.argmax_to_host(rows)
     }
 
-    /// Принять первые `accepted` строк последнего шага проверки.
+    /// Accept the first `accepted` rows of the last verification step.
     ///
-    /// Если приняты все, достаточно перенести черновое состояние в слот
-    /// последовательности. Если нет — conv и скан доигрываются по сохранённым
-    /// входам миксера, и второго прохода по весам это не стоит.
+    /// If all are accepted, it's enough to move the draft state into the
+    /// sequence's slot. If not, conv and the scan are replayed from the saved
+    /// mixer inputs, and that doesn't cost a second pass over the weights.
     pub fn commit_speculation(
         &mut self,
         weights: &ModelWeights,
@@ -707,7 +707,7 @@ impl Executor {
 
         assert!(
             !self.speculation_mixer.is_empty(),
-            "фиксация без предшествующей проверки"
+            "commit without a preceding verification"
         );
         let capacity = self.max_batch + 1;
         let replay_mode = self.delta_state_mode_for_replay();
@@ -729,7 +729,7 @@ impl Executor {
                 0,
                 &self.stream,
             )?;
-            // Доигрывание — тот же скан, поэтому и оно идёт по копии.
+            // Replay is the same scan, so it also runs on the copy.
             delta_net::unpack_state_slot(
                 &self.state_pools[linear_layer],
                 sequence,
@@ -763,8 +763,8 @@ impl Executor {
         self.stream.synchronize()
     }
 
-    /// Доигрывание идёт рекуррентным сканом: строк там единицы, а чанковая
-    /// форма на такой длине только теряет на подготовке.
+    /// Replay uses the recurrent scan: there are only a few rows, and the chunked
+    /// form only loses on preparation at that length.
     fn delta_state_mode_for_replay(&self) -> DeltaStateMode {
         match self.delta_state_mode {
             DeltaStateMode::Wy => DeltaStateMode::Bf16,
@@ -772,20 +772,20 @@ impl Executor {
         }
     }
 
-    /// Слотов состояния: по одному на последовательность плюс черновой,
-    /// на котором проверяются спекулятивные токены.
+    /// State slots: one per sequence plus the draft slot,
+    /// on which speculative tokens are verified.
     pub fn state_capacity(&self) -> usize {
         self.max_batch + 1
     }
 
-    /// Байты одного снимка кэша префиксов.
+    /// Bytes of one prefix cache snapshot.
     pub fn prefix_snapshot_bytes() -> usize {
         NUM_LINEAR_LAYERS
             * (STATE_ELEMS * std::mem::size_of::<u16>()
                 + CONV_STATE_ELEMS * std::mem::size_of::<f32>())
     }
 
-    /// Память под `snapshots` снимков кэша префиксов.
+    /// Memory for `snapshots` prefix cache snapshots.
     pub fn enable_prefix_snapshots(&mut self, snapshots: usize) -> Result<()> {
         self.prefix_state.clear();
         self.prefix_conv.clear();
@@ -807,24 +807,24 @@ impl Executor {
             .map_or(0, |buffer| buffer.len() / STATE_ELEMS)
     }
 
-    /// Операции кэша префиксов на следующий смешанный шаг. Подъём
-    /// выполняется вместо распаковки слота, снятие — после скана чанка;
-    /// оба только для сегментов префилла этого шага.
+    /// Prefix cache operations for the next mixed step. Restore
+    /// runs instead of unpacking the slot, capture after the chunk's scan;
+    /// both only for this step's prefill segments.
     pub fn plan_prefix(&mut self, restores: &[(usize, usize)], saves: &[(usize, usize)]) {
         let snapshots = self.prefix_snapshots();
         assert!(
             restores.iter().chain(saves).all(|&(slot, snapshot)| {
                 slot < self.max_batch && snapshot < snapshots
             }),
-            "снимок вне пула или слот вне batch"
+            "snapshot outside the pool or slot outside the batch"
         );
         self.prefix_restores = restores.to_vec();
         self.prefix_saves = saves.to_vec();
     }
 
-    /// Скопировать страницу KV во всех слоях полного внимания: хвост
-    /// закэшированного префикса лежит в неполной странице, а дописывать в
-    /// неё будет новая последовательность.
+    /// Copy a KV page in all full-attention layers: the tail of
+    /// a cached prefix lies in an incomplete page, and a new sequence
+    /// will be appending to it.
     pub fn copy_kv_block(&mut self, from: usize, to: usize) -> Result<()> {
         assert!(from < self.kv_pool_blocks && to < self.kv_pool_blocks);
         for cache in self.key_caches.iter_mut().chain(self.value_caches.iter_mut()) {
@@ -834,12 +834,12 @@ impl Executor {
         Ok(())
     }
 
-    /// Индекс чернового слота.
+    /// Index of the draft slot.
     pub fn speculation_slot(&self) -> usize {
         self.max_batch
     }
 
-    /// Сколько страниц KV покрывает контекст одной последовательности.
+    /// How many KV pages cover one sequence's context.
     pub fn max_blocks(&self) -> usize {
         self.max_blocks
     }
@@ -848,8 +848,8 @@ impl Executor {
         self.kv_pool_blocks
     }
 
-    /// Один шаг decode для `tokens[i]` на позиции `positions[i]`.
-    /// Логиты остаются в `self.logits` — их читает sampling.
+    /// One decode step for `tokens[i]` at position `positions[i]`.
+    /// Logits stay in `self.logits` — sampling reads them.
     pub fn decode(
         &mut self,
         weights: &ModelWeights,
@@ -859,10 +859,10 @@ impl Executor {
         let batch = tokens.len();
         assert_eq!(positions.len(), batch);
         assert!(batch > 0 && batch <= self.max_batch);
-        let max_position = *positions.iter().max().expect("непустой batch") as usize;
+        let max_position = *positions.iter().max().expect("non-empty batch") as usize;
         assert!(
             max_position < self.max_context,
-            "позиция {max_position} за пределами контекста {}",
+            "position {max_position} is beyond context {}",
             self.max_context
         );
 
@@ -963,8 +963,8 @@ impl Executor {
             "weights and executor use different decode linear modes"
         );
         if self.profile.is_some() {
-            // Захват графа не измеряется событиями: под таймлайном шаг идёт
-            // обычными запусками, и цена этих запусков видна в сумме фаз.
+            // Graph capture isn't measured by events: under the timeline the step runs
+            // as ordinary launches, and their cost shows up in the phase sum.
             self.decode_forward(weights, batch, max_position)?;
             return self.stream.synchronize();
         }
@@ -1005,9 +1005,9 @@ impl Executor {
             .embed
             .gather_rows(&self.tokens, &mut self.residual, batch, &self.stream)?;
 
-        // Схема слоя: residual несёт магистраль, а норма следующего блока
-        // сама добавляет в неё выход предыдущего. Отдельного сложения нет —
-        // это и есть fused residual-add в RmsNorm.
+        // Layer scheme: the residual carries the stream, and the next block's norm
+        // adds the previous block's output to it itself. There's no separate addition —
+        // this is the fused residual-add in RmsNorm.
         self.mark("norm")?;
         weights.layers[0].input_norm.forward_bf16(
             &self.residual,
@@ -1211,8 +1211,8 @@ impl Executor {
         block_ids: &[u32],
         block_bounds: &[usize],
     ) -> Result<()> {
-        // Таймлайн вынимается из `self`: внутри прохода арена шага занята
-        // изменяемым заимствованием, и метод `mark` туда уже не пройдёт.
+        // The timeline is taken out of `self`: inside the pass the step arena is held
+        // by a mutable borrow, and the `mark` method can't get through anymore.
         let mut timeline = self.profile.take();
         let result = self.forward_segments_inner(
             weights,
@@ -1224,7 +1224,7 @@ impl Executor {
             timeline.as_mut(),
         );
         self.profile = timeline;
-        // План одноразовый: повтор шага после ошибки строит его заново.
+        // The plan is single-use: repeating a step after an error rebuilds it.
         self.prefix_restores.clear();
         self.prefix_saves.clear();
         result
@@ -1274,8 +1274,8 @@ impl Executor {
 
         let state_capacity = self.max_batch + 1;
         let speculation_rows = self.speculation_rows;
-        // Рекуррентная форма — это режим точности состояния; `Wy` в ней не
-        // выражается, поэтому короткий отрезок считается bf16-проходом.
+        // The recurrent form is a state precision mode; `Wy` can't be
+        // expressed in it, so a short segment is computed with a bf16 pass.
         let recurrent_mode = match self.delta_state_mode {
             DeltaStateMode::Wy => DeltaStateMode::Bf16,
             other => other,
@@ -1364,8 +1364,8 @@ impl Executor {
                             .find(|&&(owner, _)| owner == slot)
                             .map(|&(_, snapshot)| snapshot);
                         if let Some(snapshot) = restore {
-                            // Свёртка читает свою историю в prepare — она
-                            // должна быть на месте до него.
+                            // The convolution reads its history in prepare — it
+                            // must be in place before that.
                             self.conv_pools[linear_layer].copy_from_device_at(
                                 slot * CONV_STATE_ELEMS,
                                 &self.prefix_conv[linear_layer],
@@ -1396,16 +1396,16 @@ impl Executor {
                             &self.stream,
                         )?;
                         mark!("delta.scan_prefill");
-                        // Чанковая форма окупается от пары сотен токенов: на
-                        // коротком отрезке её шесть подготовительных запусков
-                        // на слой дороже самого скана. Проверка спекуляции
-                        // несёт k+1 строку — это как раз тот случай.
+                        // The chunked form pays off from a couple hundred tokens: on
+                        // a short segment its six prep launches
+                        // per layer cost more than the scan itself. Speculation verification
+                        // carries k+1 rows — exactly that case.
                         let wy = self.delta_prefill.is_some()
                             && segment.tokens >= MIN_WY_TOKENS;
-                        // Скан идёт по расквантованной копии. Если копия уже
-                        // держит этот слот — распаковки нет, и продолжение
-                        // многосегментного промпта стартует с того же
-                        // состояния, каким его оставил прошлый сегмент.
+                        // The scan runs on the dequantized copy. If the copy already
+                        // holds this slot, there's no unpacking, and continuing a
+                        // multi-segment prompt starts from the same
+                        // state the previous segment left it in.
                         if let Some(snapshot) = restore {
                             self.state_work[linear_layer].copy_from_device_at(
                                 0,
@@ -1450,9 +1450,9 @@ impl Executor {
                                 &self.stream,
                             )?,
                         }
-                        // Упаковка после каждого сегмента, а не в конце
-                        // промпта: так 8-битный слот всегда актуален, и знать,
-                        // какой сегмент последний, не нужно.
+                        // Packing after every segment, not at the end of
+                        // the prompt: this way the 8-bit slot is always current, and there's no need to know
+                        // which segment is the last.
                         delta_net::pack_state_slot(
                             &self.state_work[linear_layer],
                             1,
@@ -1545,12 +1545,12 @@ impl Executor {
                         self.kv_cache_dtype,
                         &self.stream,
                     )?;
-                    // Строки decode и сегменты при fp8-кэше идут упакованным
-                    // ядром: decode-строка — свой тайл со своей таблицей,
-                    // сегмент — тайлы до десяти строк с общей. Сегмент
-                    // вызывается отдельно: тайл запросов не имеет права
-                    // пересекать границу последовательности. bf16-кэш идёт
-                    // прежними ядрами.
+                    // Decode rows and segments with an fp8 cache go through the packed
+                    // kernel: a decode row is its own tile with its own table,
+                    // a segment is tiles of up to ten rows with a shared one. A segment
+                    // is called separately: a query tile must not
+                    // cross a sequence boundary. A bf16 cache goes through
+                    // the old kernels.
                     let packed = self.kv_cache_dtype == KvCacheDtype::Fp8;
                     if decode_rows > 0 && packed {
                         mark!("attn.decode");
@@ -1703,8 +1703,8 @@ impl Executor {
             )?;
         }
 
-        // Проверке черновиков нужен argmax каждой строки, а не только
-        // последней: именно по ним и решается, сколько токенов принято.
+        // Draft verification needs the argmax of every row, not just
+        // the last: that's exactly how the number of accepted tokens is decided.
         if speculation_rows > 0 {
             for row in 0..speculation_rows {
                 prefill.host_last_rows[row] = row as u32;
@@ -1886,9 +1886,9 @@ impl Executor {
         )?;
         self.mark("attn.decode")?;
         if self.kv_cache_dtype == KvCacheDtype::Fp8 {
-            // Шаг захватывается в CUDA-граф, поэтому партиции выбираются по
-            // потолку контекста, а не по текущему: отрезки ядро режет само по
-            // фактической длине каждой строки.
+            // The step is captured into a CUDA graph, so partitions are chosen by
+            // the context cap, not the current context: the kernel cuts spans itself by
+            // the actual length of each row.
             paged_attention::gated_packed(
                 &self.query,
                 &self.query_gate,
@@ -1989,7 +1989,7 @@ impl Executor {
         Ok(max_position)
     }
 
-    /// Позиционные таблицы и адреса страницы нового токена.
+    /// Position tables and page addresses for the new token.
     fn upload_step(&mut self, tokens: &[u32], positions: &[u32]) -> Result<()> {
         self.host_block_tables.fill(0);
         for (sequence, &position) in positions.iter().enumerate() {
@@ -2098,8 +2098,8 @@ impl Executor {
             .copy_from_slice(&prefill.host_block_tables)
     }
 
-    /// Забыть контекст: состояние DeltaNet и conv-история обнуляются, KV
-    /// перестаёт быть виден через context_lengths.
+    /// Forget the context: DeltaNet state and conv history are zeroed, KV
+    /// stops being visible through context_lengths.
     pub fn reset(&mut self) -> Result<()> {
         for pool in &mut self.state_pools {
             pool.reset()?;
@@ -2115,8 +2115,8 @@ impl Executor {
         assert!(slot < self.max_batch);
         for (layer, pool) in self.state_pools.iter_mut().enumerate() {
             pool.reset_slot(slot)?;
-            // Копия этого слота больше ничего не значит: слот получил новую
-            // последовательность.
+            // The copy of this slot no longer means anything: the slot got a new
+            // sequence.
             if self.work_owner[layer] == Some(slot) {
                 self.work_owner[layer] = None;
             }
@@ -2127,24 +2127,24 @@ impl Executor {
         Ok(())
     }
 
-    /// Логиты одной строки последнего шага на хост: последовательности в
-    /// обычном шаге или строки проверки черновиков.
+    /// Logits of one row of the last step to host: sequences in a
+    /// regular step or draft verification rows.
     pub fn logits_to_host(&self, sequence: usize) -> Result<Vec<f32>> {
         self.logits.to_vec_range(sequence * VOCAB_SIZE, VOCAB_SIZE)
     }
 
     /// Greedy sampling on the GPU; only the resulting token IDs cross PCIe.
-    /// Одна строка скрытых состояний в отдельный буфер, не покидая карту.
-    /// Черновой шаг MTP принимает её как вход; копия ряда в 10 КБ на фоне
-    /// шага в 12 мс ничего не стоит, а вид на чужой буфер стоил бы времени
-    /// жизни.
+    /// One row of hidden states into a separate buffer, without leaving the card.
+    /// The MTP draft step takes it as input; a 10 KB row copy next to
+    /// a 12 ms step costs nothing, while a view into someone else's buffer would cost
+    /// lifetimes.
     pub fn copy_decode_hidden_row(
         &self,
         row: usize,
         destination: &mut DeviceBuffer<u16>,
     ) -> Result<()> {
         copy_hidden_row(&self.normed, row, destination, &self.stream)?;
-        // Читать строку будет поток спекулятора, а не этот.
+        // The row will be read by the speculator's stream, not this one.
         self.stream.synchronize()
     }
 
@@ -2156,10 +2156,10 @@ impl Executor {
         copy_hidden_row(&self.prefill.normed, row, destination, &self.stream)
     }
 
-    /// Строки `[first, first + count)` последнего prefill-шага подряд в
-    /// `destination`. Ими MTP-голова заполняет свой KV по промпту и по
-    /// принятым позициям проверки. Копия ждёт завершения: читать её будет
-    /// поток спекулятора, а не этот.
+    /// Rows `[first, first + count)` of the last prefill step contiguously into
+    /// `destination`. The MTP head fills its KV from them for the prompt and for
+    /// accepted verification positions. The copy waits for completion: it will be read by
+    /// the speculator's stream, not this one.
     pub fn copy_prefill_hidden_rows(
         &self,
         first: usize,
@@ -2178,18 +2178,18 @@ impl Executor {
         self.stream.synchronize()
     }
 
-    /// Скрытые состояния после финальной нормы — ровно тот тензор, который
-    /// уходит в `lm_head`, и ровно тот, который MTP-голова ждёт на входе.
+    /// Hidden states after the final norm — exactly the tensor that
+    /// goes into `lm_head`, and exactly the one the MTP head expects as input.
     ///
-    /// Нужны замеру acceptance draft-головы: её вход — это (h_t, эмбеддинг
-    /// токена t+1). Копия на хост, поэтому путь диагностический, не горячий.
+    /// Needed for measuring draft head acceptance: its input is (h_t, embedding of
+    /// token t+1). A copy to host, so this path is diagnostic, not hot.
     pub fn decode_hidden_to_host(&self, batch: usize) -> Result<Vec<u16>> {
         assert!(batch > 0 && batch <= self.max_batch);
         let all = self.normed.to_vec()?;
         Ok(all[..batch * HIDDEN_SIZE].to_vec())
     }
 
-    /// То же для строк последнего prefill-шага: `rows` строк с начала арены.
+    /// The same for rows of the last prefill step: `rows` rows from the start of the arena.
     pub fn prefill_hidden_to_host(&self, rows: usize) -> Result<Vec<u16>> {
         assert!(rows * HIDDEN_SIZE <= self.prefill.normed.len());
         let all = self.prefill.normed.to_vec()?;
@@ -2250,13 +2250,13 @@ fn project_decode(
 /// `rows` is the live prefix of the arena. Quantizing and multiplying the dead
 /// padding rows as well costs real tensor-core time once the arena is large, so
 /// a fused step pays only for the tokens it carries. CUTLASS needs M >= 3.
-/// Проекция строк шага. На широком шаге это W4A4 на тензорных ядрах, на
-/// узком — тот же выбор, что в decode.
+/// Projection of step rows. On a wide step it's W4A4 on tensor cores, on
+/// a narrow one the same choice as in decode.
 ///
-/// Узкий шаг бывает не только в decode: проверка спекулятивных токенов несёт
-/// k+1 строку одной последовательности, и на такой ширине W4A4 читает веса
-/// вдвое медленнее W4A16 (530 против 1379 ГБ/с по `nvfp4bench`). Пока выбор
-/// был прибит к W4A4, шаг проверки стоил дороже целого шага decode.
+/// A narrow step isn't only decode: speculative token verification carries
+/// k+1 rows of one sequence, and at that width W4A4 reads the weights
+/// half as fast as W4A16 (530 vs 1379 GB/s per `nvfp4bench`). While the choice
+/// was nailed to W4A4, a verification step cost more than a whole decode step.
 fn project_w4a4(
     projection: &Projection,
     input: &DeviceBuffer<u16>,

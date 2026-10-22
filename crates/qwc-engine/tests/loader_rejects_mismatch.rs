@@ -1,5 +1,5 @@
-//! Расхождение с архитектурой — ошибка загрузки, а не повод подстроиться.
-//! Проверки формы идут до первой аллокации, поэтому тест не трогает GPU.
+//! A mismatch with the architecture is a load error, not a reason to adapt.
+//! Shape checks happen before the first allocation, so the test doesn't touch the GPU.
 
 use qwc_engine::{LoadError, ModelWeights};
 use qwc_model::Checkpoint;
@@ -11,7 +11,7 @@ impl TempDir {
     fn new(tag: &str) -> Self {
         let dir = std::env::temp_dir().join(format!("qwc-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("временный каталог");
+        std::fs::create_dir_all(&dir).expect("temporary directory");
         Self(dir)
     }
 
@@ -26,8 +26,8 @@ impl Drop for TempDir {
     }
 }
 
-/// Чекпоинт из перечисленных тензоров: (имя, dtype, форма). Данные нулевые —
-/// до их чтения загрузчик в этих тестах не доходит.
+/// A checkpoint of the listed tensors: (name, dtype, shape). The data is zero —
+/// the loader in these tests never gets to reading it.
 fn write_checkpoint(dir: &Path, tensors: &[(&str, &str, &[usize])]) {
     let mut entries = Vec::new();
     let mut data = Vec::new();
@@ -44,7 +44,7 @@ fn write_checkpoint(dir: &Path, tensors: &[(&str, &str, &[usize])]) {
     shard.extend_from_slice(&(header.len() as u64).to_le_bytes());
     shard.extend_from_slice(header.as_bytes());
     shard.extend_from_slice(&data);
-    std::fs::write(dir.join("model-00001.safetensors"), &shard).expect("шард");
+    std::fs::write(dir.join("model-00001.safetensors"), &shard).expect("shard");
 
     let map: Vec<String> = tensors
         .iter()
@@ -54,36 +54,36 @@ fn write_checkpoint(dir: &Path, tensors: &[(&str, &str, &[usize])]) {
         dir.join("model.safetensors.index.json"),
         format!(r#"{{"weight_map":{{{}}}}}"#, map.join(",")),
     )
-    .expect("индекс");
+    .expect("index");
 }
 
 fn load_error(tensors: &[(&str, &str, &[usize])], tag: &str) -> String {
     let dir = TempDir::new(tag);
     write_checkpoint(dir.path(), tensors);
-    let checkpoint = Checkpoint::open(dir.path()).expect("чекпоинт открывается");
+    let checkpoint = Checkpoint::open(dir.path()).expect("checkpoint opens");
     match ModelWeights::load(&checkpoint) {
         Err(LoadError::Checkpoint(message)) => message,
-        Err(other) => panic!("ожидалась ошибка чекпоинта, получено: {other}"),
-        Ok(_) => panic!("пустой чекпоинт не должен грузиться"),
+        Err(other) => panic!("expected a checkpoint error, got: {other}"),
+        Ok(_) => panic!("an empty checkpoint must not load"),
     }
 }
 
 #[test]
 fn missing_projection_is_named_in_the_error() {
-    // Индекс без единого веса слоя: первым спрашивается gate_proj слоя 0.
+    // An index without a single layer weight: gate_proj of layer 0 is asked first.
     let message = load_error(
         &[("model.language_model.norm.weight", "BF16", &[5120])],
         "loader-missing",
     );
     assert!(
         message.contains("model.language_model.layers.0.mlp.gate_proj.weight_packed"),
-        "ошибка не называет отсутствующий тензор: {message}"
+        "the error doesn't name the missing tensor: {message}"
     );
 }
 
 #[test]
 fn wrong_shape_is_rejected_before_any_upload() {
-    // Тензор есть, но форма не та: 17408 x 5120/2 против подсунутых 16 x 8.
+    // The tensor exists, but the shape is wrong: 17408 x 5120/2 vs the substituted 16 x 8.
     let message = load_error(
         &[(
             "model.language_model.layers.0.mlp.gate_proj.weight_packed",
@@ -93,7 +93,7 @@ fn wrong_shape_is_rejected_before_any_upload() {
         "loader-shape",
     );
     assert!(
-        message.contains("ожидалась [17408, 2560]"),
-        "ошибка не показывает ожидаемую форму: {message}"
+        message.contains("expected [17408, 2560]"),
+        "the error doesn't show the expected shape: {message}"
     );
 }

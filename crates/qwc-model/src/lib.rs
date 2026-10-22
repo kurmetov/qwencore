@@ -1,7 +1,7 @@
-//! Загрузка чекпоинта Qwen3.8-27B-NVFP4.
+//! Loading the Qwen3.8-27B-NVFP4 checkpoint.
 //!
-//! Загрузчик знает архитектуру на этапе компиляции и сверяет с ней каждый
-//! тензор. Расхождение формы — ошибка загрузки, а не повод подстроиться.
+//! The loader knows the architecture at compile time and checks every
+//! tensor against it. A shape mismatch is a load error, not a reason to adapt.
 
 pub mod checkpoint;
 pub mod names;

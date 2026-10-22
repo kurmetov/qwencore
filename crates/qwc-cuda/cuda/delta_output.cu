@@ -29,7 +29,7 @@ __global__ __launch_bounds__(kHeadDim) void gated_rmsnorm_kernel(
   const int dimension = threadIdx.x;
   const size_t offset =
       (static_cast<size_t>(batch) * kHeads + head) * kHeadDim + dimension;
-  // Гейт может лежать срезом слитой арены, вход и выход — всегда плотно.
+  // The gate may be a slice of the fused arena; input and output are always dense.
   const size_t gate_offset =
       static_cast<size_t>(batch) * gate_stride + head * kHeadDim + dimension;
 

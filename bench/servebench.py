@@ -29,9 +29,9 @@ def prompt_ids(count: int, seed: int) -> list[int]:
 
 
 def corpus_prompts(path: Path, count: int, prompt_tokens: int) -> list[list[int]]:
-    """Те же промпты, что читает `--corpus` у qwc: один и тот же файл, одна и
-    та же нарезка. Синтетический `prompt_ids` — прогрессия, и спекуляция на
-    ней угадывает почти всё; корпус нужен, чтобы acceptance был настоящим."""
+    """The same prompts qwc reads via `--corpus`: the same file, the same
+    slicing. Synthetic `prompt_ids` are a progression, and speculation on
+    them guesses almost everything; the corpus makes acceptance real."""
     prompts = []
     with open(path) as handle:
         for line in handle:
@@ -39,17 +39,17 @@ def corpus_prompts(path: Path, count: int, prompt_tokens: int) -> list[list[int]
                 continue
             ids = json.loads(line)["prompt_token_ids"]
             if len(ids) < prompt_tokens:
-                raise SystemExit(f"{path}: промпт короче {prompt_tokens} токенов")
+                raise SystemExit(f"{path}: prompt shorter than {prompt_tokens} tokens")
             prompts.append(ids[:prompt_tokens])
             if len(prompts) == count:
                 break
     if len(prompts) < count:
-        raise SystemExit(f"{path}: {len(prompts)} промптов, а запрошено {count}")
+        raise SystemExit(f"{path}: {len(prompts)} prompts, but {count} requested")
     return prompts
 
 
 def percentile(values: list[float], fraction: float) -> float:
-    """Как `percentile` в servebench.rs: элемент с индексом round((n−1)·q)."""
+    """Like `percentile` in servebench.rs: the element at index round((n−1)·q)."""
     ordered = sorted(values)
     return ordered[int(math.floor((len(ordered) - 1) * fraction + 0.5))]
 
@@ -59,12 +59,12 @@ def latency_record(
     emissions: dict[str, list[tuple[float, int]]],
     ttft_service: list[float],
 ) -> dict:
-    """TTFT, TPOT и ITL по моментам выдачи токенов — те же определения, что у
-    qwc в servebench.rs. TTFT — от подачи всех запросов (t=0), с очередью;
-    `ttft_service` — от взятия запроса в работу, без очереди. TPOT — по
-    запросу (последний − первый)/(n − 1), перцентили по запросам. ITL — по
-    промежуткам между выдачами; выдача в k токенов (спекуляция) даёт
-    промежуток/k."""
+    """TTFT, TPOT and ITL from token emission times — the same definitions as
+    qwc's in servebench.rs. TTFT is from submitting all requests (t=0), with queueing;
+    `ttft_service` is from the request being scheduled, without queueing. TPOT is per
+    request (last − first)/(n − 1), percentiles over requests. ITL is over
+    gaps between emissions; an emission of k tokens (speculation) gives
+    gap/k."""
     ttft, tpot, itl = [], [], []
     for times in emissions.values():
         ttft.append((times[0][0] - started) * 1e3)
@@ -90,7 +90,7 @@ def latency_record(
 
 
 def total_gpu_memory_gb() -> float:
-    """Ёмкость карты в тех же десятичных ГБ, в которых движок задаёт лимит."""
+    """Card capacity in the same decimal GB the engine uses for its limit."""
     out = subprocess.run(
         ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
         capture_output=True, text=True, check=True,
@@ -108,7 +108,7 @@ def run_qwc(args) -> dict:
         "--prompt-tokens", str(args.prompt_tokens),
         "--max-new", str(args.max_new),
         "--context", str(args.context),
-        # При общем бюджете KV берёт остаток, как у vLLM: 0 означает «авто».
+        # Under a shared budget KV takes the remainder, as in vLLM: 0 means "auto".
         "--kv-cache-gb", str(0 if args.engine_budget_gb else args.kv_cache_gb),
         "--memory-limit-gb", str(args.engine_budget_gb or args.memory_limit_gb),
         "--kv-cache", args.kv_cache_dtype,
@@ -117,9 +117,9 @@ def run_qwc(args) -> dict:
         "--shortlist", str(args.qwc_shortlist),
         "--mtp-prime", args.qwc_mtp_prime,
     ]
-    # Ширина шага prefill — такой же свипаемый параметр, как
-    # max_num_batched_tokens у vLLM: держать его фиксированным значит
-    # занижать одну из сторон.
+    # Prefill step width is as much a swept parameter as vLLM's
+    # max_num_batched_tokens: keeping it fixed means
+    # handicapping one of the sides.
     if args.prefill_chunk:
         command.extend(("--prefill-chunk", str(args.prefill_chunk)))
     if args.corpus:
@@ -135,8 +135,8 @@ def run_vllm(args) -> dict:
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     from vllm import LLM, SamplingParams
 
-    # Один бюджет на оба движка: у нас он абсолютный, у vLLM — доля карты.
-    # Считаем долю здесь и кладём в артефакт, чтобы её можно было проверить.
+    # One budget for both engines: ours is absolute, vLLM's is a fraction of the card.
+    # Compute the fraction here and put it in the artifact so it can be checked.
     total_gb = total_gpu_memory_gb()
     utilization = (
         args.engine_budget_gb / total_gb
@@ -159,15 +159,15 @@ def run_vllm(args) -> dict:
         max_num_batched_tokens=args.max_batched_tokens or max(args.context, args.concurrency),
         # "bf16" is vLLM's unquantized KV, which it spells "auto".
         kv_cache_dtype="fp8" if args.kv_cache_dtype == "fp8" else "auto",
-        # Промпты и так уникальны, но фиксируем политику явно: результат не
-        # должен зависеть от значения default в конкретной версии vLLM.
+        # Prompts are unique anyway, but pin the policy explicitly: the result must not
+        # depend on the default value in a particular vLLM version.
         enable_prefix_caching=False,
-        # Чекпоинт мультимодальный, а стенд текстовый. Без этого флага vLLM
-        # поднимает vision tower (0.92 ГБ), и под общим бюджетом мы
-        # сравнивались с соперником, который носит лишний гигабайт.
+        # The checkpoint is multimodal, but the bench is text-only. Without this flag vLLM
+        # loads the vision tower (0.92 GB), and under a shared budget we were
+        # comparing against a rival carrying an extra gigabyte.
         language_model_only=not args.vllm_keep_vision,
-        # Голова MTP лежит в том же чекпоинте, и vLLM умеет её грузить как
-        # qwen3_5_mtp. Мерить его без неё — мерить недонастроенного соперника.
+        # The MTP head is in the same checkpoint, and vLLM can load it as
+        # qwen3_5_mtp. Measuring without it means measuring an under-tuned rival.
         speculative_config=(
             {
                 "method": "qwen3_5_mtp",
@@ -179,8 +179,8 @@ def run_vllm(args) -> dict:
         ),
     )
     load_seconds = time.perf_counter() - started
-    # Формат состояния DeltaNet не задаём: "auto" для этой модели — fp32 из
-    # `mamba_ssm_dtype` в config.json. В артефакт идёт итог, а не запрос.
+    # The DeltaNet state format is not set: "auto" for this model is fp32 from
+    # `mamba_ssm_dtype` in config.json. The artifact records the outcome, not the request.
     engine_config = getattr(llm.llm_engine, "vllm_config", None)
     cache_config = getattr(engine_config, "cache_config", None)
     mamba_ssm_dtype = str(getattr(cache_config, "mamba_ssm_cache_dtype", "auto"))
@@ -214,9 +214,9 @@ def run_vllm(args) -> dict:
     ]
     llm.generate(warmup, params, use_tqdm=False)
 
-    # Тот же цикл, что внутри `LLM.generate`, но с выдачей по шагам (DELTA):
-    # generate просит FINAL_ONLY, и у запроса остаются только первый и
-    # последний моменты — ITL по промежуткам из них не собрать.
+    # The same loop as inside `LLM.generate`, but with per-step output (DELTA):
+    # generate asks for FINAL_ONLY, and the request keeps only the first and
+    # last timestamps — ITL over gaps can't be built from them.
     from vllm.sampling_params import RequestOutputKind
 
     stepped = params.clone()
@@ -234,8 +234,8 @@ def run_vllm(args) -> dict:
             tokens = len(output.outputs[0].token_ids)
             if tokens:
                 emissions.setdefault(output.request_id, []).append((now, tokens))
-            # Моменты ядра движка монотонные и годятся только как промежуток:
-            # взят в работу -> первый токен.
+            # Engine core timestamps are monotonic and only usable as an interval:
+            # scheduled -> first token.
             metrics = getattr(output, "metrics", None)
             if output.finished and metrics is not None and metrics.scheduled_ts:
                 ttft_service.append((metrics.first_token_ts - metrics.scheduled_ts) * 1e3)
@@ -295,36 +295,36 @@ def main() -> int:
         "--engine-budget-gb",
         type=float,
         default=0.0,
-        help="общий потолок видеопамяти на движок; у vLLM пересчитывается в долю карты",
+        help="shared VRAM ceiling per engine; for vLLM converted to a fraction of the card",
     )
     parser.add_argument(
         "--vllm-speculative",
         type=int,
         default=0,
-        help="глубина MTP-спекуляции у vLLM (0 — выключена)",
+        help="vLLM MTP speculation depth (0 — off)",
     )
     parser.add_argument(
         "--qwc-speculative",
         type=int,
         default=0,
-        help="глубина MTP-спекуляции QwenCore (0 — выключена)",
+        help="QwenCore MTP speculation depth (0 — off)",
     )
     parser.add_argument(
         "--qwc-shortlist",
         type=int,
         default=0,
-        help="частотная часть shortlist словаря QwenCore (0 — полный lm_head)",
+        help="frequency part of the QwenCore vocab shortlist (0 — full lm_head)",
     )
     parser.add_argument(
         "--qwc-mtp-prime",
         default="2048",
-        help="окно прогрева MTP-головы QwenCore: N, all или off; 2048 — как у serve",
+        help="QwenCore MTP head warmup window: N, all or off; 2048 — same as serve",
     )
     parser.add_argument(
         "--vllm-keep-vision",
         action="store_true",
-        help="не передавать language_model_only: vLLM поднимет vision tower "
-             "(так шли замеры до 24.09)",
+        help="don't pass language_model_only: vLLM will load the vision tower "
+             "(how measurements ran before 09-24)",
     )
     parser.add_argument("--max-batched-tokens", type=int, default=0)
     parser.add_argument("--prefill-chunk", type=int, default=0)
@@ -335,8 +335,8 @@ def main() -> int:
     parser.add_argument(
         "--corpus",
         type=Path,
-        help="jsonl с prompt_token_ids (bench/make_corpus.py); "
-             "без него промпты синтетические",
+        help="jsonl with prompt_token_ids (bench/make_corpus.py); "
+             "without it prompts are synthetic",
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()

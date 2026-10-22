@@ -1,13 +1,13 @@
-//! MTP draft-голова: один слой внимания поверх скрытого состояния основной
-//! модели.
+//! MTP draft head: one attention layer on top of the main model's hidden
+//! state.
 //!
-//! Голова лежит в чекпоинте (`mtp.*`, 849 МБ BF16) и до сих пор не грузилась.
-//! Её вход — пара (h_t, эмбеддинг токена t+1), выход — предсказание токена
-//! t+2. Замеренный acceptance: 0.93 на первом черновике и 0.90 без
-//! синтетических повторов корпуса (`bench/results/mtp-acceptance-2026-09-16.md`).
+//! The head is in the checkpoint (`mtp.*`, 849 MB BF16) and wasn't loaded before.
+//! Its input is the pair (h_t, embedding of token t+1), its output is a prediction of token
+//! t+2. Measured acceptance: 0.93 on the first draft and 0.90 without
+//! the corpus's synthetic repeats (`bench/results/mtp-acceptance-2026-09-16.md`).
 //!
-//! Черновой шаг читает 849 МБ, то есть 5% от веса основного шага: за эти
-//! проценты и покупается второй-третий токен за проход.
+//! A draft step reads 849 MB, i.e. 5% of the main step's weights: these
+//! percent buy the second or third token per pass.
 
 use qwc_core::arch::*;
 use qwc_cuda::attention_prepare::AttentionPreprocessor;
@@ -20,7 +20,7 @@ use qwc_cuda::{DeviceBuffer, Stream, bf16};
 
 use crate::weights::ModelWeights;
 
-/// Ширина выхода q_proj головы: на голову лежит [q | выходной гейт].
+/// Output width of the head's q_proj: per head it's [q | output gate].
 const Q_GATE_DIM: usize = 2 * Q_PROJ_DIM;
 
 pub struct MtpHead {
@@ -47,8 +47,8 @@ impl MtpHead {
     }
 }
 
-/// Скретч и собственный KV-кэш головы. Слой у неё один, поэтому кэш стоит
-/// 1/16 от кэша основной модели на тот же контекст.
+/// The head's scratch and its own KV cache. It has one layer, so the cache costs
+/// 1/16 of the main model's cache for the same context.
 pub struct MtpScratch {
     embedding: DeviceBuffer<u16>,
     normed_embedding: DeviceBuffer<u16>,
@@ -85,8 +85,8 @@ pub struct MtpScratch {
 }
 
 impl MtpScratch {
-    /// `rows` — сколько позиций голова считает за вызов (черновик идёт по
-    /// одной), `max_context` — потолок длины последовательности.
+    /// `rows` — how many positions the head computes per call (a draft goes
+    /// one at a time), `max_context` — the sequence length cap.
     pub fn new(rows: usize, max_context: usize, cache_dtype: KvCacheDtype) -> qwc_cuda::Result<Self> {
         assert!((1..=kernels::MAX_ROWS).contains(&rows));
         let max_blocks = max_context.div_ceil(PAGE_SIZE);
@@ -130,15 +130,15 @@ impl MtpScratch {
         self.key_cache.bytes() + self.value_cache.bytes()
     }
 
-    /// Обнуляет KV головы. Нужен при переходе на другую последовательность:
-    /// позиции те же, а ключи остались от прежней.
+    /// Zeroes the head's KV. Needed when switching to another sequence:
+    /// the positions are the same, but the keys are left over from the previous one.
     pub fn reset_cache(&mut self) -> qwc_cuda::Result<()> {
         self.truncate_cache(0)
     }
 
-    /// Обнуляет KV головы начиная со страницы, где лежит позиция `keep`.
-    /// Позиции до неё остаются; хвост страницы до `keep` тоже уходит в ноль,
-    /// это дешевле, чем знать раскладку внутри страницы.
+    /// Zeroes the head's KV starting from the page holding position `keep`.
+    /// Positions before it remain; the page's tail before `keep` is zeroed too,
+    /// that's cheaper than knowing the layout within a page.
     pub fn truncate_cache(&mut self, keep: usize) -> qwc_cuda::Result<()> {
         let page_bytes =
             PAGE_SIZE * NUM_KV_HEADS * ATTN_HEAD_DIM * self.cache_dtype.bytes_per_element();
@@ -148,7 +148,7 @@ impl MtpScratch {
         self.value_cache.zero_range(start, bytes)
     }
 
-    /// Позиционные таблицы и адрес страницы для строк [0, rows).
+    /// Position tables and page address for rows [0, rows).
     fn upload(&mut self, tokens: &[u32], positions: &[u32]) -> qwc_cuda::Result<()> {
         let rows = tokens.len();
         assert_eq!(positions.len(), rows);
@@ -181,13 +181,13 @@ impl MtpScratch {
     }
 }
 
-/// Один проход головы: из (hidden, следующий токен) получить скрытое
-/// состояние черновика. Логиты из него считает `lm_head` основной модели —
-/// голова своей не имеет.
+/// One head pass: from (hidden, next token) get the draft's hidden
+/// state. Logits from it are computed by the main model's `lm_head` —
+/// the head doesn't have its own.
 ///
-/// `hidden` — финальные скрытые состояния основной модели для тех же строк,
-/// `tokens[i]` — токен на позиции `positions[i] + 1`, то есть тот, который
-/// модель только что выдала.
+/// `hidden` — the main model's final hidden states for the same rows,
+/// `tokens[i]` — the token at position `positions[i] + 1`, i.e. the one the
+/// model has just emitted.
 #[allow(clippy::too_many_arguments)]
 pub fn draft(
     head: &MtpHead,
@@ -261,11 +261,11 @@ pub fn draft(
     )?;
     let max_context = positions.iter().max().copied().unwrap_or(0) as usize + 1;
     if scratch.cache_dtype == KvCacheDtype::Fp8 {
-        // Строки вызова — всегда одна последовательность: KV у скретча один,
-        // и `upload` даёт всем строкам одну таблицу страниц. Поэтому форма —
-        // сегмент: шесть голов восьми строк прогрева идут одним тайлом и
-        // читают KV один раз, а не восемь. Маска у каждой строки своя, по её
-        // позиции.
+        // A call's rows are always one sequence: the scratch has one KV,
+        // and `upload` gives all rows one page table. So the shape is
+        // a segment: six heads of eight priming rows go as one tile and
+        // read KV once, not eight times. Each row has its own mask, by its
+        // position.
         paged_attention::gated_packed(
             &scratch.query,
             &scratch.query_gate,
@@ -304,7 +304,7 @@ pub fn draft(
     kernels::bf16_linear(&head.output, &scratch.attention_out, &mut scratch.normed,
         rows, Q_PROJ_DIM, HIDDEN_SIZE, stream)?;
 
-    // residual = residual + attn, и та же сумма нормируется дальше.
+    // residual = residual + attn, and the same sum is normalized next.
     head.post_attention_norm.forward_bf16(
         &scratch.normed,
         Some(&mut scratch.residual),
@@ -324,8 +324,8 @@ pub fn draft(
         .forward_bf16(&scratch.normed, Some(&mut scratch.residual), out, rows, stream)
 }
 
-/// Подъём головы из чекпоинта. Формы сверяются с архитектурой, как и у
-/// основных весов: расхождение — ошибка загрузки, а не повод подстроиться.
+/// Loading the head from the checkpoint. Shapes are checked against the architecture, as for
+/// the main weights: a mismatch is a load error, not a reason to adapt.
 pub fn load(checkpoint: &qwc_model::Checkpoint) -> Result<MtpHead, crate::weights::LoadError> {
     use crate::weights::{bf16_device_tensor, load_norm_named};
 
@@ -405,13 +405,13 @@ pub fn load(checkpoint: &qwc_model::Checkpoint) -> Result<MtpHead, crate::weight
     })
 }
 
-/// Голова, её скретч и буферы для цепочки черновиков.
+/// The head, its scratch and buffers for the draft chain.
 ///
-/// Скретч несёт собственный однослойный KV на всю длину контекста, поэтому
-/// один `Speculator` обслуживает одну последовательность. При переходе на
-/// другую KV надо обнулить: позиции у новой последовательности те же, а
-/// содержимое чужое. Черновики на корректность не влияют — их проверяет
-/// основная модель, — но чужой KV роняет acceptance.
+/// The scratch carries its own single-layer KV for the full context length, so
+/// one `Speculator` serves one sequence. When switching to
+/// another, the KV must be zeroed: the new sequence's positions are the same, but
+/// the contents are foreign. Drafts don't affect correctness — the main model
+/// verifies them — but foreign KV drops acceptance.
 pub struct Speculator {
     head: MtpHead,
     scratch: MtpScratch,
@@ -421,28 +421,28 @@ pub struct Speculator {
     argmax: qwc_cuda::sampling::Argmax,
     stream: Stream,
     owner: Option<u32>,
-    /// Промпт владельца: по нему `bind_prompt` решает, какая часть KV
-    /// головы годится следующему ходу того же диалога.
+    /// The owner's prompt: `bind_prompt` uses it to decide which part of the head's KV
+    /// is usable for the next turn of the same dialog.
     owner_prompt: Vec<u32>,
     shortlist: Option<Shortlist>,
 }
 
-/// Список строк словаря, по которым черновая голова ищет свой argmax.
+/// The list of vocab rows over which the draft head looks for its argmax.
 ///
-/// Полная проекция в словарь читает 1.27 ГБ и стоит 0.82 из 1.49 мс чернового
-/// прохода. Точный argmax по всем 248 320 строкам черновику не нужен: его
-/// предложение проверяет основная модель, и промах списка стоит отвергнутого
-/// черновика, а не неверного выхода.
+/// The full vocab projection reads 1.27 GB and costs 0.82 of the draft pass's 1.49 ms.
+/// The draft doesn't need an exact argmax over all 248 320 rows: its
+/// proposal is verified by the main model, and a list miss costs a rejected
+/// draft, not a wrong output.
 ///
-/// Список — частотный префикс словаря плюс токены контекста. Замер покрытия
-/// на 25 600 реально сгенерированных токенах: один контекст даёт 0.814,
-/// `id < 32768` — 0.915, вместе — 0.958. Контекстная часть здесь главная:
-/// в коде и агентных промптах модель много повторяет уже сказанное.
+/// The list is a frequency prefix of the vocab plus context tokens. Coverage measured
+/// on 25 600 actually generated tokens: context alone gives 0.814,
+/// `id < 32768` — 0.915, together — 0.958. The context part is the main one here:
+/// in code and agent prompts the model repeats a lot of what's already been said.
 struct Shortlist {
     ids: DeviceBuffer<u32>,
     host: Vec<u32>,
     present: std::collections::HashSet<u32>,
-    /// Сколько первых строк словаря входят в список всегда.
+    /// How many first vocab rows are always in the list.
     frequent: usize,
     dirty: bool,
 }
@@ -459,7 +459,7 @@ impl Shortlist {
         })
     }
 
-    /// Начать список заново под другую последовательность.
+    /// Start the list over for another sequence.
     fn reset(&mut self, context: &[u32]) {
         self.host.clear();
         self.present.clear();
@@ -508,9 +508,9 @@ impl Speculator {
         })
     }
 
-    /// Включает шортлист словаря для черновых логитов. `frequent` — сколько
-    /// первых строк словаря держать всегда, `context_capacity` — сколько
-    /// различных токенов последовательности список может вместить сверх них.
+    /// Enables the vocab shortlist for draft logits. `frequent` — how many
+    /// first vocab rows to always keep, `context_capacity` — how many
+    /// distinct sequence tokens the list can hold beyond them.
     pub fn enable_shortlist(
         &mut self,
         frequent: usize,
@@ -521,16 +521,16 @@ impl Speculator {
         Ok(())
     }
 
-    /// Токены контекста для шортлиста: промпт последовательности и всё, что
-    /// она уже выдала. Без них покрытие падает с 0.958 до 0.915.
+    /// Context tokens for the shortlist: the sequence's prompt and everything
+    /// it has already emitted. Without them coverage drops from 0.958 to 0.915.
     pub fn set_context(&mut self, context: &[u32]) {
         if let Some(shortlist) = self.shortlist.as_mut() {
             shortlist.reset(context);
         }
     }
 
-    /// Принятый токен продолжает контекст: следующий черновик должен уметь
-    /// его повторить.
+    /// An accepted token continues the context: the next draft must be able
+    /// to repeat it.
     pub fn observe(&mut self, token: u32) {
         if let Some(shortlist) = self.shortlist.as_mut() {
             shortlist.push(token);
@@ -541,14 +541,14 @@ impl Speculator {
         self.head.resident_bytes() + self.scratch.resident_bytes()
     }
 
-    /// Буфер под скрытые состояния основной модели, до `MAX_ROWS` строк:
-    /// исполнитель копирует их сюда перед `draft_chain`.
+    /// Buffer for the main model's hidden states, up to `MAX_ROWS` rows:
+    /// the executor copies them here before `draft_chain`.
     pub fn hidden_mut(&mut self) -> &mut DeviceBuffer<u16> {
         &mut self.hidden
     }
 
-    /// Переключает спекулятор на другую последовательность, если нужно.
-    /// Возвращает `true`, если KV головы был сброшен.
+    /// Switches the speculator to another sequence if needed.
+    /// Returns `true` if the head's KV was reset.
     pub fn bind(&mut self, sequence: u32) -> qwc_cuda::Result<bool> {
         if self.owner == Some(sequence) {
             return Ok(false);
@@ -559,18 +559,18 @@ impl Speculator {
         Ok(true)
     }
 
-    /// Привязать спекулятор к последовательности с промптом `prompt`.
+    /// Bind the speculator to a sequence with prompt `prompt`.
     ///
-    /// Если новый промпт продолжает промпт прежнего владельца — следующий ход
-    /// того же диалога, — KV головы на общей части остаётся: пары (h, токен)
-    /// там те же. Это важно вместе с кэшем префиксов: закэшированную
-    /// историю движок не прогоняет, и голова её заново не увидит.
+    /// If the new prompt continues the previous owner's prompt — the next turn
+    /// of the same dialog — the head's KV on the common part stays: the (h, token) pairs
+    /// are the same there. This matters together with the prefix cache: the engine doesn't
+    /// run the cached history, and the head won't see it again.
     ///
-    /// Всё за общей частью обнуляется. Иначе два диалога с одним системным
-    /// промптом видели бы за ним KV друг друга — это хуже нулей. Позиция t
-    /// несёт пару (h_t, токен t+1), поэтому последняя общая позиция тоже
-    /// чужая: её пара — с токеном, на котором промпты разошлись. Возвращает
-    /// длину унаследованной части; 0 — KV сброшен целиком.
+    /// Everything beyond the common part is zeroed. Otherwise two dialogs with the same system
+    /// prompt would see each other's KV after it — that's worse than zeros. Position t
+    /// carries the pair (h_t, token t+1), so the last common position is
+    /// foreign too: its pair has the token where the prompts diverged. Returns
+    /// the length of the inherited part; 0 — the KV was reset entirely.
     pub fn bind_prompt(&mut self, sequence: u32, prompt: &[u32]) -> qwc_cuda::Result<usize> {
         if self.owner == Some(sequence) {
             return Ok(prompt.len());
@@ -589,14 +589,14 @@ impl Speculator {
         Ok(keep)
     }
 
-    /// Заполняет KV головы по строкам prefill-шага: строка `first_row + i`
-    /// несёт h_t, `tokens[i]` — токен t+1, а `first_position` — позиция
-    /// `tokens[0]`. Выход головы выбрасывается, нужен только её KV.
+    /// Fills the head's KV from the rows of a prefill step: row `first_row + i`
+    /// carries h_t, `tokens[i]` is token t+1, and `first_position` is the position of
+    /// `tokens[0]`. The head's output is discarded, only its KV is needed.
     ///
-    /// Без этого голова видит на промпте нули: `bind` обнуляет кэш, а
-    /// черновики пишут только свои позиции. Оффлайн-эталон с полным KV даёт
-    /// 0.913 на первом черновике, голова с пустым — 0.850. vLLM прогоняет
-    /// MTP-слой по всему промпту на префилле.
+    /// Without this the head sees zeros on the prompt: `bind` zeroes the cache, and
+    /// drafts write only their own positions. An offline reference with full KV gives
+    /// 0.913 on the first draft, a head with empty KV — 0.850. vLLM runs
+    /// the MTP layer over the whole prompt during prefill.
     pub fn prime(
         &mut self,
         weights: &ModelWeights,
@@ -622,22 +622,22 @@ impl Speculator {
                 &mut self.draft_hidden,
                 &self.stream,
             )?;
-            // Следующая порция перепишет `hidden` с чужого потока.
+            // The next batch will overwrite `hidden` from another stream.
             self.stream.synchronize()?;
         }
         Ok(())
     }
 
-    /// Цепочка из `depth` черновиков.
+    /// A chain of `depth` drafts.
     ///
-    /// `tokens` — токены, чьи пары (h, токен) голова ещё не видела с
-    /// настоящими h: строки `hidden` лежат для них подряд, `position` —
-    /// позиция `tokens[0]`. После обычного шага это один ожидающий токен,
-    /// после проверки — все принятые плюс исправленный: их KV черновики
-    /// писали по собственному выходу головы, и первый проход переписывает его
-    /// настоящими состояниями основной модели. Строки идут одним проходом по
-    /// весам головы, поэтому переписывание почти бесплатно. Дальше голова
-    /// продолжает по собственному выходу.
+    /// `tokens` — tokens whose (h, token) pairs the head hasn't yet seen with
+    /// real h: `hidden` rows for them are contiguous, `position` is the
+    /// position of `tokens[0]`. After a regular step it's one pending token,
+    /// after verification — all accepted plus the corrected one: their KV was written by drafts
+    /// from the head's own output, and the first pass rewrites it with
+    /// the main model's real states. The rows go in one pass over the
+    /// head's weights, so the rewrite is almost free. After that the head
+    /// continues from its own output.
     pub fn draft_chain(
         &mut self,
         weights: &ModelWeights,
@@ -655,7 +655,7 @@ impl Speculator {
             } else {
                 &self.draft_hidden
             };
-            // SAFETY: оба буфера живут в self и не пересекаются с выходом.
+            // SAFETY: both buffers live in self and don't overlap with the output.
             let source = unsafe { &*source };
             if step == 0 {
                 let positions: Vec<u32> =
@@ -670,7 +670,7 @@ impl Speculator {
                     &mut self.draft_hidden,
                     &self.stream,
                 )?;
-                // Словарь и следующий шаг читают строку 0.
+                // The vocab and the next step read row 0.
                 self.draft_hidden
                     .copy_within(0, last * HIDDEN_SIZE, HIDDEN_SIZE, &self.stream)?;
             } else {
@@ -695,8 +695,8 @@ impl Speculator {
                         count,
                         &self.stream,
                     )?;
-                    // argmax идёт по плотному выходу, поэтому возвращает место
-                    // в списке, а не токен.
+                    // argmax runs over the dense output, so it returns a position
+                    // in the list, not a token.
                     match used {
                         true => {
                             let slot =

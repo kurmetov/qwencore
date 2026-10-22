@@ -1,72 +1,72 @@
 # Prefill DeltaNet — 2026-09-12
 
-> **Одиночные точки одной сессии, без доверительных интервалов.** Сравнение с
-> vLLM здесь снято до появления протокола
-> [`docs/11-experiments.md`](../../docs/11-experiments.md): один-два прогона на
-> точку, без ротации порядка вариантов и без bootstrap CI, на частично занятой
-> карте. Эти множители отменяются прогоном comparison suite и не должны
-> цитироваться как результат проекта. Условия каждой точки — ниже по тексту.
+> **Single points from one session, without confidence intervals.** The comparison with
+> vLLM here was taken before the protocol
+> [`docs/11-experiments.md`](../../docs/11-experiments.md) existed: one or two runs per
+> point, no variant order rotation and no bootstrap CI, on a partially busy
+> card. These multipliers are superseded by a comparison suite run and must not
+> be quoted as a project result. The conditions of each point are given below.
 
-RTX 5090, `Qwen3.8-27B-QUASAR-NVFP4`, KV fp8, контекст 2048, 200 запросов по
-256 промпт-токенов и 128 новых.
+RTX 5090, `Qwen3.8-27B-QUASAR-NVFP4`, KV fp8, context 2048, 200 requests of
+256 prompt tokens and 128 new.
 
-## Откуда взялось
+## Where it came from
 
-После батчевого `lm_head` крупнейшим блоком смешанного шага остался prefill
-DeltaNet: 37.1 мс из 90.6 на сегменте в 448 токенов. Замер по длинам сегмента
-(32 / 112 / 224 / 448 токенов) дал строгую линейность — 62 мкс на токен, — то
-есть дело не в накладных запусков, а в том, что работа на токен идёт почти
-без параллелизма.
+After the batched `lm_head`, the biggest block of the mixed step was DeltaNet
+prefill: 37.1 ms of 90.6 on a 448-token segment. Measuring by segment length
+(32 / 112 / 224 / 448 tokens) showed strict linearity — 62 µs per token — i.e.
+it's not launch overhead, but that the per-token work runs almost
+without parallelism.
 
-## Скан: варп вместо блока
+## Scan: a warp instead of a block
 
-Рекуррентность последовательна по токенам, но строки состояния независимы —
-связывает их только скаляр `k.q`. Прежний кернел держал `k` и `q` в shared,
-ставил на каждый токен три `__syncthreads()` и считал `k.q` одним варпом из
-восьми, пока остальные семь стояли на барьере.
+The recurrence is sequential over tokens, but state rows are independent —
+the only thing linking them is the scalar `k.q`. The old kernel kept `k` and `q` in shared,
+put three `__syncthreads()` on every token and computed `k.q` with one warp out of
+eight while the other seven waited at the barrier.
 
-Теперь варп владеет строкой состояния и идёт по токенам сам: `k` и `q`
-читаются вектором прямо из global, `k.q` варп считает себе сам в той же
-бабочке, что `S k` и `S q` — три редукции за пять шагов вместо двух подряд с
-броадкастом через shared. Барьеров не осталось ни одного. Сетка ставит одну
-строку состояния на варп: 48 голов x 16 блоков = 768 блоков на 170 SM.
+Now a warp owns a state row and walks the tokens by itself: `k` and `q`
+are read as vectors straight from global, the warp computes `k.q` for itself in the same
+butterfly as `S k` and `S q` — three reductions in five steps instead of two in a row with
+a broadcast through shared. Not a single barrier is left. The grid puts one
+state row per warp: 48 heads x 16 blocks = 768 blocks on 170 SMs.
 
-## Свёртка: параллельно по токенам
+## Convolution: parallel over tokens
 
-`causal_conv_prefill_kernel` отдавал потоку канал целиком и шёл по токенам в
-программном порядке — 40 блоков на 170 SM, меньше четверти чипа. Но свёртка
-на четыре отвода по токенам параллельна; последовательна только переноска
-истории между чанками. Поток теперь считает один выход `(канал, токен)`, а
-хвост истории дописывает отдельный запуск — писать её в том же кернеле
-значило бы гонку с блоками, которые ту же историю читают на первых трёх
-токенах.
+`causal_conv_prefill_kernel` gave a thread a whole channel and walked tokens in
+program order — 40 blocks on 170 SMs, less than a quarter of the chip. But a four-tap
+convolution is parallel over tokens; only carrying the history
+between chunks is sequential. A thread now computes one output `(channel, token)`, and
+the history tail is written by a separate launch — writing it in the same
+kernel would mean a race with blocks that read the same history on the first three
+tokens.
 
-## Фазы смешанного шага (c=64, сегмент 448)
+## Mixed step phases (c=64, segment 448)
 
-| фаза | было, мс | стало, мс |
+| phase | before, ms | after, ms |
 |---|---:|---:|
 | `delta.scan_prefill` | 27.71 | 15.93 |
 | `delta.prepare_prefill` | 9.38 | 1.64 |
-| шаг целиком | 90.56 | 69.86 |
+| whole step | 90.56 | 69.86 |
 
-Шаг чистого decode не изменился: 32.0 мс — обе правки касаются только prefill.
+The pure decode step didn't change: 32.0 ms — both changes only touch prefill.
 
-## Сквозная пропускная способность
+## End-to-end throughput
 
-| concurrency | до сегодня | после lm_head | после prefill | итого | vLLM 0.28.0 |
+| concurrency | before today | after lm_head | after prefill | total | vLLM 0.28.0 |
 |---|---:|---:|---:|---:|---:|
 | 32 | 749.97 | 839.15 | 902.64 | 1.20× | 982.64 |
 | 64 | 952.60 | 1138.70 | 1274.74 | 1.34× | 1001.80 |
 | 80 | 1026.24 | 1254.10 | 1447.44 | 1.41× | 984.70 |
 
-TTFT p50 на c=64: 9320 -> 6692 мс, на c=80: 9737 -> 6725 мс.
+TTFT p50 at c=64: 9320 -> 6692 ms, at c=80: 9737 -> 6725 ms.
 
-## Что осталось в скане
+## What's left in the scan
 
-15.9 мс — это 36 мкс на токен. Диагностический прогон с укороченной бабочкой
-(три шага вместо пяти) даёт 13.2 мс, то есть на шаффлы приходится около 6 мс
-из 15.9. Дальше — раскладка с восемью дорожками на строку состояния вместо
-тридцати двух: шагов бабочки становится три, а варп покрывает четыре строки,
-то есть шаффл-работы на строку в шесть раз меньше. Но блоков при этом
-остаётся 192 на 170 SM, и выигрыш упрётся в занятость — это замер, а не
-очевидность.
+15.9 ms is 36 µs per token. A diagnostic run with a shortened butterfly
+(three steps instead of five) gives 13.2 ms, i.e. shuffles account for about 6 ms
+of 15.9. Next is a layout with eight lanes per state row instead of
+thirty-two: the butterfly becomes three steps, and a warp covers four rows,
+i.e. six times less shuffle work per row. But the block count
+stays at 192 on 170 SMs, and the gain will hit occupancy — that's for measurement, not
+obvious.

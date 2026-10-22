@@ -1,0 +1,70 @@
+LOAD r=1 1.72 2 %, 450 MHz, 32
+QWC r=1   gate/up |     1 |     32.95 us |   1522 GB/s |     94.8%
+QWC r=1      down |     1 |     33.14 us |   1513 GB/s |     94.2%
+QWC r=1    q+gate |     1 |     26.34 us |   1344 GB/s |     83.7%
+CUT r=1 RESULT mode=per_matrix m=17408 k=5120 us_per_matrix=32.98 weight_GBps=1520 min_ms=5.2634 max_ms=5.5989
+CUT r=1 RESULT mode=batched m=17408 k=5120 us_per_matrix=30.29 weight_GBps=1655 min_ms=4.8403 max_ms=5.1839
+CUT r=1 RESULT mode=per_matrix m=5120 k=17408 us_per_matrix=32.24 weight_GBps=1555 min_ms=5.1539 max_ms=5.6911
+CUT r=1 RESULT mode=batched m=5120 k=17408 us_per_matrix=30.46 weight_GBps=1646 min_ms=4.8640 max_ms=5.7174
+CUT r=1 RESULT mode=per_matrix m=12288 k=5120 us_per_matrix=24.24 weight_GBps=1460 min_ms=3.8670 max_ms=4.1230
+CUT r=1 RESULT mode=batched m=12288 k=5120 us_per_matrix=21.60 weight_GBps=1638 min_ms=3.4513 max_ms=3.7088
+LOAD r=2 1.85 1 %, 2497 MHz, 35
+CUT r=2 RESULT mode=per_matrix m=17408 k=5120 us_per_matrix=34.35 weight_GBps=1460 min_ms=5.2704 max_ms=5.5098
+CUT r=2 RESULT mode=batched m=17408 k=5120 us_per_matrix=30.30 weight_GBps=1655 min_ms=4.8431 max_ms=5.3519
+CUT r=2 RESULT mode=per_matrix m=5120 k=17408 us_per_matrix=32.31 weight_GBps=1552 min_ms=5.1568 max_ms=5.6139
+CUT r=2 RESULT mode=batched m=5120 k=17408 us_per_matrix=30.49 weight_GBps=1644 min_ms=4.8707 max_ms=5.2167
+CUT r=2 RESULT mode=per_matrix m=12288 k=5120 us_per_matrix=24.20 weight_GBps=1463 min_ms=3.8581 max_ms=4.1176
+CUT r=2 RESULT mode=batched m=12288 k=5120 us_per_matrix=21.61 weight_GBps=1638 min_ms=3.4512 max_ms=3.7886
+QWC r=2   gate/up |     1 |     33.35 us |   1503 GB/s |     93.7%
+QWC r=2      down |     1 |     33.07 us |   1516 GB/s |     94.5%
+QWC r=2    q+gate |     1 |     24.38 us |   1452 GB/s |     90.5%
+LOAD r=3 1.98 99 %, 2872 MHz, 45
+QWC r=3   gate/up |     1 |     32.92 us |   1523 GB/s |     94.9%
+QWC r=3      down |     1 |     33.14 us |   1513 GB/s |     94.3%
+QWC r=3    q+gate |     1 |     24.38 us |   1451 GB/s |     90.4%
+CUT r=3 RESULT mode=per_matrix m=17408 k=5120 us_per_matrix=34.54 weight_GBps=1452 min_ms=5.2651 max_ms=5.8644
+CUT r=3 RESULT mode=batched m=17408 k=5120 us_per_matrix=30.31 weight_GBps=1654 min_ms=4.8428 max_ms=5.1052
+CUT r=3 RESULT mode=per_matrix m=5120 k=17408 us_per_matrix=32.25 weight_GBps=1555 min_ms=5.1530 max_ms=5.6017
+CUT r=3 RESULT mode=batched m=5120 k=17408 us_per_matrix=30.47 weight_GBps=1645 min_ms=4.8656 max_ms=5.1995
+CUT r=3 RESULT mode=per_matrix m=12288 k=5120 us_per_matrix=24.20 weight_GBps=1462 min_ms=3.8661 max_ms=4.0597
+CUT r=3 RESULT mode=batched m=12288 k=5120 us_per_matrix=21.59 weight_GBps=1639 min_ms=3.4524 max_ms=3.6994
+LOAD r=4 2.15 1 %, 2505 MHz, 36
+CUT r=4 RESULT mode=per_matrix m=17408 k=5120 us_per_matrix=32.99 weight_GBps=1520 min_ms=5.2660 max_ms=5.5639
+CUT r=4 RESULT mode=batched m=17408 k=5120 us_per_matrix=30.31 weight_GBps=1654 min_ms=4.8420 max_ms=5.3439
+CUT r=4 RESULT mode=per_matrix m=5120 k=17408 us_per_matrix=32.29 weight_GBps=1553 min_ms=5.1533 max_ms=5.7841
+CUT r=4 RESULT mode=batched m=5120 k=17408 us_per_matrix=32.14 weight_GBps=1560 min_ms=4.8727 max_ms=5.6546
+CUT r=4 RESULT mode=per_matrix m=12288 k=5120 us_per_matrix=24.18 weight_GBps=1464 min_ms=3.8595 max_ms=4.3462
+CUT r=4 RESULT mode=batched m=12288 k=5120 us_per_matrix=21.60 weight_GBps=1638 min_ms=3.4488 max_ms=3.7095
+QWC r=4   gate/up |     1 |     32.93 us |   1522 GB/s |     94.9%
+QWC r=4      down |     1 |     32.93 us |   1522 GB/s |     94.8%
+QWC r=4    q+gate |     1 |     24.17 us |   1464 GB/s |     91.2%
+LOAD r=5 1.95 100 %, 2872 MHz, 49
+QWC r=5   gate/up |     1 |     32.96 us |   1521 GB/s |     94.8%
+QWC r=5      down |     1 |     32.89 us |   1525 GB/s |     95.0%
+QWC r=5    q+gate |     1 |     24.23 us |   1461 GB/s |     91.0%
+CUT r=5 RESULT mode=per_matrix m=17408 k=5120 us_per_matrix=32.95 weight_GBps=1521 min_ms=5.2686 max_ms=5.5108
+CUT r=5 RESULT mode=batched m=17408 k=5120 us_per_matrix=30.35 weight_GBps=1652 min_ms=4.8425 max_ms=5.3509
+CUT r=5 RESULT mode=per_matrix m=5120 k=17408 us_per_matrix=32.25 weight_GBps=1555 min_ms=5.1535 max_ms=5.5892
+CUT r=5 RESULT mode=batched m=5120 k=17408 us_per_matrix=32.06 weight_GBps=1564 min_ms=4.8673 max_ms=5.4646
+CUT r=5 RESULT mode=per_matrix m=12288 k=5120 us_per_matrix=24.15 weight_GBps=1465 min_ms=3.8580 max_ms=4.0259
+CUT r=5 RESULT mode=batched m=12288 k=5120 us_per_matrix=21.65 weight_GBps=1635 min_ms=3.4573 max_ms=3.8099
+LOAD r=6 2.11 1 %, 2535 MHz, 37
+CUT r=6 RESULT mode=per_matrix m=17408 k=5120 us_per_matrix=35.98 weight_GBps=1394 min_ms=5.2778 max_ms=7.6781
+CUT r=6 RESULT mode=batched m=17408 k=5120 us_per_matrix=30.43 weight_GBps=1648 min_ms=4.8422 max_ms=6.3414
+CUT r=6 RESULT mode=per_matrix m=5120 k=17408 us_per_matrix=32.23 weight_GBps=1555 min_ms=5.1495 max_ms=5.9951
+CUT r=6 RESULT mode=batched m=5120 k=17408 us_per_matrix=32.03 weight_GBps=1565 min_ms=4.8755 max_ms=5.2105
+CUT r=6 RESULT mode=per_matrix m=12288 k=5120 us_per_matrix=24.15 weight_GBps=1465 min_ms=3.8612 max_ms=4.3166
+CUT r=6 RESULT mode=batched m=12288 k=5120 us_per_matrix=21.63 weight_GBps=1636 min_ms=3.4558 max_ms=3.8122
+QWC r=6   gate/up |     1 |     33.06 us |   1516 GB/s |     94.5%
+QWC r=6      down |     1 |     33.16 us |   1512 GB/s |     94.2%
+QWC r=6    q+gate |     1 |     24.34 us |   1454 GB/s |     90.6%
+LOAD r=7 3.07 100 %, 2872 MHz, 49
+QWC r=7   gate/up |     1 |     34.71 us |   1444 GB/s |     90.0%
+QWC r=7      down |     1 |     33.06 us |   1517 GB/s |     94.5%
+QWC r=7    q+gate |     1 |     24.34 us |   1454 GB/s |     90.6%
+CUT r=7 RESULT mode=per_matrix m=17408 k=5120 us_per_matrix=33.00 weight_GBps=1519 min_ms=5.2608 max_ms=6.3924
+CUT r=7 RESULT mode=batched m=17408 k=5120 us_per_matrix=30.36 weight_GBps=1651 min_ms=4.8502 max_ms=5.9272
+CUT r=7 RESULT mode=per_matrix m=5120 k=17408 us_per_matrix=32.31 weight_GBps=1552 min_ms=5.1584 max_ms=5.5426
+CUT r=7 RESULT mode=batched m=5120 k=17408 us_per_matrix=30.47 weight_GBps=1645 min_ms=4.8667 max_ms=5.5405
+CUT r=7 RESULT mode=per_matrix m=12288 k=5120 us_per_matrix=24.18 weight_GBps=1463 min_ms=3.8632 max_ms=4.1008
+CUT r=7 RESULT mode=batched m=12288 k=5120 us_per_matrix=21.65 weight_GBps=1634 min_ms=3.4584 max_ms=3.7896

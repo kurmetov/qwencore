@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Время decode-шага у запущенного `serve` на длинном промпте.
+"""Decode step time of a running `serve` on a long prompt.
 
-Шаг берётся наклоном между запросами в 1 и N+1 токен: префилл, прогрев
-головы и накладные расходы запроса сокращаются. Промпты — склейка документов
-`bench/corpus/state-length.jsonl`, у каждого одновременного запроса свой
-порядок документов. Кэш префиксов на сервере должен быть выключен
-(`--prefix-cache 0`), иначе повторный запрос не пересчитывает промпт и наклон
-врёт.
+The step is taken as the slope between requests of 1 and N+1 tokens: prefill, head
+warmup and request overhead cancel out. Prompts are concatenations of documents from
+`bench/corpus/state-length.jsonl`, with each concurrent request getting its own
+document order. The server's prefix cache must be off
+(`--prefix-cache 0`), otherwise a repeated request doesn't recompute the prompt and the slope
+lies.
 
   bench/serve_decode.py --lengths 8192,30000 --concurrency 1,2
 """

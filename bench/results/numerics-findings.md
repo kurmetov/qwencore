@@ -1,10 +1,10 @@
 # Locating the qwc↔vLLM logprob drift — 2026-09-11
 
-> **Снято в конфигурации, которой больше нет.** С поднятым FlashInfer vLLM
-> берёт `FLASHINFER` attention и `FlashInferCutlassNvFp4LinearKernel` вместо
-> ядер, против которых считались числа ниже — см.
-> [`budget-sweep-2026-09-17.md`](budget-sweep-2026-09-17.md). Вывод «в 70 раз
-> ближе к истине» требует переснятия.
+> **Taken in a configuration that no longer exists.** With FlashInfer brought up, vLLM
+> takes `FLASHINFER` attention and `FlashInferCutlassNvFp4LinearKernel` instead of
+> the kernels the numbers below were computed against — see
+> [`budget-sweep-2026-09-17.md`](budget-sweep-2026-09-17.md). The conclusion "70 times
+> closer to the truth" needs re-measuring.
 
 Baseline: `qwc-b1` reproduces all 120 greedy tokens of the reference but sits
 at logprob MAE 0.364 against `vllm.jsonl`, above the 0.25 threshold.

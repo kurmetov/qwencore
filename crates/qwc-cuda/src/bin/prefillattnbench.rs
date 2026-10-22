@@ -1,13 +1,13 @@
-//! Внимание на префилле: три пути на одной форме.
+//! Prefill attention: three paths on one shape.
 //! `cargo run --release -p qwc-cuda --bin prefillattnbench [bf16|fp8]`
 //!
-//! Форма взята из движка: чанк строк запроса на своей позиции в промпте,
-//! то есть каждая строка видит свой причинный префикс. Слои держат отдельные
-//! кэши, иначе один буфер осел бы в L2 и замер бы поехал.
+//! The shape comes from the engine: a chunk of query rows at its position in the prompt,
+//! i.e. each row sees its own causal prefix. Layers keep separate
+//! caches, otherwise one buffer would settle in L2 and skew the measurement.
 //!
-//! Второй аргумент задаёт размер чанка (по умолчанию 511). Медленные пути
-//! decode и тайловый считаются только на чанках до 512 строк: на больших
-//! decode идёт десятки секунд и меряет не то.
+//! The second argument sets the chunk size (default 511). The slow decode and
+//! tiled paths are computed only on chunks up to 512 rows: on larger ones
+//! decode takes tens of seconds and measures the wrong thing.
 
 use qwc_core::arch::{ATTN_HEAD_DIM, NUM_ATTN_HEADS, NUM_FULL_LAYERS, NUM_KV_HEADS};
 use qwc_cuda::paged_attention::{self, KvCacheDtype, PAGE_SIZE, PagedAttentionWorkspace};
@@ -31,17 +31,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[allow(non_snake_case)]
     let ROWS: usize = std::env::args()
         .nth(2)
-        .map(|a| a.parse().expect("число строк чанка"))
+        .map(|a| a.parse().expect("chunk row count"))
         .unwrap_or(511);
     let slow_paths = ROWS <= 512;
 
     println!(
-        "Внимание на префилле, RTX 5090 ({} SM), {} слоёв, KV {:?}, {ROWS} строк чанка\n",
+        "Prefill attention, RTX 5090 ({} SM), {} layers, KV {:?}, {ROWS} chunk rows\n",
         device.sm_count, NUM_FULL_LAYERS, dtype
     );
     println!(
         "  {:>8} | {:>12} | {:>12} | {:>12} | {:>8} | {:>11}",
-        "позиция", "decode", "тайловое", "MMA", "выигрыш", "MMA/токен"
+        "position", "decode", "tiled", "MMA", "speedup", "MMA/token"
     );
     println!(
         "  {:->8}-+-{:->12}-+-{:->12}-+-{:->12}-+-{:->8}-+-{:->11}",
@@ -83,8 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let device_tables = DeviceBuffer::from_slice(&tables)?;
         let device_lengths = DeviceBuffer::from_slice(&contexts)?;
         let mut output = DeviceBuffer::<u16>::zeroed(query.len())?;
-        // Workspace нужен только пути decode, а он считается лишь на малых
-        // чанках: его разметка ограничена 1024 строками.
+        // Workspace is needed only by the decode path, and that runs only on small
+        // chunks: its layout is limited to 1024 rows.
         let mut workspace = PagedAttentionWorkspace::new(ROWS.min(1024), max_context)?;
 
         let mut run = |path: Path| -> qwc_cuda::Result<()> {
@@ -131,11 +131,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ms.is_nan() {
                 format!("{:>12}", "-")
             } else {
-                format!("{:>9.3} мс", ms)
+                format!("{:>9.3} ms", ms)
             }
         };
         println!(
-            "  {:>8} | {} | {} | {:>9.3} мс | {:>7} | {:>8.1} us",
+            "  {:>8} | {} | {} | {:>9.3} ms | {:>7} | {:>8.1} us",
             start,
             cell(decode_ms),
             cell(tiled_ms),

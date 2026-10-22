@@ -1,13 +1,13 @@
-//! Упакованное внимание против прежних путей на формах `flashinfer_attention.py`.
+//! Packed attention vs the previous paths on `flashinfer_attention.py` shapes.
 //! `cargo run --release -p qwc-cuda --bin packedbench [-- --sweep] [--rows 64,128]`
 //!
-//! Сегмент — `rows` строк одной последовательности за историей `start`:
-//! проверка черновиков, хвост промпта, чанк. Прежний путь движка для него —
-//! MMA-префилл без разбиения (`prefill_gated_mma`). Decode — `batch`
-//! строк разных последовательностей с контекстом `context`, прежний путь —
-//! `decode_gated`. Слои держат отдельные кэши, иначе контекст осел бы в L2.
-//! `--sweep` добавляет свип числа партиций упакованного ядра, `--rows`
-//! оставляет только сегменты этих размеров и пропускает decode.
+//! A segment is `rows` rows of one sequence after `start` of history:
+//! draft verification, a prompt tail, a chunk. The engine's previous path for it is
+//! the unsplit MMA prefill (`prefill_gated_mma`). Decode is `batch`
+//! rows of different sequences with context `context`; the previous path is
+//! `decode_gated`. Layers keep separate caches, otherwise the context would settle in L2.
+//! `--sweep` adds a sweep over the packed kernel's partition count, `--rows`
+//! keeps only segments of those sizes and skips decode.
 
 use qwc_core::arch::{ATTN_HEAD_DIM, NUM_ATTN_HEADS, NUM_FULL_LAYERS, NUM_KV_HEADS};
 use qwc_cuda::paged_attention::{
@@ -25,7 +25,7 @@ fn caches(num_blocks: usize) -> Caches {
         .collect()
 }
 
-/// Мкс на слой: медиана семи замеров по пять проходов всех слоёв.
+/// Us per layer: median of seven measurements of five passes over all layers.
 fn time(
     stream: &Stream,
     mut run: impl FnMut(&DeviceBuffer<u8>, &DeviceBuffer<u8>) -> qwc_cuda::Result<()>,
@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .position(|arg| arg == "--rows")
         .map(|at| arguments[at + 1].split(',').map(|rows| rows.parse().unwrap()).collect());
-    // `--dense`: все P от 1 до 48 — для подгонки выбора партиций.
+    // `--dense`: every P from 1 to 48 — for fitting the partition choice.
     let dense = arguments.iter().any(|arg| arg == "--dense");
     let forced: Vec<usize> = if dense {
         (1..=48).collect()
@@ -95,12 +95,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::init(0)?;
     let stream = Stream::new()?;
     println!(
-        "Упакованное внимание, RTX 5090 ({} SM), {} слоёв, KV fp8; мкс на слой\n",
+        "Packed attention, RTX 5090 ({} SM), {} layers, KV fp8; us per layer\n",
         device.sm_count, NUM_FULL_LAYERS
     );
 
-    println!("Сегмент одной последовательности");
-    print!("  {:>5} | {:>6} | {:>14} | {:>14}", "строк", "старт", "MMA", "упакованное");
+    println!("Segment of one sequence");
+    print!("  {:>5} | {:>6} | {:>14} | {:>14}", "rows", "start", "MMA", "packed");
     if sweep {
         for &partitions in &forced {
             print!(" | {:>7}", format!("P={partitions}"));
@@ -172,8 +172,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if only_rows.is_some() {
         return Ok(());
     }
-    println!("\nDecode: строки разных последовательностей");
-    print!("  {:>5} | {:>7} | {:>14} | {:>14}", "batch", "контекст", "decode_gated", "упакованное");
+    println!("\nDecode: rows of different sequences");
+    print!("  {:>5} | {:>7} | {:>14} | {:>14}", "batch", "context", "decode_gated", "packed");
     if sweep {
         for &partitions in &forced {
             print!(" | {:>7}", format!("P={partitions}"));

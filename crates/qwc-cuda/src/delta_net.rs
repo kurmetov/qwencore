@@ -1,21 +1,21 @@
-//! Gated DeltaNet: рекуррентный шаг decode.
+//! Gated DeltaNet: the recurrent decode step.
 //!
-//! Реализует 48 из 64 слоёв Qwen3.8. Подробности математики и раскладки —
-//! в `cuda/delta_net.cu`.
+//! Implements 48 of Qwen3.8's 64 layers. Details of the math and layout are
+//! in `cuda/delta_net.cu`.
 
 use crate::error::{Result, check};
 use crate::{DeviceBuffer, Stream, ffi};
 use qwc_core::arch::{LA_K_HEAD_DIM, LA_NUM_K_HEADS, LA_NUM_V_HEADS, LA_V_HEAD_DIM};
 
-/// Элементов состояния на одну последовательность в одном слое.
+/// State elements per sequence in one layer.
 pub const STATE_ELEMS: usize = LA_NUM_V_HEADS * LA_V_HEAD_DIM * LA_K_HEAD_DIM;
-/// Элементов q или k на последовательность.
+/// q or k elements per sequence.
 pub const QK_ELEMS: usize = LA_NUM_K_HEADS * LA_K_HEAD_DIM;
-/// Элементов v или выхода на последовательность.
+/// v or output elements per sequence.
 pub const V_ELEMS: usize = LA_NUM_V_HEADS * LA_V_HEAD_DIM;
-/// Гейтов (alpha, beta) на последовательность.
+/// Gates (alpha, beta) per sequence.
 pub const GATE_ELEMS: usize = LA_NUM_V_HEADS;
-/// Скаляров k.q на последовательность: по одному на k-голову.
+/// k.q scalars per sequence: one per k head.
 pub const KQ_ELEMS: usize = LA_NUM_K_HEADS;
 /// FP32 causal-convolution history per persistent sequence slot and layer.
 pub const CONV_STATE_ELEMS: usize = qwc_core::arch::LA_CONV_CHANNELS * 3;
@@ -23,20 +23,20 @@ pub const CONV_STATE_ELEMS: usize = qwc_core::arch::LA_CONV_CHANNELS * 3;
 /// Matrix tile used by the parallel WY prefill scan.
 pub const WY_CHUNK_SIZE: usize = 64;
 
-/// Как считается chunk на prefill.
+/// How a prefill chunk is computed.
 ///
-/// `Bf16` и `Fp32` — один и тот же рекуррентный проход по токенам, разной
-/// точности состояния. `Bf16` округляет состояние после каждого токена,
-/// поэтому chunk воспроизводит повторный decode бит в бит. `Fp32` держит
-/// строку состояния в регистрах до конца chunk и округляет только запись на
-/// границе — так делает эталонная реализация (flash-linear-attention копит
-/// `b_h` в FP32 через все чанки). Их A/B изолирует потокенное округление как
-/// источник расхождения.
+/// `Bf16` and `Fp32` are the same recurrent pass over tokens with different
+/// state precision. `Bf16` rounds the state after every token,
+/// so a chunk reproduces repeated decode bit for bit. `Fp32` keeps
+/// the state row in registers until the end of the chunk and rounds only the write at
+/// the boundary — that's what the reference implementation does (flash-linear-attention accumulates
+/// `b_h` in FP32 across all chunks). Their A/B isolates per-token rounding as
+/// a source of divergence.
 ///
-/// `Wy` — другой алгоритм, а не другая точность: chunk считается матрицами
-/// на тензорных ядрах (`bench/results/deltanet-wy-2026-09-16.md`). Состояние
-/// внутри chunk копится в FP32, поэтому по округлениям `Wy` ближе всего к
-/// `Fp32`. Это быстрейший путь на промптах длиннее пары чанков и он требует
+/// `Wy` is a different algorithm, not a different precision: a chunk is computed with matrices
+/// on tensor cores (`bench/results/deltanet-wy-2026-09-16.md`). The state
+/// within a chunk accumulates in FP32, so in terms of rounding `Wy` is closest to
+/// `Fp32`. It's the fastest path on prompts longer than a couple of chunks and requires
 /// `DeltaPrefillWorkspace`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeltaStateMode {
@@ -54,19 +54,19 @@ impl DeltaStateMode {
         }
     }
 
-    /// Только для рекуррентного пути: WY-скан токены поштучно не округляет,
-    /// и вызов на нём — ошибка вызывающего, а не режим по умолчанию.
+    /// Only for the recurrent path: the WY scan doesn't round tokens one by one,
+    /// and calling this on it is a caller error, not a default mode.
     fn round_per_token(self) -> i32 {
         match self {
             Self::Bf16 => 1,
             Self::Fp32 => 0,
-            Self::Wy => unreachable!("WY-скан не округляет состояние по токенам"),
+            Self::Wy => unreachable!("the WY scan doesn't round the state per token"),
         }
     }
 }
 
-/// Чанков в самом длинном шаге: фазы, не зависящие от состояния, считаются
-/// сразу по всем, поэтому их буферы рассчитаны на полную арену.
+/// Chunks in the longest step: state-independent phases are computed
+/// for all of them at once, so their buffers are sized for the full arena.
 const WY_MAX_CHUNKS: usize = crate::MAX_STEP_ROWS / WY_CHUNK_SIZE;
 
 const WY_QK_TILE_ELEMS: usize = WY_MAX_CHUNKS * LA_NUM_K_HEADS * WY_CHUNK_SIZE * LA_K_HEAD_DIM;
@@ -81,9 +81,9 @@ const WY_VALUE_TILE_ELEMS: usize = WY_MAX_CHUNKS * GATE_ELEMS * WY_CHUNK_SIZE * 
 /// launch.  A layer step invokes the scan up to 48 times and runtime CUDA
 /// allocations would serialize that path.
 ///
-/// Тайл фиксирован на 64 токена, но фазы, не зависящие от состояния,
-/// считаются сразу по всем чанкам сегмента — поэтому буферы рассчитаны на
-/// полную арену (`MAX_STEP_ROWS`) и стоят около 84 МБ.
+/// The tile is fixed at 64 tokens, but state-independent phases
+/// are computed for all chunks of a segment at once — so the buffers are sized for
+/// the full arena (`MAX_STEP_ROWS`) and cost about 84 MB.
 pub struct DeltaPrefillWorkspace {
     query: DeviceBuffer<u16>,
     key: DeviceBuffer<u16>,
@@ -109,7 +109,7 @@ impl DeltaPrefillWorkspace {
         })
     }
 
-    /// Байты, которые режим `Wy` добавляет к бюджету памяти движка.
+    /// Bytes that `Wy` mode adds to the engine's memory budget.
     pub fn bytes(&self) -> usize {
         self.query.bytes()
             + self.key.bytes()
@@ -128,8 +128,8 @@ pub struct PreparedDelta {
     pub v: DeviceBuffer<f32>,
     pub alpha: DeviceBuffer<f32>,
     pub beta: DeviceBuffer<f32>,
-    /// k.q на токен и k-голову: общий для всех строк состояния, поэтому
-    /// считается один раз в prepare, а не в каждом варпе скана.
+    /// k.q per token and k head: shared by all state rows, so
+    /// computed once in prepare, not in every scan warp.
     pub kq: DeviceBuffer<f32>,
     batch: usize,
 }
@@ -240,9 +240,9 @@ impl DeltaPreprocessor {
     ) -> Result<()> {
         assert!(tokens > 0 && row_offset + tokens <= output.batch);
         assert!(state_slot < state_capacity);
-        // Проверяются строки, которых кернел действительно касается, а не вся
-        // ёмкость арены: доигрывание принятых черновиков подаёт вход из
-        // маленького сохранённого буфера на несколько строк.
+        // Check the rows the kernel actually touches, not the whole
+        // arena capacity: replaying accepted drafts feeds input from
+        // a small saved buffer of a few rows.
         let used = row_offset + tokens;
         assert!(mixed_qkv.fits(used, qwc_core::arch::LA_CONV_CHANNELS));
         assert!(a_projection.fits(used, GATE_ELEMS));
@@ -276,11 +276,11 @@ impl DeltaPreprocessor {
     }
 }
 
-/// Срез арены проекций: строки идут с шагом `stride`, начиная с `offset`.
+/// A slice of the projection arena: rows go with stride `stride`, starting at `offset`.
 ///
-/// Слитая проекция миксера кладёт qkv, z, a и b в одну матрицу, поэтому
-/// потребители получают не отдельный буфер, а вид на её столбцы. `packed`
-/// описывает прежний случай — отдельный плотный буфер.
+/// The fused mixer projection puts qkv, z, a and b into one matrix, so
+/// consumers get not a separate buffer but a view onto its columns. `packed`
+/// describes the old case — a separate dense buffer.
 #[derive(Clone, Copy)]
 pub struct RowView<'a> {
     buffer: &'a DeviceBuffer<u16>,
@@ -298,7 +298,7 @@ impl<'a> RowView<'a> {
     }
 
     pub fn strided(buffer: &'a DeviceBuffer<u16>, offset: usize, stride: usize) -> Self {
-        assert!(offset < stride, "срез начинается за пределами строки");
+        assert!(offset < stride, "slice starts beyond the row");
         Self {
             buffer,
             offset,
@@ -310,14 +310,14 @@ impl<'a> RowView<'a> {
         self.stride
     }
 
-    /// Помещаются ли `rows` строк шириной `width`.
+    /// Whether `rows` rows of width `width` fit.
     pub fn fits(&self, rows: usize, width: usize) -> bool {
-        assert!(self.offset + width <= self.stride, "срез шире строки");
+        assert!(self.offset + width <= self.stride, "slice is wider than the row");
         rows == 0 || self.offset + (rows - 1) * self.stride + width <= self.buffer.len()
     }
 
     fn as_ptr(&self) -> *const std::ffi::c_void {
-        // SAFETY: смещение внутри буфера проверяется `fits` у вызывающего.
+        // SAFETY: the offset within the buffer is checked by the caller's `fits`.
         unsafe { (self.buffer.as_ptr() as *const u16).add(self.offset) as *const _ }
     }
 }
@@ -366,20 +366,20 @@ impl DeltaOutputNorm {
 }
 
 pub struct DeltaInputs<'a> {
-    /// L2-нормированные, [batch, 16, 128].
+    /// L2-normalized, [batch, 16, 128].
     pub q: &'a DeviceBuffer<f32>,
     pub k: &'a DeviceBuffer<f32>,
     /// [batch, 48, 128].
     pub v: &'a DeviceBuffer<f32>,
-    /// Затухание exp(g) в (0, 1), [batch, 48].
+    /// Decay exp(g) in (0, 1), [batch, 48].
     pub alpha: &'a DeviceBuffer<f32>,
-    /// Сила записи sigmoid(b), [batch, 48].
+    /// Write strength sigmoid(b), [batch, 48].
     pub beta: &'a DeviceBuffer<f32>,
-    /// Скаляр k.q, [batch, 16].
+    /// Scalar k.q, [batch, 16].
     pub kq: &'a DeviceBuffer<f32>,
 }
 
-/// Один шаг decode. Состояние обновляется на месте.
+/// One decode step. The state is updated in place.
 pub fn decode(
     state: &mut DeviceBuffer<u16>,
     inputs: &DeltaInputs<'_>,
@@ -490,11 +490,11 @@ pub fn prefill_slot(
     })
 }
 
-/// Чанковый (WY) скан: `DeltaStateMode::Wy`.
+/// Chunked (WY) scan: `DeltaStateMode::Wy`.
 ///
-/// Рекуррентный кернел остаётся реализацией `Bf16` и `Fp32`: округление после
-/// каждого токена — само по себе рекуррентность, матричной формой она не
-/// выражается. Поэтому это отдельная точка входа, а не флаг внутри
+/// The recurrent kernel remains the implementation of `Bf16` and `Fp32`: rounding after
+/// every token is itself a recurrence, it can't be expressed in matrix form.
+/// So this is a separate entry point, not a flag inside
 /// `prefill_slot`.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_slot_wy(
@@ -544,18 +544,18 @@ pub fn prefill_slot_wy(
     })
 }
 
-/// Масштабов на слот и слой: по одному на строку состояния.
+/// Scales per slot and layer: one per state row.
 pub const STATE_SCALE_ELEMS: usize = LA_NUM_V_HEADS * LA_V_HEAD_DIM;
 
-/// Восьмибитное хранение состояния одного слоя: int8 плюс построчный масштаб.
+/// Eight-bit state storage for one layer: int8 plus a per-row scale.
 ///
-/// Данные и масштабы лежат вместе не ради удобства: строка без своего
-/// масштаба — мусор, и два параллельных `DeviceBuffer` в исполнителе рано или
-/// поздно разъехались бы по ёмкости.
+/// Data and scales are kept together not for convenience: a row without its
+/// scale is garbage, and two parallel `DeviceBuffer`s in the executor would sooner or
+/// later drift apart in capacity.
 ///
-/// Префилл сюда не пишет. Промпт считается по расквантованной bf16-копии и
-/// упаковывается один раз в конце: перезапуск сегмента префилла с 8-битного
-/// состояния портит весь остаток промпта
+/// Prefill doesn't write here. The prompt is computed on a dequantized bf16 copy and
+/// packed once at the end: restarting a prefill segment from the 8-bit
+/// state spoils the whole rest of the prompt
 /// (`bench/results/delta-state-8bit.md`).
 pub struct PackedStatePool {
     data: DeviceBuffer<u8>,
@@ -581,8 +581,8 @@ impl PackedStatePool {
         self.data.bytes() + self.scales.bytes()
     }
 
-    /// Обнуляет слот. Нулевая строка представима при любом масштабе, поэтому
-    /// масштабы обнуляются вместе с данными, а не выставляются в единицу.
+    /// Zeroes a slot. A zero row is representable at any scale, so
+    /// scales are zeroed along with the data rather than set to one.
     pub fn reset_slot(&mut self, slot: usize) -> Result<()> {
         assert!(slot < self.capacity);
         self.data.zero_range(slot * STATE_ELEMS, STATE_ELEMS)?;
@@ -590,7 +590,7 @@ impl PackedStatePool {
             .zero_range(slot * STATE_SCALE_ELEMS, STATE_SCALE_ELEMS)
     }
 
-    /// Обнуляет весь пул.
+    /// Zeroes the whole pool.
     pub fn reset(&mut self) -> Result<()> {
         for slot in 0..self.capacity {
             self.reset_slot(slot)?;
@@ -598,8 +598,8 @@ impl PackedStatePool {
         Ok(())
     }
 
-    /// Копирует слот целиком — и данные, и масштабы. Порядок аргументов
-    /// здесь «откуда, куда», а у `copy_within` — наоборот, приёмник первым.
+    /// Copies a whole slot — both data and scales. The argument order
+    /// here is "from, to", while `copy_within` has it the other way around, destination first.
     pub fn copy_slot(&mut self, from: usize, to: usize, stream: &Stream) -> Result<()> {
         assert!(from < self.capacity && to < self.capacity);
         self.data
@@ -613,7 +613,7 @@ impl PackedStatePool {
     }
 }
 
-/// Один шаг decode по 8-битному состоянию.
+/// One decode step over the 8-bit state.
 pub fn decode_slots_packed(
     pool: &mut PackedStatePool,
     state_slots: &DeviceBuffer<u32>,
@@ -649,7 +649,7 @@ pub fn decode_slots_packed(
     })
 }
 
-/// bf16-копия -> 8-битный слот.
+/// bf16 copy -> 8-bit slot.
 pub fn pack_state_slot(
     source: &DeviceBuffer<u16>,
     source_capacity: usize,
@@ -676,7 +676,7 @@ pub fn pack_state_slot(
     })
 }
 
-/// 8-битный слот -> bf16-копия.
+/// 8-bit slot -> bf16 copy.
 pub fn unpack_state_slot(
     pool: &PackedStatePool,
     packed_slot: usize,
@@ -702,13 +702,13 @@ pub fn unpack_state_slot(
     })
 }
 
-/// Разрядность хранения рекуррентного состояния — для измерения, а не для
-/// экономии: пул остаётся bf16, а значения сажаются на 8-битную сетку после
-/// каждого обновления. Так diff-eval отвечает на вопрос о точности раньше,
-/// чем переложены три кернела, пулы и бюджет.
+/// Recurrent state storage width — for measurement, not for
+/// savings: the pool stays bf16, and values are snapped onto the 8-bit grid after
+/// every update. This way diff-eval answers the accuracy question before
+/// three kernels, the pools and the budget are reworked.
 ///
-/// `Int8` держит масштаб на строку состояния и бьёт `E4m3` вчетверо при том
-/// же байте: строки плоские, и четыре бита экспоненты им не нужны
+/// `Int8` keeps a scale per state row and beats `E4m3` fourfold at the same
+/// byte: rows are flat, and they don't need four exponent bits
 /// (`bench/results/delta-state-8bit.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum StateQuant {
@@ -745,7 +745,7 @@ impl StateQuant {
     }
 }
 
-/// Сажает состояние перечисленных слотов на 8-битную сетку.
+/// Snaps the state of the listed slots onto the 8-bit grid.
 pub fn requantize_state_slots(
     state_pool: &mut DeviceBuffer<u16>,
     state_slots: &DeviceBuffer<u32>,
@@ -772,7 +772,7 @@ pub fn requantize_state_slots(
     })
 }
 
-/// То же для одного слота: у prefill сегмент всегда один.
+/// The same for one slot: prefill always has one segment.
 pub fn requantize_state_slot(
     state_pool: &mut DeviceBuffer<u16>,
     quant: StateQuant,
@@ -798,19 +798,19 @@ pub fn requantize_state_slot(
     })
 }
 
-/// Трафик памяти одного вызова: состояние читается и переписывается целиком.
+/// Memory traffic of one call: the state is read and rewritten in full.
 pub fn traffic_bytes(batch: usize) -> u64 {
     2 * (batch * STATE_ELEMS * std::mem::size_of::<u16>()) as u64
 }
 
-/// Эталон на CPU. Работает с тем же bf16-представлением состояния, что и GPU,
-/// поэтому расхождение может давать только порядок суммирования.
+/// CPU reference. Works with the same bf16 state representation as the GPU,
+/// so a mismatch can only come from summation order.
 pub mod reference {
     use super::*;
     use crate::bf16;
 
-    // Эталон повторяет сигнатуру кернела один в один: группировать аргументы
-    // в структуру значит спрятать расхождение с GPU-путём.
+    // The reference repeats the kernel signature one to one: grouping the arguments
+    // into a struct would hide divergence from the GPU path.
     #[allow(clippy::too_many_arguments)]
     pub fn decode(
         state: &mut [u16],
@@ -860,29 +860,29 @@ pub mod reference {
         }
     }
 
-    /// Скан в чанковой (WY) форме: рекуррентность по токенам заменена
-    /// матрицами внутри чанка длины `chunk`.
+    /// Scan in the chunked (WY) form: the recurrence over tokens is replaced by
+    /// matrices within a chunk of length `chunk`.
     ///
-    /// Вывод. Обозначим за `S_t` состояние после токена t, за gamma_t —
-    /// произведение alpha по токенам чанка до t включительно. Из
-    /// `S_t = a_t S_{t-1} + c_t k_t^T` по индукции следует
-    /// `S_t = gamma_t (S_0 + sum_{r<=t} (c_r / gamma_r) k_r^T)`, и подстановка
-    /// этого в `c_t = b_t (v_t - a_t S_{t-1} k_t)` даёт треугольную систему
+    /// Derivation. Let `S_t` be the state after token t, gamma_t the
+    /// product of alpha over the chunk's tokens up to and including t. From
+    /// `S_t = a_t S_{t-1} + c_t k_t^T` by induction it follows that
+    /// `S_t = gamma_t (S_0 + sum_{r<=t} (c_r / gamma_r) k_r^T)`, and substituting
+    /// this into `c_t = b_t (v_t - a_t S_{t-1} k_t)` gives a triangular system
     ///
     ///   c_t + sum_{r<t} A[t][r] c_r = b_t v_t - b_t gamma_t (S_0 k_t),
     ///   A[t][r] = b_t (gamma_t / gamma_r) (k_r . k_t).
     ///
-    /// Выход и финальное состояние — тоже матрицы:
+    /// The output and the final state are matrices too:
     ///
     ///   out_t = gamma_t (S_0 q_t) + sum_{r<=t} (gamma_t / gamma_r)(k_r . q_t) c_r,
     ///   S_C   = gamma_C S_0 + sum_t (gamma_C / gamma_t) c_t k_t^T.
     ///
-    /// Все множители — отношения gamma по парам (r <= t), а alpha в (0, 1],
-    /// поэтому каждое из них не больше единицы. Считать их делением всё равно
-    /// нельзя: gamma само по себе — произведение до 64 множителей и уходит
-    /// под fp32 уже при alpha около 0.2, после чего отношение превращается в
-    /// 0/0. Поэтому затухание копится в логарифмах, а отношение берётся как
-    /// exp от разности.
+    /// All multipliers are ratios of gamma over pairs (r <= t), and alpha is in (0, 1],
+    /// so each of them is at most one. They still can't be computed by division:
+    /// gamma itself is a product of up to 64 factors and underflows
+    /// fp32 already at alpha around 0.2, after which the ratio turns into
+    /// 0/0. So decay is accumulated in logarithms, and the ratio is taken as
+    /// exp of the difference.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_chunked_fp32(
         state: &mut [u16],
@@ -911,10 +911,10 @@ pub mod reference {
                 let key = |t: usize| &k[((start + t) * LA_NUM_K_HEADS + hk) * DK..][..DK];
                 let query = |t: usize| &q[((start + t) * LA_NUM_K_HEADS + hk) * DK..][..DK];
 
-                // Затухание копится в логарифмах: произведение alpha по чанку
-                // уходит под fp32 уже при alpha около 0.2, и отношения
-                // gamma_t / gamma_r превращаются в 0/0. Разность логарифмов
-                // конечна всегда.
+                // Decay is accumulated in logarithms: the product of alpha over a chunk
+                // underflows fp32 already at alpha around 0.2, and the ratios
+                // gamma_t / gamma_r turn into 0/0. A difference of logarithms
+                // is always finite.
                 let mut cumulative = vec![0.0f32; len];
                 let mut running = 0.0f32;
                 for (t, slot) in cumulative.iter_mut().enumerate() {
@@ -924,7 +924,7 @@ pub mod reference {
                 let gamma: Vec<f32> = cumulative.iter().map(|x| x.exp()).collect();
                 let ratio = |t: usize, r: usize| (cumulative[t] - cumulative[r]).exp();
 
-                // Правая часть: b_t v_t - b_t gamma_t (S_0 k_t).
+                // Right-hand side: b_t v_t - b_t gamma_t (S_0 k_t).
                 let mut c = vec![0.0f32; len * DV];
                 for t in 0..len {
                     let bt = beta[(start + t) * HV + h];
@@ -935,8 +935,8 @@ pub mod reference {
                             bt * (v[((start + t) * HV + h) * DV + row] - gamma[t] * sk);
                     }
                 }
-                // Прямая подстановка по треугольной системе: строка t видит
-                // только уже посчитанные r < t.
+                // Forward substitution over the triangular system: row t sees
+                // only the already computed r < t.
                 for t in 0..len {
                     let bt = beta[(start + t) * HV + h];
                     let kt = key(t);
@@ -952,7 +952,7 @@ pub mod reference {
                     }
                 }
 
-                // Выход: вклад входного состояния плюс нижнетреугольная часть.
+                // Output: the input state's contribution plus the lower-triangular part.
                 for t in 0..len {
                     let qt = query(t);
                     for row in 0..DV {
@@ -968,7 +968,7 @@ pub mod reference {
                     }
                 }
 
-                // Состояние на конец чанка.
+                // State at the end of the chunk.
                 let last = gamma[len - 1];
                 for row in 0..DV {
                     for j in 0..DK {
@@ -993,8 +993,8 @@ pub mod reference {
         }
     }
 
-    /// Эталон рекуррентного chunk-скана с FP32-состоянием: округление до
-    /// BF16 происходит только на границе chunk, как в `DeltaStateMode::Fp32`.
+    /// Reference recurrent chunk scan with FP32 state: rounding to
+    /// BF16 happens only at the chunk boundary, as in `DeltaStateMode::Fp32`.
     #[allow(clippy::too_many_arguments)]
     pub fn prefill_chunk_fp32(
         state: &mut [u16],

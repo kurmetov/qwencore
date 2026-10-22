@@ -1,0 +1,183 @@
+--- a/examples/91_fp4_gemv/91_fp4_gemv.cu
++++ b/examples/91_fp4_gemv/91_fp4_gemv.cu
+@@ -29,7 +29,13 @@
+  *
+  **************************************************************************************************/
+ 
++#include <algorithm>
++#include <vector>
+ #include <cstdint>  // uint64_t
++
++// qwencore bench flag: 4 launches of one matrix each instead of one batched.
++bool per_matrix = false;
++
+ #include <cstdio>
+ #include <cstdlib>  // rand(), RAND_MAX
+ #include <string>   // std::stoi
+@@ -413,6 +419,7 @@
+     return true;
+   }
+ 
++  int slice = -1;
+   virtual typename Gemv::Arguments get_arguments(
+     cutlass::MatrixCoord problem_size, int32_t batch_count,
+     float epilogue_st, ElementCompute alpha, ElementCompute beta) = 0;
+@@ -468,50 +475,44 @@
+         }
+       }
+ 
+-      // warmup
+-      status = gemv_op();
+-      if (status != cutlass::Status::kSuccess) {
+-        std::cerr << "Device execution failed on warmup." << std::endl;
+-        return false;
+-      }
+-
+-      result = cudaEventRecord(events[0]);
+ 
+-      if (result != cudaSuccess) {
+-        std::cerr << "cudaEventRecord() failed with error " << cudaGetErrorString(result) << std::endl;
+-        return false;
+-      }
+-     
+-      for (int iter_i = 0; iter_i < kIterations; ++iter_i) {
+-        status = gemv_op();
+-        if (status != cutlass::Status::kSuccess) {
+-          std::cerr << "Device execution failed." << std::endl;
+-          return false;
++      // As in nvfp4bench: 20 warmups, 7 series of kIterations passes, median.
++      // per_matrix: 4 launches with batch_count=1 over different matrices (as in qwc),
++      // otherwise one launch with batch_count=gemm_batch.
++      std::vector<Gemv> ops;
++      if (per_matrix) {
++        ops.resize(gemm_batch);
++        for (int b = 0; b < gemm_batch; ++b) {
++          this->slice = b;
++          auto args = this->get_arguments(problem_size, 1, epilogue_st, alpha, beta);
++          this->slice = -1;
++          if (ops[b].can_implement(args) != cutlass::Status::kSuccess ||
++              ops[b].initialize(args, workspace.get()) != cutlass::Status::kSuccess) {
++            printf("slice init failed\n");
++            return false;
++          }
+         }
+       }
+-
+-      result = cudaEventRecord(events[1]);
+-
+-      if (result != cudaSuccess) {
+-        std::cerr << "cudaEventRecord() failed with error " << cudaGetErrorString(result) << std::endl;
+-        return false;
+-      }
+-
+-      result = cudaDeviceSynchronize();
+-
+-      if (result != cudaSuccess) {
+-        std::cerr << "cudaDeviceSynchronize() failed with error " << cudaGetErrorString(result) << std::endl;
+-        return false;
+-      }
+-
+-      float elapsed_ms = 0;
+-      result = cudaEventElapsedTime(&elapsed_ms, events[0], events[1]);
+-
+-      if (result != cudaSuccess) {
+-        std::cerr << "cudaEventElapsedTime() failed with error " << cudaGetErrorString(result) << std::endl;
+-        return false;
++      auto pass_once = [&]() {
++        if (per_matrix) {
++          for (auto &op : ops) { status = op(); }
++        } else {
++          status = gemv_op();
++        }
++      };
++      for (int w = 0; w < 20; ++w) pass_once();
++      cudaDeviceSynchronize();
++      float samples[7];
++      for (int s = 0; s < 7; ++s) {
++        cudaEventRecord(events[0]);
++        for (int iter_i = 0; iter_i < kIterations; ++iter_i) pass_once();
++        cudaEventRecord(events[1]);
++        cudaEventSynchronize(events[1]);
++        cudaEventElapsedTime(&samples[s], events[0], events[1]);
+       }
+-
++      if (status != cutlass::Status::kSuccess) { std::cerr << "exec failed\n"; return false; }
++      std::sort(samples, samples + 7);
++      float elapsed_ms = samples[3];
+       for (cudaEvent_t &evt : events) {
+         result = cudaEventDestroy(evt);
+         if (result != cudaSuccess) {
+@@ -539,6 +540,11 @@
+       std::cout << "         Runtime: " << elapsed_ms_per_iter << " ms" << std::endl;
+       std::cout << "          GFLOPs: " << gflops_per_second << "  GFLOPs" << std::endl;
+       std::cout << "Memory bandwidth: " << gbytes_per_second << "  GiB/s" << std::endl;
++      double weight_bytes = double(gemm_m) * gemm_k / 2 + double(gemm_m) * gemm_k / 16;
++      double us_per_matrix = double(elapsed_ms) * 1e3 / kIterations / gemm_batch;
++      printf("RESULT mode=%s m=%d k=%d us_per_matrix=%.2f weight_GBps=%.0f min_ms=%.4f max_ms=%.4f\n",
++             per_matrix ? "per_matrix" : "batched", gemm_m, gemm_k, us_per_matrix,
++             weight_bytes / (us_per_matrix * 1e-6) / 1e9, samples[0], samples[6]);
+ 
+     }
+ 
+@@ -693,6 +699,12 @@
+     auto batch_stride_tuple = cute::stride<2>(sfd_layout);  // This returns (_0, 8192)
+     int batch_stride_SFD = static_cast<int>(cute::get<1>(batch_stride_tuple));  // Extract the 8192 part
+ 
++    auto ref_A = this->tensor_A.device_ref();
++    auto *ptr_SFA = this->tensor_SFA.device_data();
++    if (this->slice >= 0) {
++      ref_A.add_coord_offset(cutlass::MatrixCoord{this->slice * gemm_m, 0});
++      ptr_SFA += int64_t(this->slice) * batch_stride_SFA;
++    }
+     // Initialize GEMV kernel
+     typename Gemv::Arguments arguments{
+         problem_size,                        // problem_size
+@@ -706,11 +718,11 @@
+             batch_stride_SFD,                // batch_stride_sfd
+             gemm_m                           // stride_d
+         },
+-        this->tensor_A.device_ref(),         // ref_A
++        ref_A,                               // ref_A
+         this->tensor_B.device_data(),        // ptr_B
+         this->tensor_C.device_data(),        // ptr_C
+         this->tensor_D.device_data(),        // ptr_D
+-        this->tensor_SFA.device_data(),      // ptr_SFA
++        ptr_SFA,                             // ptr_SFA
+         this->tensor_SFB.device_data(),      // ptr_SFB
+         gemm_k,                              // stride_A
+         gemm_m * gemm_k,                     // batch_stride_A
+@@ -726,6 +738,8 @@
+   }
+ };
+ 
++
++
+ struct Options {
+   bool help = false;
+ 
+@@ -740,6 +754,7 @@
+   
+   bool profiling = true;
+   int iterations = 10;
++  bool verify = true;
+ 
+   // Parses the command line
+   void parse(int argc, char const **args) {
+@@ -758,6 +773,8 @@
+     cmd.get_cmd_line_argument("epilogue_st",  epilogue_st);
+     cmd.get_cmd_line_argument("profiling", profiling);
+     cmd.get_cmd_line_argument("iterations", iterations);
++    cmd.get_cmd_line_argument("per_matrix", per_matrix);
++    cmd.get_cmd_line_argument("verify", verify);
+   }
+ 
+   /// Prints the usage statement.
+@@ -868,7 +885,7 @@
+   Options verification_options = options;
+   verification_options.profiling = false;
+   
+-  bool passed = run_fp4_gemv_device(verification_options);
++  bool passed = options.verify ? run_fp4_gemv_device(verification_options) : true;
+   if (passed == false) {
+     printf("test fail\n");
+     return 1;

@@ -1,10 +1,10 @@
-//! Архитектура Qwen3.8-27B (`Qwen3_5ForConditionalGeneration`, text-only).
+//! Qwen3.8-27B architecture (`Qwen3_5ForConditionalGeneration`, text-only).
 //!
-//! Источник: `Qwen/Qwen3.8-27B/config.json`, секция `text_config`.
-//! Vision tower намеренно отсутствует — движок text-only.
+//! Source: `Qwen/Qwen3.8-27B/config.json`, the `text_config` section.
+//! The vision tower is intentionally absent — the engine is text-only.
 
 // ---------------------------------------------------------------------------
-// Базовый стек
+// Base stack
 // ---------------------------------------------------------------------------
 
 pub const NUM_LAYERS: usize = 64;
@@ -14,11 +14,11 @@ pub const VOCAB_SIZE: usize = 248_320;
 pub const RMS_NORM_EPS: f32 = 1e-6;
 pub const MAX_POSITION_EMBEDDINGS: usize = 262_144;
 
-/// Веса lm_head не связаны с embed_tokens: это отдельные 1.27B параметров.
+/// lm_head weights aren't tied to embed_tokens: that's a separate 1.27B parameters.
 pub const TIE_WORD_EMBEDDINGS: bool = false;
 
 // ---------------------------------------------------------------------------
-// Гибридный layout: [linear, linear, linear, full] x 16
+// Hybrid layout: [linear, linear, linear, full] x 16
 // ---------------------------------------------------------------------------
 
 pub const FULL_ATTENTION_INTERVAL: usize = 4;
@@ -27,13 +27,13 @@ pub const NUM_LINEAR_LAYERS: usize = NUM_LAYERS - NUM_FULL_LAYERS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
-    /// Gated DeltaNet: рекуррентное состояние константного размера.
+    /// Gated DeltaNet: a constant-size recurrent state.
     LinearAttention,
-    /// Классический GQA-attention с paged KV-кэшем.
+    /// Classic GQA attention with a paged KV cache.
     FullAttention,
 }
 
-/// Тип слоя по индексу. Full-attention — каждый 4-й: 3, 7, 11, ..., 63.
+/// Layer type by index. Full-attention is every 4th: 3, 7, 11, ..., 63.
 pub const fn layer_kind(idx: usize) -> LayerKind {
     debug_assert!(idx < NUM_LAYERS);
     if (idx + 1).is_multiple_of(FULL_ATTENTION_INTERVAL) {
@@ -43,8 +43,8 @@ pub const fn layer_kind(idx: usize) -> LayerKind {
     }
 }
 
-/// Порядковый номер слоя среди слоёв своего типа — индекс в KV-кэше
-/// (для full) или в пуле состояний (для linear).
+/// The layer's ordinal among layers of its type — the index in the KV cache
+/// (for full) or in the state pool (for linear).
 pub const fn layer_slot(idx: usize) -> usize {
     match layer_kind(idx) {
         LayerKind::FullAttention => idx / FULL_ATTENTION_INTERVAL,
@@ -53,47 +53,47 @@ pub const fn layer_slot(idx: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Full attention (16 слоёв)
+// Full attention (16 layers)
 // ---------------------------------------------------------------------------
 
 pub const NUM_ATTN_HEADS: usize = 24;
 pub const NUM_KV_HEADS: usize = 4;
-/// Нетипично большой: почти все готовые attention-кернелы рассчитаны на <= 128.
+/// Atypically large: almost all off-the-shelf attention kernels are designed for <= 128.
 pub const ATTN_HEAD_DIM: usize = 256;
 pub const GQA_GROUP: usize = NUM_ATTN_HEADS / NUM_KV_HEADS;
 
 pub const Q_PROJ_DIM: usize = NUM_ATTN_HEADS * ATTN_HEAD_DIM;
 pub const KV_PROJ_DIM: usize = NUM_KV_HEADS * ATTN_HEAD_DIM;
 
-/// `attn_output_gate: true` — дополнительный проекшн 5120 -> 6144,
-/// swish-гейт на выходе attention перед o_proj.
+/// `attn_output_gate: true` — an extra 5120 -> 6144 projection,
+/// a swish gate on the attention output before o_proj.
 pub const ATTN_OUTPUT_GATE: bool = true;
 
-/// `partial_rotary_factor: 0.25` — RoPE применяется к первым 64 из 256 dims,
-/// остальные 192 проходят насквозь.
+/// `partial_rotary_factor: 0.25` — RoPE is applied to the first 64 of 256 dims,
+/// the other 192 pass through.
 pub const ROPE_DIM: usize = ATTN_HEAD_DIM / 4;
 pub const ROPE_THETA: f64 = 10_000_000.0;
 
-/// mrope с секциями [11, 11, 10] вырождается в обычный RoPE, когда все три
-/// позиционных индекса равны — а в text-only они всегда равны.
-/// Поэтому mrope в движке не реализуется вообще.
+/// mrope with sections [11, 11, 10] degenerates into plain RoPE when all three
+/// position indices are equal — and in text-only they're always equal.
+/// So mrope isn't implemented in the engine at all.
 pub const MROPE_SECTIONS: [usize; 3] = [11, 11, 10];
 
 // ---------------------------------------------------------------------------
-// Linear attention / Gated DeltaNet (48 слоёв)
+// Linear attention / Gated DeltaNet (48 layers)
 // ---------------------------------------------------------------------------
 
 pub const LA_NUM_K_HEADS: usize = 16;
 pub const LA_NUM_V_HEADS: usize = 48;
 pub const LA_K_HEAD_DIM: usize = 128;
 pub const LA_V_HEAD_DIM: usize = 128;
-/// k/q-головы броадкастятся на v-головы 1:3.
+/// k/q heads are broadcast onto v heads 1:3.
 pub const LA_HEAD_RATIO: usize = LA_NUM_V_HEADS / LA_NUM_K_HEADS;
 
 pub const LA_QK_PROJ_DIM: usize = LA_NUM_K_HEADS * LA_K_HEAD_DIM;
 pub const LA_V_PROJ_DIM: usize = LA_NUM_V_HEADS * LA_V_HEAD_DIM;
 
-/// Короткая causal conv1d перед рекуррентностью, по каналам q|k|v.
+/// A short causal conv1d before the recurrence, over the q|k|v channels.
 pub const LA_CONV_KERNEL: usize = 4;
 pub const LA_CONV_CHANNELS: usize = LA_QK_PROJ_DIM * 2 + LA_V_PROJ_DIM;
 
@@ -101,29 +101,29 @@ pub const LA_CONV_CHANNELS: usize = LA_QK_PROJ_DIM * 2 + LA_V_PROJ_DIM;
 // MTP (speculative decoding)
 // ---------------------------------------------------------------------------
 
-/// Draft-голова встроена в чекпоинт: спекулятивный декодинг не требует
-/// отдельной draft-модели.
+/// The draft head is built into the checkpoint: speculative decoding needs no
+/// separate draft model.
 pub const MTP_NUM_LAYERS: usize = 1;
 pub const MTP_DEDICATED_EMBEDDINGS: bool = false;
 
 // ---------------------------------------------------------------------------
-// Производные величины кэша
+// Derived cache quantities
 // ---------------------------------------------------------------------------
 
-/// Элементов KV-кэша на один токен по всем full-attention слоям.
-/// 16 слоёв x 4 kv-головы x 256 dim x 2 (K и V) = 32768.
+/// KV cache elements per token across all full-attention layers.
+/// 16 layers x 4 kv heads x 256 dim x 2 (K and V) = 32768.
 pub const KV_ELEMS_PER_TOKEN: usize = NUM_FULL_LAYERS * NUM_KV_HEADS * ATTN_HEAD_DIM * 2;
 
-/// Элементов рекуррентного состояния DeltaNet на одну последовательность.
-/// 48 слоёв x 48 v-голов x 128 x 128 = 37 748 736. Не зависит от длины контекста.
+/// DeltaNet recurrent state elements per sequence.
+/// 48 layers x 48 v heads x 128 x 128 = 37 748 736. Independent of context length.
 pub const STATE_ELEMS_PER_SEQ: usize =
     NUM_LINEAR_LAYERS * LA_NUM_V_HEADS * LA_K_HEAD_DIM * LA_V_HEAD_DIM;
 
-/// Элементов conv-состояния на последовательность (окно kernel-1).
+/// Conv state elements per sequence (a window of kernel-1).
 pub const CONV_ELEMS_PER_SEQ: usize = NUM_LINEAR_LAYERS * LA_CONV_CHANNELS * (LA_CONV_KERNEL - 1);
 
 // ---------------------------------------------------------------------------
-// Подсчёт параметров
+// Parameter count
 // ---------------------------------------------------------------------------
 
 pub const MLP_PARAMS_PER_LAYER: usize = 3 * HIDDEN_SIZE * INTERMEDIATE_SIZE;
@@ -143,31 +143,31 @@ pub const LINEAR_ATTN_PARAMS_PER_LAYER: usize = HIDDEN_SIZE * LA_QK_PROJ_DIM  //
 pub const EMBED_PARAMS: usize = VOCAB_SIZE * HIDDEN_SIZE;
 pub const LM_HEAD_PARAMS: usize = VOCAB_SIZE * HIDDEN_SIZE;
 
-/// Параметры, которые квантованы в NVFP4 (все linear-слои тела модели).
+/// Parameters quantized to NVFP4 (all linear layers of the model body).
 pub const QUANTIZED_PARAMS: usize = NUM_LAYERS * MLP_PARAMS_PER_LAYER
     + NUM_FULL_LAYERS * FULL_ATTN_PARAMS_PER_LAYER
     + NUM_LINEAR_LAYERS * LINEAR_ATTN_PARAMS_PER_LAYER;
 
-/// Полное число параметров текстовой модели (без vision tower и MTP-головы).
+/// Total parameter count of the text model (without the vision tower and the MTP head).
 pub const TEXT_PARAMS: usize = QUANTIZED_PARAMS + EMBED_PARAMS + LM_HEAD_PARAMS;
 
-/// Оценка размера MTP draft-головы: один блок (attention + MLP) плюс
-/// проекция конкатенации [hidden_state; embedding] -> hidden.
-/// `mtp_use_dedicated_embeddings: false`, поэтому своих эмбеддингов нет.
-/// Уточняется по `model.safetensors.index.json` при загрузке чекпоинта.
+/// Estimate of the MTP draft head size: one block (attention + MLP) plus
+/// the projection of the concatenation [hidden_state; embedding] -> hidden.
+/// `mtp_use_dedicated_embeddings: false`, so it has no embeddings of its own.
+/// Refined from `model.safetensors.index.json` when the checkpoint is loaded.
 pub const MTP_PARAMS_EST: usize =
     FULL_ATTN_PARAMS_PER_LAYER + MLP_PARAMS_PER_LAYER + 2 * HIDDEN_SIZE * HIDDEN_SIZE;
 
-/// Оценка размера vision tower (depth 27, hidden 1152, intermediate 4304,
-/// patch 16, spatial_merge 2, out_hidden 5120). В text-only не грузится,
-/// нужна только чтобы показать экономию относительно baseline.
-pub const VISION_PARAMS_EST: usize = 27 * (4 * 1152 * 1152 + 2 * 1152 * 4304)  // блоки
+/// Estimate of the vision tower size (depth 27, hidden 1152, intermediate 4304,
+/// patch 16, spatial_merge 2, out_hidden 5120). Not loaded in text-only,
+/// needed only to show the savings relative to the baseline.
+pub const VISION_PARAMS_EST: usize = 27 * (4 * 1152 * 1152 + 2 * 1152 * 4304)  // blocks
     + 3 * 16 * 16 * 2 * 1152                                                   // patch embed
     + 2304 * 1152                                                              // pos embed
     + 1152 * 4 * HIDDEN_SIZE; // merger
 
 // ---------------------------------------------------------------------------
-// Проверки на этапе компиляции
+// Compile-time checks
 // ---------------------------------------------------------------------------
 
 const _: () = {
@@ -178,7 +178,7 @@ const _: () = {
     assert!(ROPE_DIM == 64);
     assert!(KV_ELEMS_PER_TOKEN == 32_768);
     assert!(STATE_ELEMS_PER_SEQ == 37_748_736);
-    // Секции mrope покрывают ровно половину RoPE-размерности (пары dim/2).
+    // The mrope sections cover exactly half of the RoPE dimension (dim/2 pairs).
     assert!(MROPE_SECTIONS[0] + MROPE_SECTIONS[1] + MROPE_SECTIONS[2] == ROPE_DIM / 2);
 };
 
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn layer_layout_matches_config() {
-        // layer_types из config.json: full_attention на индексах 3, 7, ..., 63.
+        // layer_types from config.json: full_attention at indices 3, 7, ..., 63.
         let full: Vec<usize> = (0..NUM_LAYERS)
             .filter(|&i| layer_kind(i) == LayerKind::FullAttention)
             .collect();
@@ -213,16 +213,16 @@ mod tests {
 
     #[test]
     fn parameter_count_is_27b() {
-        // Заявленные 27B: сходимся в пределах 0.5%.
+        // The stated 27B: we agree within 0.5%.
         let b = TEXT_PARAMS as f64 / 1e9;
-        assert!((26.8..27.1).contains(&b), "получилось {b} B");
+        assert!((26.8..27.1).contains(&b), "got {b} B");
     }
 
     #[test]
     fn mlp_dominates_weights() {
         let mlp = (NUM_LAYERS * MLP_PARAMS_PER_LAYER) as f64;
         let share = mlp / TEXT_PARAMS as f64;
-        // MLP — ~64% весов, поэтому именно они дают выигрыш от NVFP4.
-        assert!((0.62..0.66).contains(&share), "доля MLP {share}");
+        // MLP is ~64% of the weights, which is why they're where NVFP4 pays off.
+        assert!((0.62..0.66).contains(&share), "MLP share {share}");
     }
 }

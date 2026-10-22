@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Скачивание целевого чекпоинта. Докачка поддерживается: можно прерывать.
+# Downloads the target checkpoint. Resuming is supported: it can be interrupted.
 set -uo pipefail
 
 REPO="${REPO:-QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4}"
@@ -30,12 +30,12 @@ for f in "${FILES[@]}"; do
     want=$(curl -sIL "$BASE/$f" | grep -i '^content-length' | tail -1 | tr -d '\r' | awk '{print $2}')
     have=$(stat -c %s "$out" 2>/dev/null || echo 0)
     if [ -n "$want" ] && [ "$have" = "$want" ]; then
-        echo "== $f уже есть ($(numfmt --to=iec "$have"))"
+        echo "== $f already present ($(numfmt --to=iec "$have"))"
         continue
     fi
     echo "== $f -> $(numfmt --to=iec "${want:-0}")"
     curl -sL -C - --retry 5 --retry-delay 5 -o "$out" "$BASE/$f" || {
-        echo "!! не удалось: $f"; exit 1; }
+        echo "!! failed: $f"; exit 1; }
 done
 
-echo "== готово, итого $(du -sh "$DEST" | cut -f1)"
+echo "== done, total $(du -sh "$DEST" | cut -f1)"

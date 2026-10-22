@@ -1,14 +1,14 @@
-//! Пофазная разбивка шага на событиях CUDA.
+//! Per-phase breakdown of a step using CUDA events.
 //!
-//! Метка — это `cudaEventRecord` в поток; интервал между соседними метками
-//! относится к фазе, которую открыла первая из них. Всё лежит на одном
-//! потоке, поэтому сумма интервалов равна времени шага целиком: ни одна
-//! миллисекунда не теряется, а пробелы от голодания по запускам попадают в ту
-//! фазу, где они возникли.
+//! A mark is a `cudaEventRecord` into the stream; the interval between adjacent marks
+//! belongs to the phase the first of them opened. Everything is on one
+//! stream, so the sum of intervals equals the whole step time: not a single
+//! millisecond is lost, and gaps from launch starvation land in the
+//! phase where they occurred.
 //!
-//! Стоимость самой записи — около микросекунды на метку на хосте, порядка
-//! половины миллисекунды на шаг из полутысячи меток. Поэтому замер с
-//! таймлайном сверяется с замером без него: разница и есть искажение.
+//! The recording itself costs about a microsecond per mark on the host, on the order
+//! of half a millisecond per step of five hundred marks. So a measurement with
+//! the timeline is checked against one without it: the difference is the distortion.
 
 use crate::error::Result;
 use crate::stream::{Event, Stream};
@@ -24,8 +24,8 @@ impl Timeline {
         Self::default()
     }
 
-    /// Начать шаг заново. События переиспользуются: их создание стоит дороже
-    /// записи, а количество меток от шага к шагу одно и то же.
+    /// Restart the step. Events are reused: creating them costs more than
+    /// recording, and the number of marks is the same from step to step.
     pub fn reset(&mut self) {
         self.labels.clear();
     }
@@ -44,8 +44,8 @@ impl Timeline {
         self.labels.len()
     }
 
-    /// Суммы по фазам в порядке первого появления. Последняя метка закрывает
-    /// шаг и собственного интервала не имеет.
+    /// Per-phase sums in order of first appearance. The last mark closes
+    /// the step and has no interval of its own.
     pub fn totals(&self) -> Result<Vec<(&'static str, f32)>> {
         if self.labels.len() < 2 {
             return Ok(Vec::new());
@@ -65,7 +65,7 @@ impl Timeline {
         Ok(totals)
     }
 
-    /// Время от первой метки до последней.
+    /// Time from the first mark to the last.
     pub fn total_ms(&self) -> Result<f32> {
         if self.labels.len() < 2 {
             return Ok(0.0);

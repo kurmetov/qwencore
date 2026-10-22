@@ -1,5 +1,5 @@
-//! Сверка чекпоинта с архитектурой и реальный план VRAM.
-//! `cargo run -p qwc-model --bin inspect -- <каталог>`
+//! Checks the checkpoint against the architecture and prints the real VRAM plan.
+//! `cargo run -p qwc-model --bin inspect -- <dir>`
 
 use qwc_core::dtype::Dtype;
 use qwc_core::memory::{CacheConfig, GB, rtx5090};
@@ -12,65 +12,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| dirs_home().join("models/Qwen3.8-27B-QUASAR-NVFP4"));
 
-    println!("чекпоинт: {}\n", dir.display());
+    println!("checkpoint: {}\n", dir.display());
     let ck = Checkpoint::open(&dir)?;
     let (problems, st) = ck.validate();
 
     if problems.is_empty() {
-        println!("сверка с архитектурой: OK");
+        println!("architecture check: OK");
     } else {
-        println!("сверка с архитектурой: {} расхождений", problems.len());
+        println!("architecture check: {} mismatches", problems.len());
         for p in problems.iter().take(15) {
             println!("  {p}");
         }
         if problems.len() > 15 {
-            println!("  ... ещё {}", problems.len() - 15);
+            println!("  ... {} more", problems.len() - 15);
         }
     }
 
     let g = |b: u64| b as f64 / 1e9;
-    println!("\nтензоров в чекпоинте: {}", ck.tensor_count());
-    println!("из них разобрано:     {}", st.tensors);
-    println!("квантованных linear:  {}", st.quantized_linears);
+    println!("\ntensors in checkpoint: {}", ck.tensor_count());
+    println!("of them parsed:        {}", st.tensors);
+    println!("quantized linears:     {}", st.quantized_linears);
 
-    println!("\nРаскладка чекпоинта");
-    println!("  веса NVFP4 (packed)   {:>7.2} GB", g(st.packed_bytes));
-    println!("  поблочные шкалы fp8   {:>7.2} GB", g(st.scale_bytes));
-    println!("  нормы и мелочь        {:>7.2} GB", g(st.plain_bytes));
+    println!("\nCheckpoint layout");
+    println!("  NVFP4 weights (packed) {:>7.2} GB", g(st.packed_bytes));
+    println!("  fp8 block scales       {:>7.2} GB", g(st.scale_bytes));
+    println!("  norms and small stuff  {:>7.2} GB", g(st.plain_bytes));
     println!("  embed_tokens bf16     {:>7.2} GB", g(st.embed_bytes));
     println!("  lm_head bf16          {:>7.2} GB", g(st.lm_head_bytes));
-    println!("  MTP-голова bf16       {:>7.2} GB", g(st.mtp_bytes));
+    println!("  MTP head bf16          {:>7.2} GB", g(st.mtp_bytes));
     println!(
-        "  не нужно (vision)     {:>7.2} GB  ({} тензоров)",
+        "  not needed (vision)    {:>7.2} GB  ({} tensors)",
         g(st.unused_bytes),
         st.unused_tensors
     );
     println!(
-        "  итого на диске        {:>7.2} GB",
+        "  total on disk          {:>7.2} GB",
         g(st.engine_bytes() + st.unused_bytes)
     );
 
-    // Наши преобразования при загрузке.
+    // Our transformations at load time.
     let head_fp8 = Dtype::Fp8E4m3.bytes(qwc_core::arch::LM_HEAD_PARAMS);
     let embed_fp8 = Dtype::Fp8E4m3.bytes(qwc_core::arch::EMBED_PARAMS);
     let ours =
         st.packed_bytes + st.scale_bytes + st.plain_bytes + st.mtp_bytes + head_fp8 + embed_fp8;
 
-    println!("\nЧто грузим мы (text-only, lm_head и embed в fp8)");
+    println!("\nWhat we load (text-only, lm_head and embed in fp8)");
     println!(
-        "  vLLM грузит           {:>7.2} GB",
+        "  vLLM loads             {:>7.2} GB",
         g(st.engine_bytes() + st.unused_bytes)
     );
-    println!("  мы грузим             {:>7.2} GB", g(ours));
+    println!("  we load                {:>7.2} GB", g(ours));
     println!(
-        "  фора                  {:>7.2} GB",
+        "  head start             {:>7.2} GB",
         g(st.engine_bytes() + st.unused_bytes - ours)
     );
 
     let cfg = CacheConfig::default();
     let b = rtx5090(ours, 2 * GB);
     println!(
-        "\nПод кэш остаётся        {:>7.2} GB",
+        "\nLeft for cache          {:>7.2} GB",
         g(b.cache_available())
     );
     println!("  max concurrency @4K   {}", b.max_concurrency(&cfg, 4096));

@@ -1,13 +1,13 @@
-// Decode-проекция NVFP4 x BF16 для batch 1..4.
+// NVFP4 x BF16 decode projection for batch 1..4.
 //
-// Чекпоинт хранит W построчно: два E2M1 в байте и одну E4M3-шкалу
-// на 16 весов. В отличие от W4A4 GEMM, этот путь не квантует активации:
-// для малого decode-batch это убирает отдельный kernel, сохраняет качество
-// и почти не меняет DRAM-трафик, потому что доминируют веса.
+// The checkpoint stores W row by row: two E2M1 per byte and one E4M3 scale
+// per 16 weights. Unlike the W4A4 GEMM, this path doesn't quantize activations:
+// for a small decode batch this removes a separate kernel, preserves quality
+// and barely changes DRAM traffic, because the weights dominate.
 //
-// Блок считает 16 выходных строк. BF16-тайл X[B, 256] загружается в shared
-// один раз, а не по разу на строку; каждый 128-битный фрагмент W читается
-// ровно один раз и используется для всех B последовательностей.
+// A block computes 16 output rows. The BF16 tile X[B, 256] is loaded into shared
+// once, not once per row; each 128-bit W fragment is read
+// exactly once and used for all B sequences.
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -18,10 +18,10 @@
 
 namespace {
 
-// Потолок строк одного W4A16-вызова. Держался на 4, пока вся сетка decode
-// выше четырёх уходила в W4A4; замер показал, что переход обходится дороже
-// самого ядра — шаг c=4 идёт 16.3 мс, c=5 уже 21.8, и пятая
-// последовательность снижает пропускную вместо роста.
+// Row cap of one W4A16 call. It stayed at 4 while the whole decode grid
+// above four went to W4A4; measurement showed the switch costs more
+// than the kernel itself — a c=4 step takes 16.3 ms, c=5 already 21.8, and the fifth
+// sequence reduces throughput instead of increasing it.
 constexpr int kMaxBatch = 8;
 
 __device__ __forceinline__ float fp8_e4m3_to_float(uint8_t raw) {
@@ -38,15 +38,15 @@ __device__ __forceinline__ size_t block_scale_offset(
     return (tile << 9) | row_bits | (group & 3);
 }
 
-// Внутренний цикл амортизирует загрузку активации из shared по kRowsPerThread
-// строкам весов: x[b][k] читается один раз и умножается на веса всех строк,
-// которые ведёт поток. При batch 1 kernel упирается в DRAM и это не нужно,
-// при batch 3-4 именно shared-загрузки съедали половину пропускной способности.
-// Сколько блоков на SM требовать от компилятора. При batch 1-4 ядро упирается
-// в DRAM, и восемь блоков — способ спрятать латентность. С пяти строк
-// аккумуляторы и активация в регистрах перестают влезать в 32 регистра на
-// поток, которых требует такая занятость, и ядро уходит в спилл: шаг c=8 шёл
-// 30.5 мс против 22.3 у W4A4. Меньше блоков — больше регистров.
+// The inner loop amortizes the activation load from shared over kRowsPerThread
+// weight rows: x[b][k] is read once and multiplied by the weights of all rows
+// the thread handles. At batch 1 the kernel is DRAM-bound and this isn't needed,
+// at batch 3-4 it was exactly the shared loads that ate half the bandwidth.
+// How many blocks per SM to demand from the compiler. At batch 1-4 the kernel is
+// DRAM-bound, and eight blocks are a way to hide latency. From five rows on
+// the accumulators and activation in registers no longer fit in the 32 registers per
+// thread such occupancy requires, and the kernel spills: a c=8 step took
+// 30.5 ms vs 22.3 for W4A4. Fewer blocks — more registers.
 template <int kBatch>
 constexpr int blocks_per_sm() {
     return 8;
@@ -85,7 +85,7 @@ void nvfp4_w4a16_kernel(
         rows[j] = row_base + j * kRows;
         valid[j] = rows[j] < out_features;
     }
-    // rows[0] — наименьшая из ведомых потоком строк.
+    // rows[0] is the smallest of the rows the thread handles.
     const bool any_valid = valid[0];
 
     float accum[kRowsPerThread][kBatch] = {};
@@ -93,7 +93,7 @@ void nvfp4_w4a16_kernel(
     const int scale_group_blocks = in_features / 64;
 
     for (int k0 = 0; k0 < in_features; k0 += kKTile) {
-        // batch * 256 bf16 = batch * 32 vectorных 128-битных загрузок.
+        // batch * 256 bf16 = batch * 32 vector 128-bit loads.
         const int vectors = kBatch * (kKTile * int(sizeof(__nv_bfloat16)) / int(sizeof(uint4)));
         for (int v = linear_thread; v < vectors; v += kRows * kKThreads) {
             const int vectors_per_batch = kKTile * int(sizeof(__nv_bfloat16)) / int(sizeof(uint4));
@@ -105,7 +105,7 @@ void nvfp4_w4a16_kernel(
         __syncthreads();
 
         if (any_valid) {
-            // Слитая 64- или 128-битная загрузка на каждую ведомую строку.
+            // A coalesced 64- or 128-bit load for each handled row.
             uint32_t words[kRowsPerThread][4] = {};
             #pragma unroll
             for (int j = 0; j < kRowsPerThread; ++j) {
@@ -137,7 +137,7 @@ void nvfp4_w4a16_kernel(
                 if constexpr (kElemsPerThread >= 16) {
                     scale_group = k_lane * kGroupsPerThread + group;
                 } else {
-                    // При 8 элементах два соседних потока делят scale-блок из 16.
+                    // With 8 elements two neighboring threads share a scale block of 16.
                     scale_group = k_lane / (16 / kElemsPerThread);
                 }
                 const int global_group = k0 / 16 + scale_group;
@@ -156,7 +156,7 @@ void nvfp4_w4a16_kernel(
                     const int byte_index = group * kPairsPerGroup + pair;
                     const int x_index = k_lane * kElemsPerThread + group * 16 + pair * 2;
 
-                    // Одна загрузка активации на kRowsPerThread строк весов.
+                    // One activation load per kRowsPerThread weight rows.
                     float2 xf[kBatch];
                     #pragma unroll
                     for (int b = 0; b < kBatch; ++b) {
@@ -194,7 +194,7 @@ void nvfp4_w4a16_kernel(
         __syncthreads();
     }
 
-    // В каждом варпе лежат четыре независимые группы по 8 k-потоков.
+    // Each warp holds four independent groups of 8 k threads.
     #pragma unroll
     for (int offset = kKThreads / 2; offset > 0; offset >>= 1) {
         #pragma unroll
@@ -221,9 +221,9 @@ void nvfp4_w4a16_kernel(
     }
 }
 
-// MLP decode: gate_proj + up_proj + silu(gate) * up в одном kernel.
-// Обе матрицы читаются один раз, а activation tile загружается в shared один раз
-// на пару проекций. Выход сразу имеет форму входа down_proj.
+// MLP decode: gate_proj + up_proj + silu(gate) * up in one kernel.
+// Both matrices are read once, and the activation tile is loaded into shared once
+// per projection pair. The output immediately has the shape of the down_proj input.
 template <int kBatch>
 __global__ __launch_bounds__(128, blocks_per_sm<kBatch>())
 void nvfp4_swiglu_w4a16_kernel(
@@ -376,11 +376,11 @@ cudaError_t launch_w4a16(
     return cudaGetLastError();
 }
 
-// Сколько строк весов ведёт один поток. При batch 1-2 kernel упирается в DRAM,
-// и вторая строка только режет параллелизм (q+gate: 1475 -> 1374 GB/s).
-// С batch 3 узкое место — shared-загрузки активации, и амортизация по двум
-// строкам даёт gate/up 1041 -> 1411 GB/s, q+gate 1003 -> 1176, down 1127 -> 1160.
-// Три и четыре строки проигрывают на всех формах: не хватает регистров.
+// How many weight rows one thread handles. At batch 1-2 the kernel is DRAM-bound,
+// and a second row only cuts parallelism (q+gate: 1475 -> 1374 GB/s).
+// From batch 3 the bottleneck is shared activation loads, and amortizing over two
+// rows gives gate/up 1041 -> 1411 GB/s, q+gate 1003 -> 1176, down 1127 -> 1160.
+// Three and four rows lose on all shapes: not enough registers.
 constexpr int rows_per_thread_for(int batch) {
     return batch <= 2 ? 1 : 2;
 }
@@ -503,18 +503,18 @@ extern "C" cudaError_t qwc_nvfp4_w4a16(
         return cudaErrorInvalidValue;
     }
 
-    // Геометрия выбрана свипом `nvfp4narrow` по всем decode-формам Qwen3.8,
-    // ГБ/с на RTX 5090 (было -> стало):
+    // Geometry chosen by an `nvfp4narrow` sweep over all Qwen3.8 decode shapes,
+    // GB/s on the RTX 5090 (before -> after):
     //
     //   q+gate [12288, 5120]  b3 1225 -> 1427, b4  994 -> 1254
     //   la_in  [16480, 5120]  b3 1383 -> 1483, b4 1135 -> 1319
-    //   k или v [1024, 5120]  b1  413 ->  578, b4  254 ->  285
+    //   k or v [1024, 5120]   b1  413 ->  578, b4  254 ->  285
     //
-    // Широкие формы: 8x16 обгоняет прежние 16x8 тем сильнее, чем шире batch —
-    // вдвое меньше варпов на строку, значит вдвое меньше повторных чтений
-    // активации из shared. Узкий выход (k и v) упирается не в полосу, а в
-    // число блоков: 1024 строки дают 256 блоков на 170 SM, и там выигрывает
-    // самый длинный k-тайл, какой делит in_features.
+    // Wide shapes: 8x16 beats the old 16x8 the more, the wider the batch —
+    // half the warps per row means half the repeated activation reads
+    // from shared. A narrow output (k and v) is bound not by bandwidth but by
+    // the number of blocks: 1024 rows give 256 blocks on 170 SMs, and there
+    // the longest k tile that divides in_features wins.
     if (out_features >= 8192) {
         return launch_batch<8, 16, 256>(packed, scales, input, output,
             out_features, in_features, batch, 2,
@@ -536,9 +536,9 @@ extern "C" cudaError_t qwc_nvfp4_w4a16(
         1.0f / weight_global_scale, stream);
 }
 
-// Точка входа для свипа: геометрия и раскладка задаются снаружи. В движке не
-// используется — она существует, чтобы `nvfp4narrow` мог перебрать варианты на
-// реальных формах, не пересобирая ядро под каждый.
+// Entry point for the sweep: geometry and layout are given from outside. Not used
+// in the engine — it exists so that `nvfp4narrow` can try variants on
+// real shapes without rebuilding the kernel for each.
 extern "C" cudaError_t qwc_nvfp4_w4a16_tuned(
     const void* packed,
     const void* scales,

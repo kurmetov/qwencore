@@ -12,30 +12,30 @@ const OUT_OF_MEMORY: CudaError = CudaError(2);
 fn ceiling_bounds_allocations_and_is_released_on_drop() {
     assert_eq!(memory_usage().used, 0);
     assert_eq!(memory_usage().limit, usize::MAX);
-    assert!(set_memory_limit(0).is_err(), "нулевой лимит бессмыслен");
+    assert!(set_memory_limit(0).is_err(), "a zero limit is meaningless");
 
     const LIMIT: usize = 4096;
-    set_memory_limit(LIMIT).expect("лимит ставится до первой аллокации");
+    set_memory_limit(LIMIT).expect("limit is set before the first allocation");
 
-    let head = DeviceBuffer::<u8>::zeroed(3072).expect("влезает под потолок");
+    let head = DeviceBuffer::<u8>::zeroed(3072).expect("fits under the ceiling");
     assert_eq!(memory_usage().used, 3072);
     assert_eq!(memory_usage().remaining(), 1024);
 
-    // Отказ происходит до cudaMalloc и не меняет учёт.
+    // The refusal happens before cudaMalloc and doesn't change the accounting.
     assert_eq!(DeviceBuffer::<u8>::zeroed(1025).err(), Some(OUT_OF_MEMORY));
     assert_eq!(memory_usage().used, 3072);
-    // Считаются байты, а не элементы: 257 * 4 > 1024.
+    // Bytes are counted, not elements: 257 * 4 > 1024.
     assert_eq!(DeviceBuffer::<f32>::zeroed(257).err(), Some(OUT_OF_MEMORY));
     assert_eq!(memory_usage().used, 3072);
 
-    // from_slice учитывается тем же потолком.
+    // from_slice is counted against the same ceiling.
     let data = vec![7u8; 1024];
-    let tail = DeviceBuffer::from_slice(&data).expect("ровно добирает потолок");
+    let tail = DeviceBuffer::from_slice(&data).expect("exactly fills the ceiling");
     assert_eq!(memory_usage().used, LIMIT);
     assert_eq!(memory_usage().remaining(), 0);
-    assert_eq!(tail.to_vec().expect("копия обратно на хост"), data);
+    assert_eq!(tail.to_vec().expect("copy back to host"), data);
 
-    // Пока живы буферы, лимит не переставить — иначе учёт разошёлся бы с VRAM.
+    // While buffers are alive the limit can't be reset — otherwise accounting would diverge from VRAM.
     assert!(set_memory_limit(LIMIT * 2).is_err());
 
     drop(tail);
@@ -43,8 +43,8 @@ fn ceiling_bounds_allocations_and_is_released_on_drop() {
     drop(head);
     assert_eq!(memory_usage().used, 0);
 
-    // Освобождённое место снова доступно целиком.
-    let whole = DeviceBuffer::<u8>::zeroed(LIMIT).expect("потолок доступен заново");
+    // Freed space is fully available again.
+    let whole = DeviceBuffer::<u8>::zeroed(LIMIT).expect("ceiling available again");
     assert_eq!(memory_usage().used, LIMIT);
     drop(whole);
     assert_eq!(memory_usage().used, 0);

@@ -1,14 +1,14 @@
-//! Линейные слои MTP draft-головы: BF16 как есть в чекпоинте.
+//! MTP draft head linear layers: BF16 as-is from the checkpoint.
 //!
-//! Голова не квантована (`ignored: .*mtp.*` в конфиге квантизации), поэтому
-//! её матрицы не проходят NVFP4-путём. Это и не нужно: черновой шаг читает
-//! 849 МБ за проход и упирается в полосу, а не в тензорные ядра.
+//! The head isn't quantized (`ignored: .*mtp.*` in the quantization config), so
+//! its matrices don't go through the NVFP4 path. Nor do they need to: a draft step reads
+//! 849 MB per pass and is bound by bandwidth, not tensor cores.
 
 use crate::error::{Result, check};
 use crate::{DeviceBuffer, Stream, ffi};
 
-/// Максимум строк на вызов. Черновой шаг работает с одной строкой, проверка
-/// черновиков — с k+1.
+/// Max rows per call. A draft step works with one row, draft
+/// verification with k+1.
 pub const MAX_ROWS: usize = 8;
 
 /// `output[rows, n] = input[rows, k] * weights[n, k]^T`.
@@ -22,7 +22,7 @@ pub fn bf16_linear(
     stream: &Stream,
 ) -> Result<()> {
     assert!((1..=MAX_ROWS).contains(&rows));
-    assert_eq!(weights.len(), k * n, "веса [n, k]");
+    assert_eq!(weights.len(), k * n, "weights [n, k]");
     assert!(input.len() >= rows * k);
     assert!(output.len() >= rows * n);
     check(unsafe {
@@ -38,7 +38,7 @@ pub fn bf16_linear(
     })
 }
 
-/// `out = silu(gate) * up` поэлементно.
+/// `out = silu(gate) * up` element-wise.
 pub fn swiglu(
     gate: &DeviceBuffer<u16>,
     up: &DeviceBuffer<u16>,
@@ -58,7 +58,7 @@ pub fn swiglu(
     })
 }
 
-/// Склейка двух нормированных половин в вход `fc`: [эмбеддинг | скрытое].
+/// Concatenates two normalized halves into the `fc` input: [embedding | hidden].
 pub fn concat(
     left: &DeviceBuffer<u16>,
     right: &DeviceBuffer<u16>,
